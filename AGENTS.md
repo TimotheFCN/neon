@@ -60,8 +60,9 @@ upstream `main`, and the three repos always sit on the same release (for example
 
 ## Building and testing
 
-See `neon/docs/dev-linux.md` once it exists (milestone M0 in the plan writes it). Until then, the
-upstream flow is `source scripts/dev.sh` in `neon-linux`, then the `he` commands it defines.
+Read `neon/docs/dev-linux.md` before building. The toolchain runs in a Docker container started by
+`neon-linux/neon/dev-container.sh`, and builds use `neon_build` (8 jobs, niced), not `he build`.
+Tests are scripts under `neon/tests/` that drive the built browser over the DevTools protocol.
 
 The dev VM is shared with other agents and has about 16 GB of RAM:
 

@@ -47,10 +47,10 @@ across spaces on purpose.
 
 | ID | Milestone | Status | Needs |
 |---|---|---|---|
-| M0 | Linux dev build of stock Helium 0.22.1 from `neon-linux`, running under Xvfb | doing | |
+| M0 | Linux dev build of stock Helium 0.22.1 from `neon-linux`, running under Xvfb | done | |
 | R1 | Containers port study: map Brave's implementation onto Helium's patch layout | done | |
 | R2 | Spaces design: data model, sidebar pager, persistence | done | |
-| M1 | Containers core: a tab can live in a named persistent container | todo | M0, R1 |
+| M1 | Containers core: a tab can live in a named persistent container | doing | M0, R1 |
 | M2 | Spaces model: tabs grouped by space, one visible space, switch by command | todo | M1, R2 |
 | M3 | Sidebar pager: space switcher row, slide animation, scroll gesture | todo | M2 |
 | M4 | Space management: create, rename, icon, colour, delete, reorder, settings page | todo | M2 |
@@ -135,6 +135,9 @@ These follow the study's recommendations until the owner says otherwise:
   serialized. Research and design can run in parallel.
 - A Neon build must not share Helium's data directory, bundle id or updater on the owner's Mac,
   or the two installs will overwrite each other. Handled in M7, before the first Mac install.
+- Chromium's large test binaries (`unit_tests`, `browser_tests`, `interactive_ui_tests`) do not
+  compile on a Helium tree. Neon is tested with scripts that drive the real browser over the
+  DevTools protocol, kept under `neon/tests/`. See `neon/docs/dev-linux.md`.
 - Hosting is undecided. Until then the three repos exist only on the dev VM.
 - Containers inherit Brave's limits: extensions cannot read or set a container's cookies, tabs
   opened by an extension land in the default partition, site permissions are shared across
