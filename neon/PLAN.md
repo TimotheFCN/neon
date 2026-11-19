@@ -32,14 +32,24 @@ across spaces on purpose.
    on native materials and pinned tabs (PRs #2898, #2931, #2939, #2941). Our visual changes stay
    limited to what spaces need.
 7. **Track upstream release tags.** See "Syncing with upstream" in `AGENTS.md`.
+8. **The containers port keeps Brave's file layout and pref names** (`components/containers/`,
+   `chrome/browser/containers/`, `brave.containers.*`), with Brave's license headers. If Helium
+   imports the same code, our patches then collide on the same files, which is the signal to
+   drop ours. Brave source: brave-core `v1.100.58`. See `neon/docs/containers-port.md`.
+9. **One flat tab model per window, filtered by space.** A tab's space is derived from its
+   container and stored nowhere else. The visible space of a window is the space of its active
+   tab, so switching space is activating a tab. This copies how Chromium's tab group focus mode
+   hides tabs. See `neon/docs/spaces-design.md`.
+10. **The default storage partition is the first space.** Existing logins stay where they are
+    and show up in that space.
 
 ## Milestones
 
 | ID | Milestone | Status | Needs |
 |---|---|---|---|
-| M0 | Linux dev build of stock Helium 0.22.1 from `neon-linux`, running under Xvfb | todo | |
-| R1 | Containers port study: map Brave's implementation onto Helium's patch layout | todo | |
-| R2 | Spaces design: data model, sidebar pager, persistence | todo | |
+| M0 | Linux dev build of stock Helium 0.22.1 from `neon-linux`, running under Xvfb | doing | |
+| R1 | Containers port study: map Brave's implementation onto Helium's patch layout | done | |
+| R2 | Spaces design: data model, sidebar pager, persistence | done | |
 | M1 | Containers core: a tab can live in a named persistent container | todo | M0, R1 |
 | M2 | Spaces model: tabs grouped by space, one visible space, switch by command | todo | M1, R2 |
 | M3 | Sidebar pager: space switcher row, slide animation, scroll gesture | todo | M2 |
@@ -83,10 +93,41 @@ what differs on macOS), where space state is stored and how session restore brin
 upstream's draft persistent pinned tabs (#2931) interacts with per-space pins, and a proposed
 breakdown into Neon patches with the hooks each needs.
 
-### M1 to M5
+### M1: Containers core
 
-Scoped in detail once M0, R1 and R2 are in. Each milestone ends with the feature working in the
-Linux build, its patches in `patches/neon/`, and a test or scripted check that proves it.
+Port the patches R1 lists for M1, in its order, under `patches/neon/containers/`: `core`,
+`content-partition`, `session-persistence`, `browser-service`, `tab-partition`, `command-line`,
+`spaces-interface`. About 3,200 lines copied from Brave plus about 400 lines of hooks in about
+25 Chromium files.
+
+Done when, in the Linux build:
+
+- A tab opened in a named container keeps that container across same-tab and cross-site
+  navigation, links opened in a new tab, and popups.
+- Two tabs on the same site in different containers hold different cookies, and a third in the
+  default partition holds its own.
+- Closing and restarting the browser restores each tab into its container with its cookies.
+- A scripted check proves all three and is committed under `neon/tests/`.
+- `neon/THIRD_PARTY.md` records the Brave import.
+
+### M2 to M5
+
+The patch list for each is in `neon/docs/spaces-design.md`. Each milestone ends with the feature
+working in the Linux build, its patches in `patches/neon/`, and a test or scripted check that
+proves it. Each is scoped in detail when the one before it lands.
+
+## Product defaults taken from the design study
+
+These follow the study's recommendations until the owner says otherwise:
+
+- Closing the last tab of a space leaves a new tab page in that space. The window closes only
+  when every space is empty.
+- A new window shows the same space as the window it came from.
+- The space list does not sync between devices.
+- Moving a tab to another space reloads it there, so the menu entry reads "Reopen in space".
+- The swipe works anywhere on the sidebar.
+- Outside the vertical tabs layout, all tabs show and the space switcher is hidden.
+- Extensions see the tabs of every space in a window.
 
 ## Known constraints
 
@@ -95,3 +136,7 @@ Linux build, its patches in `patches/neon/`, and a test or scripted check that p
 - A Neon build must not share Helium's data directory, bundle id or updater on the owner's Mac,
   or the two installs will overwrite each other. Handled in M7, before the first Mac install.
 - Hosting is undecided. Until then the three repos exist only on the dev VM.
+- Containers inherit Brave's limits: extensions cannot read or set a container's cookies, tabs
+  opened by an extension land in the default partition, site permissions are shared across
+  containers, and web push inside a container is unverified. Password manager and sign-in flows
+  that rely on an extension opening tabs may misbehave outside the default space.

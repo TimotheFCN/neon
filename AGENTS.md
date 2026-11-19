@@ -49,9 +49,11 @@ upstream `main`, and the three repos always sit on the same release (for example
   add comment lines to `series`, the upstream lint treats every line as a patch path.
 - Platform-only patches: `patches/neon/...` in the platform repo, listed at the end of its own
   `patches/series`.
-- Inside the Chromium tree, put new code in new files under `chrome/browser/neon/` and
-  `chrome/browser/ui/neon/` (plus `components/` paths kept from ported code). Hooks into existing
-  Chromium or Helium files should be a few lines that call into our files.
+- Inside the Chromium tree, put our own code in new files under `chrome/browser/neon/`,
+  `chrome/browser/ui/neon/` and `chrome/browser/ui/views/neon/`. Code ported from another project
+  keeps that project's paths and names (the containers port stays in `components/containers/` and
+  `chrome/browser/containers/`). Hooks into existing Chromium or Helium files should be a few
+  lines that call into our files.
 - One patch per topic, with new files and their hooks in the same patch. Follow the existing
   patch format (quilt, `a/` and `b/` prefixes, no timestamps).
 - Everything Neon-specific goes under `neon/` in this repo: plan, docs, scripts.
