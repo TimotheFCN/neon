@@ -476,6 +476,15 @@ if a feature cannot be checked any other way.
    and runs here. `views_unittests` shows the same for view classes that only need `//ui/views`.
    Run them with `xvfb-run -a` when they need a display.
 
+   For gestures, Xvfb is not enough: its only input devices are XTEST's, and `xdotool click 6`
+   or `7` reaches Chromium as a notched mouse wheel. Chromium makes touchpad scroll events only
+   from an XInput device of type TOUCHPAD. `neon/tests/x11_touchpad.py` runs Xorg with the dummy
+   video driver and xserver's `inputtest` input driver, which adds such a device fed from a
+   Unix socket, without root or kernel devices. Keys and clicks still go through XTEST. It also
+   grabs parts of the screen in about half a millisecond, fast enough to catch frames in the
+   middle of a 200 ms animation. `neon/tests/spaces_m3.py` shows how to use both. The dev image
+   installs `xserver-xorg-core` and `xserver-xorg-video-dummy` for it.
+
 3. `chrome` itself is the integration test. Build it, start it, and check `build/logs/browser.log`
    for new errors on every change.
 

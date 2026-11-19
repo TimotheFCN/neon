@@ -1,0 +1,2474 @@
+Neon spaces (M3), part 1 of 4: sidebar pager.
+
+The tab list of the vertical tab strip becomes a pager with one page per
+space. At rest it shows the window's own tab strip view, the real page,
+under the space's name. While pages move, the neighbouring spaces are shown
+by peek pages: second and third tab strips built on the same tab strip model
+(their own RootTabCollectionNode, controller and drag handler), so both
+lists stay live. A switch by command slides the pages with the tab strip's
+200 ms timing, activates the target space as it starts, and lets the real
+and peek pages trade places in one frame. Each space keeps its scroll
+position. With one space, outside the vertical layout or outside a normal
+window, the tab strip looks and behaves as before.
+
+Hooks: BaseTabStripRegionView wraps its tab strip view in the pager and
+unwraps it before removal; RootTabCollectionNode::Init can observe the model
+without becoming its tab strip UI; TabView asks which tab a page draws as
+active; the spaces filter gains per-page spaces, and the window controller a
+presenter that the pager implements. Neon code, GPL-3.0.
+
+--- a/chrome/browser/ui/neon/spaces/space_tab_filter.cc
++++ b/chrome/browser/ui/neon/spaces/space_tab_filter.cc
+@@ -5,8 +5,10 @@
+ #include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
+ 
+ #include <array>
++#include <map>
+ #include <variant>
+ 
++#include "base/no_destructor.h"
+ #include "base/strings/string_number_conversions.h"
+ 
+ #include "components/tabs/public/tab_collection.h"
+@@ -18,6 +20,30 @@ namespace {
+ 
+ HooksDelegate* g_delegate = nullptr;
+ 
++struct PageState {
++  std::string space_id;
++  tabs::TabHandle active_tab;
++};
++
++std::map<const void*, PageState>& Pages() {
++  static base::NoDestructor<std::map<const void*, PageState>> pages;
++  return *pages;
++}
++
++// The tab that decides whether |child| shows: the tab itself, or the first
++// tab of a group or split.
++const tabs::TabInterface* GetDecidingTab(const tabs::ConstChildPtr& child) {
++  if (std::holds_alternative<tabs::ConstDanglingUntriagedTabInterface>(child)) {
++    return std::get<tabs::ConstDanglingUntriagedTabInterface>(child).get();
++  }
++  const tabs::TabCollection* collection =
++      std::get<tabs::ConstDanglingUntriagedTabCollection>(child).get();
++  if (!collection || collection->TabCountRecursive() == 0) {
++    return nullptr;
++  }
++  return collection->GetTabAtIndexRecursive(0);
++}
++
+ constexpr std::array<int, 11> kCommandIds = {
+     kNextSpaceCommand,       kPreviousSpaceCommand,
+     kSelectSpaceCommand,     kSelectSpaceCommand + 1,
+@@ -57,20 +83,39 @@ bool IsTabHidden(const TabStripModel* mo
+ }
+ 
+ bool IsChildHidden(const tabs::ConstChildPtr& child) {
++  return g_delegate && IsTabHidden(nullptr, GetDecidingTab(child));
++}
++
++void SetPageSpace(const void* page,
++                  const std::string& space_id,
++                  tabs::TabHandle active_tab) {
++  Pages()[page] = {space_id, active_tab};
++}
++
++void ClearPageSpace(const void* page) {
++  Pages().erase(page);
++}
++
++bool IsChildHiddenInPage(const void* page, const tabs::ConstChildPtr& child) {
+   if (!g_delegate) {
+     return false;
+   }
+-  if (std::holds_alternative<tabs::ConstDanglingUntriagedTabInterface>(child)) {
+-    return IsTabHidden(
+-        nullptr,
+-        std::get<tabs::ConstDanglingUntriagedTabInterface>(child).get());
++  auto it = Pages().find(page);
++  if (it == Pages().end()) {
++    return IsChildHidden(child);
+   }
+-  const tabs::TabCollection* collection =
+-      std::get<tabs::ConstDanglingUntriagedTabCollection>(child).get();
+-  if (!collection || collection->TabCountRecursive() == 0) {
+-    return false;
++  const tabs::TabInterface* tab = GetDecidingTab(child);
++  return tab && g_delegate->IsTabHiddenInSpace(tab, it->second.space_id);
++}
++
++bool IsTabActiveInPage(const void* page,
++                       const tabs::TabInterface* tab,
++                       bool active_in_model) {
++  auto it = Pages().find(page);
++  if (it == Pages().end() || !tab) {
++    return active_in_model;
+   }
+-  return IsTabHidden(nullptr, collection->GetTabAtIndexRecursive(0));
++  return it->second.active_tab == tab->GetHandle();
+ }
+ 
+ bool TakeVisibleSpaceChange(const void* key,
+--- a/chrome/browser/ui/neon/spaces/space_tab_filter.h
++++ b/chrome/browser/ui/neon/spaces/space_tab_filter.h
+@@ -10,14 +10,11 @@
+ 
+ #include "base/containers/span.h"
+ #include "components/tabs/public/tab_collection_types.h"
++#include "components/tabs/public/tab_interface.h"
+ 
+ class BrowserWindowInterface;
+ class TabStripModel;
+ 
+-namespace tabs {
+-class TabInterface;
+-}  // namespace tabs
+-
+ // The calls that Chromium's tab strip model, browser commands and tab strip
+ // views make into Neon spaces. Each hook is one line in an existing file. This
+ // target only depends on //base and //components/tabs, so the hooked targets
+@@ -61,6 +58,9 @@ class HooksDelegate {
+   // Runs a spaces command. Returns false if |command_id| is not one.
+   virtual bool ExecuteCommand(BrowserWindowInterface* browser,
+                               int command_id) = 0;
++  // Whether |tab| is hidden in a page that shows space |space_id|.
++  virtual bool IsTabHiddenInSpace(const tabs::TabInterface* tab,
++                                  const std::string& space_id) = 0;
+ };
+ 
+ void SetHooksDelegate(HooksDelegate* delegate);
+@@ -78,6 +78,25 @@ bool TakeVisibleSpaceChange(const void*
+ // returns false.
+ bool ExecuteCommand(BrowserWindowInterface* browser, int command_id);
+ 
++// Pages. The sidebar pager shows each space as a page: the window's real tab
++// strip shows the visible space, and extra tab strips on the same model
++// ("peek pages") show the spaces next to it while the pages slide. A page is
++// keyed by its TabStripCollectionController. A page given a space shows that
++// space's tabs, and draws |active_tab| as the active tab.
++void SetPageSpace(const void* page,
++                  const std::string& space_id,
++                  tabs::TabHandle active_tab);
++void ClearPageSpace(const void* page);
++
++// Same as IsChildHidden() for a child of page |page|.
++bool IsChildHiddenInPage(const void* page, const tabs::ConstChildPtr& child);
++
++// Whether |tab| draws as the active tab in page |page|. |active_in_model| is
++// what the tab strip model says.
++bool IsTabActiveInPage(const void* page,
++                       const tabs::TabInterface* tab,
++                       bool active_in_model);
++
+ // Tab strip views helpers. |Node| is a TabCollectionNode; templates keep this
+ // target free of a dependency on the views.
+ 
+@@ -89,7 +108,8 @@ bool IsChildViewHidden(const Node* paren
+   }
+   for (const auto& node : parent->children()) {
+     if (node->view() == child) {
+-      return IsChildHidden(node->GetNodeData());
++      return IsChildHiddenInPage(parent->GetController(),
++                                 node->GetNodeData());
+     }
+   }
+   return false;
+--- a/chrome/browser/ui/neon/spaces/spaces_window_controller.cc
++++ b/chrome/browser/ui/neon/spaces/spaces_window_controller.cc
+@@ -40,6 +40,13 @@ std::vector<SpacesWindowController*>& Re
+   return *registry;
+ }
+ 
++base::RepeatingCallbackList<void(SpacesWindowController*)>& CreatedCallbacks() {
++  static base::NoDestructor<
++      base::RepeatingCallbackList<void(SpacesWindowController*)>>
++      callbacks;
++  return *callbacks;
++}
++
+ bool IsDeletion(TabRemovedReason reason) {
+   return reason == TabRemovedReason::kDeleted ||
+          reason == TabRemovedReason::kDeletedAndExpandSidePanel;
+@@ -103,6 +110,13 @@ class HooksDelegateImpl : public HooksDe
+     return true;
+   }
+ 
++  bool IsTabHiddenInSpace(const tabs::TabInterface* tab,
++                          const std::string& space_id) override {
++    SpacesWindowController* controller = SpacesWindowController::FromTab(tab);
++    return controller && controller->IsActive() &&
++           controller->GetSpaceIdOf(tab) != space_id;
++  }
++
+  private:
+   // The visible space each tab strip last showed, by tab strip.
+   std::map<const void*, std::string> last_spaces_;
+@@ -131,9 +145,19 @@ SpacesWindowController::SpacesWindowCont
+       base::BindRepeating(&SpacesWindowController::ScheduleRepair,
+                           base::Unretained(this)));
+   last_visible_space_ = GetVisibleSpaceId();
++  CreatedCallbacks().Notify(this);
++}
++
++// static
++base::CallbackListSubscription SpacesWindowController::RegisterCreatedCallback(
++    CreatedCallback callback) {
++  return CreatedCallbacks().Add(std::move(callback));
+ }
+ 
+ SpacesWindowController::~SpacesWindowController() {
++  if (presenter_) {
++    std::exchange(presenter_, nullptr)->OnControllerDestroying();
++  }
+   std::erase(Registry(), this);
+   service_->RemoveObserver(this);
+   if (model_) {
+@@ -221,30 +245,57 @@ bool SpacesWindowController::IsTabHidden
+ }
+ 
+ void SpacesWindowController::SwitchToSpace(const std::string& space_id) {
++  if (!IsActive() || !service_->GetSpace(space_id)) {
++    return;
++  }
++  if (presenter_ && presenter_->PresentSpace(space_id)) {
++    return;
++  }
++  ActivateSpace(space_id);
++}
++
++void SpacesWindowController::ActivateSpace(const std::string& space_id) {
+   if (!IsActive() || !service_->GetSpace(space_id) ||
+       space_id == GetVisibleSpaceId()) {
+     return;
+   }
+-  int best_index = TabStripModel::kNoTab;
++  tabs::TabInterface* tab = GetLastActiveTabOfSpace(space_id);
++  if (!tab) {
++    OpenNewTabInSpace(space_id);
++    return;
++  }
++  model_->ActivateTabAt(model_->GetIndexOfTab(tab),
++                        TabStripUserGestureDetails(
++                            TabStripUserGestureDetails::GestureType::kOther));
++}
++
++tabs::TabInterface* SpacesWindowController::GetLastActiveTabOfSpace(
++    const std::string& space_id) const {
++  if (!model_) {
++    return nullptr;
++  }
++  tabs::TabInterface* best = nullptr;
+   base::TimeTicks best_time;
+   for (int i = 0; i < model_->count(); ++i) {
+-    content::WebContents* contents = model_->GetWebContentsAt(i);
+-    if (GetSpaceIdOf(contents) != space_id) {
++    tabs::TabInterface* tab = model_->GetTabAtIndex(i);
++    if (GetSpaceIdOf(tab) != space_id) {
+       continue;
+     }
+-    const base::TimeTicks time = contents->GetLastActiveTimeTicks();
+-    if (best_index == TabStripModel::kNoTab || time > best_time) {
+-      best_index = i;
++    if (tab == model_->GetActiveTab()) {
++      return tab;
++    }
++    const base::TimeTicks time = tab->GetContents()->GetLastActiveTimeTicks();
++    if (!best || time > best_time) {
++      best = tab;
+       best_time = time;
+     }
+   }
+-  if (best_index == TabStripModel::kNoTab) {
+-    OpenNewTabInSpace(space_id);
+-    return;
+-  }
+-  model_->ActivateTabAt(best_index,
+-                        TabStripUserGestureDetails(
+-                            TabStripUserGestureDetails::GestureType::kOther));
++  return best;
++}
++
++bool SpacesWindowController::IsTabInSpace(const tabs::TabInterface* tab,
++                                          const std::string& space_id) const {
++  return IsActive() && tab && GetSpaceIdOf(tab) == space_id;
+ }
+ 
+ void SpacesWindowController::SwitchToSpaceAt(size_t index) {
+@@ -254,7 +305,11 @@ void SpacesWindowController::SwitchToSpa
+ }
+ 
+ void SpacesWindowController::SwitchToRelativeSpace(int delta) {
+-  std::optional<size_t> current = service_->GetSpaceIndex(GetVisibleSpaceId());
++  std::string from = presenter_ ? presenter_->GetTargetSpaceId() : std::string();
++  if (from.empty()) {
++    from = GetVisibleSpaceId();
++  }
++  std::optional<size_t> current = service_->GetSpaceIndex(from);
+   if (!current) {
+     return;
+   }
+--- a/chrome/browser/ui/neon/spaces/spaces_window_controller.h
++++ b/chrome/browser/ui/neon/spaces/spaces_window_controller.h
+@@ -9,6 +9,8 @@
+ #include <string>
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/callback_list.h"
++#include "base/functional/callback.h"
+ #include "base/memory/weak_ptr.h"
+ #include "chrome/browser/neon/spaces/spaces_service.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+@@ -49,6 +51,21 @@ namespace neon::spaces {
+ class SpacesWindowController : public TabStripModelObserver,
+                                public SpacesService::Observer {
+  public:
++  // Shows space switches to the user: the sidebar pager, which slides from one
++  // space to the next. Without a presenter a switch is immediate.
++  class Presenter {
++   public:
++    virtual ~Presenter() = default;
++    // Starts showing space |space_id|. The presenter calls ActivateSpace() when
++    // the switch takes effect. Returns false to let the controller switch
++    // immediately.
++    virtual bool PresentSpace(const std::string& space_id) = 0;
++    // The space the presenter is moving to, or empty when it is at rest.
++    virtual std::string GetTargetSpaceId() const = 0;
++    // The controller is going away.
++    virtual void OnControllerDestroying() = 0;
++  };
++
+   SpacesWindowController(BrowserWindowInterface* browser,
+                          SpacesService* service);
+   SpacesWindowController(const SpacesWindowController&) = delete;
+@@ -66,6 +83,13 @@ class SpacesWindowController : public Ta
+   // process.
+   static void InstallHooks();
+ 
++  // Runs |callback| for each controller created from now on. A window's
++  // views can be built before its controller exists.
++  using CreatedCallback =
++      base::RepeatingCallback<void(SpacesWindowController*)>;
++  static base::CallbackListSubscription RegisterCreatedCallback(
++      CreatedCallback callback);
++
+   BrowserWindowInterface* browser() const { return browser_; }
+   TabStripModel* model() const { return model_; }
+ 
+@@ -89,8 +113,25 @@ class SpacesWindowController : public Ta
+   // Shows the space at |index| in the space list.
+   void SwitchToSpaceAt(size_t index);
+   // Shows the next (|delta| 1) or previous (-1) space. Stops at the ends.
++  // Counts from the space the presenter is moving to, if any.
+   void SwitchToRelativeSpace(int delta);
+ 
++  // Makes |space_id| the visible space now, without the presenter: activates
++  // its most recently active tab, or opens a new tab page in it.
++  void ActivateSpace(const std::string& space_id);
++
++  // The tab of |space_id| that was active most recently, or null.
++  tabs::TabInterface* GetLastActiveTabOfSpace(const std::string& space_id) const;
++
++  // Whether |tab| belongs to |space_id|. False when inactive.
++  bool IsTabInSpace(const tabs::TabInterface* tab,
++                    const std::string& space_id) const;
++
++  SpacesService* service() const { return service_; }
++
++  void SetPresenter(Presenter* presenter) { presenter_ = presenter; }
++  Presenter* presenter() const { return presenter_; }
++
+   // The container a new tab of this window opens in when it has no source
+   // page: the visible space's, or for a window without tabs yet the visible
+   // space of the last active window. Empty for the default partition.
+@@ -128,6 +169,7 @@ class SpacesWindowController : public Ta
+   raw_ptr<BrowserWindowInterface> browser_;
+   raw_ptr<TabStripModel> model_;
+   raw_ptr<SpacesService> service_;
++  raw_ptr<Presenter> presenter_ = nullptr;
+   // Set while this controller opens a tab in a given space.
+   std::optional<std::string> pending_new_tab_space_;
+   // The visible space as of the last model change.
+--- a/chrome/browser/ui/views/frame/BUILD.gn
++++ b/chrome/browser/ui/views/frame/BUILD.gn
+@@ -461,6 +461,7 @@ source_set("base_tab_strip_region_view")
+     "//chrome/browser/ui/tabs",
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/views",
++    "//chrome/browser/ui/views/neon/spaces",
+     "//chrome/browser/ui/views/tabs/common",
+     "//chrome/browser/ui/views/tabs/common:impl",
+     "//components/tab_groups",
+--- a/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/base_tab_strip_region_view.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/frame/base_tab_strip_region_view.h"
+ 
++#include "chrome/browser/ui/views/neon/spaces/tab_strip_wrapper.h"
++
+ #include <memory>
+ #include <variant>
+ 
+@@ -429,6 +431,8 @@ views::View* BaseTabStripRegionView::Set
+ 
+   // Add the tab strip. Note that it may not be added as a direct child of
+   // `this`, but should appear in the hierarchy.
++  view = neon::spaces::WrapTabStripView(*this, browser_view_, orientation_,
++                                        std::move(view));
+   AddTabStripView(std::move(view));
+   CHECK(Contains(tab_strip_view_));
+ 
+@@ -447,6 +451,7 @@ void BaseTabStripRegionView::ClearTabStr
+   // Remove the tab strip. Note that the tab strip may not be a direct child of
+   // `this`. Hold onto the result temporarily so we can verify the view was
+   // removed without possibility of UAF.
++  neon::spaces::UnwrapTabStripView(tab_strip_view_);
+   const auto to_delete =
+       RemoveTabStripView(std::exchange(tab_strip_view_, nullptr));
+   CHECK_EQ(view, to_delete.get());
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/BUILD.gn
+@@ -0,0 +1,48 @@
++# Copyright 2026 The Neon Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++# The sidebar pager: one page per space in the vertical tab strip.
++source_set("spaces") {
++  sources = [
++    "space_icon_view.cc",
++    "space_icon_view.h",
++    "space_page_view.cc",
++    "space_page_view.h",
++    "spaces_pager_view.cc",
++    "spaces_pager_view.h",
++    "tab_strip_wrapper.cc",
++    "tab_strip_wrapper.h",
++  ]
++
++  public_deps = [
++    "//base",
++    "//chrome/browser/neon/spaces",
++    "//chrome/browser/ui/neon/spaces",
++    "//chrome/browser/ui/tabs:tab_strip_model_observer",
++    "//chrome/browser/ui/views/tabs/shared",
++    "//components/tabs:public",
++    "//ui/base/metadata",
++    "//ui/compositor",
++    "//ui/gfx",
++    "//ui/views",
++  ]
++
++  deps = [
++    "//base:i18n",
++    "//cc/paint",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui:layout_constants",
++    "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/color:color_headers",
++    "//chrome/browser/ui/tabs",
++    "//chrome/browser/ui/tabs:tab_strip",
++    "//chrome/browser/ui/views/frame",
++    "//chrome/browser/ui/views/frame:browser_view_header",
++    "//chrome/browser/ui/views/tabs/common",
++    "//chrome/browser/ui/views/tabs/common:impl",
++    "//ui/accessibility",
++    "//ui/color",
++    "//ui/gfx:animation_scale",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/space_icon_view.cc
+@@ -0,0 +1,164 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/neon/spaces/space_icon_view.h"
++
++#include "base/functional/bind.h"
++#include "base/i18n/case_conversion.h"
++#include "base/strings/utf_string_conversions.h"
++#include "cc/paint/paint_flags.h"
++#include "chrome/browser/neon/spaces/space.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/color_utils.h"
++#include "ui/gfx/font_list.h"
++#include "ui/gfx/geometry/rect_f.h"
++#include "ui/gfx/image/canvas_image_source.h"
++#include "ui/gfx/text_constants.h"
++
++namespace neon::spaces {
++
++namespace {
++
++// How strongly an icon that is not emphasized is drawn.
++constexpr SkAlpha kFadedAlpha = 0x8c;
++
++class SpaceIconSource : public gfx::CanvasImageSource {
++ public:
++  SpaceIconSource(std::u16string glyph,
++                  SkColor color,
++                  SkColor text_color,
++                  int size)
++      : gfx::CanvasImageSource(gfx::Size(size, size)),
++        glyph_(std::move(glyph)),
++        color_(color),
++        text_color_(text_color) {}
++
++  void Draw(gfx::Canvas* canvas) override {
++    PaintSpaceIcon(canvas, gfx::RectF(gfx::SizeF(size())), size().width(),
++                   glyph_, color_, text_color_, /*emphasized=*/true);
++  }
++
++ private:
++  const std::u16string glyph_;
++  const SkColor color_;
++  const SkColor text_color_;
++};
++
++}  // namespace
++
++std::u16string GetSpaceGlyph(const Space& space) {
++  if (!space.icon.empty()) {
++    return base::UTF8ToUTF16(space.icon);
++  }
++  std::u16string name = base::UTF8ToUTF16(space.name);
++  if (name.empty()) {
++    return std::u16string();
++  }
++  return base::i18n::ToUpper(name.substr(0, 1));
++}
++
++SpaceIconView::SpaceIconView(int size) : size_(size) {
++  SetCanProcessEventsWithinSubtree(false);
++}
++
++SpaceIconView::~SpaceIconView() = default;
++
++void SpaceIconView::SetSpace(const Space& space) {
++  std::u16string glyph = GetSpaceGlyph(space);
++  if (glyph == glyph_ && space.color == color_) {
++    return;
++  }
++  glyph_ = std::move(glyph);
++  color_ = space.color;
++  SchedulePaint();
++}
++
++void SpaceIconView::SetEmphasized(bool emphasized) {
++  if (emphasized_ != emphasized) {
++    emphasized_ = emphasized;
++    SchedulePaint();
++  }
++}
++
++gfx::Size SpaceIconView::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  return gfx::Size(size_, size_);
++}
++
++void SpaceIconView::OnPaint(gfx::Canvas* canvas) {
++  const ui::ColorProvider* colors = GetColorProvider();
++  if (!colors) {
++    return;
++  }
++  PaintSpaceIcon(canvas, gfx::RectF(GetContentsBounds()), size_, glyph_,
++                 color_, colors->GetColor(kColorTabForegroundActiveFrameActive),
++                 emphasized_);
++}
++
++void PaintSpaceIcon(gfx::Canvas* canvas,
++                    const gfx::RectF& area,
++                    int size,
++                    const std::u16string& glyph,
++                    SkColor color,
++                    SkColor text_color,
++                    bool emphasized) {
++  const bool has_color = SkColorGetA(color) != 0;
++  gfx::RectF bounds = area;
++  bounds.ClampToCenteredSize(gfx::SizeF(size, size));
++  const float radius = size / 4.0f;
++
++  cc::PaintFlags flags;
++  flags.setAntiAlias(true);
++  SkColor glyph_color;
++  if (has_color) {
++    const SkColor fill = SkColorSetA(color, SK_AlphaOPAQUE);
++    flags.setColor(emphasized ? fill : SkColorSetA(fill, kFadedAlpha));
++    canvas->DrawRoundRect(bounds, radius, flags);
++    glyph_color = color_utils::GetColorWithMaxContrast(fill);
++  } else {
++    const float stroke = 1.5f;
++    flags.setStyle(cc::PaintFlags::kStroke_Style);
++    flags.setStrokeWidth(stroke);
++    flags.setColor(emphasized ? text_color
++                              : SkColorSetA(text_color, kFadedAlpha));
++    gfx::RectF ring = bounds;
++    ring.Inset(stroke / 2);
++    canvas->DrawRoundRect(ring, radius, flags);
++    glyph_color = text_color;
++  }
++  if (!emphasized) {
++    glyph_color = SkColorSetA(glyph_color, kFadedAlpha);
++  }
++  if (glyph.empty()) {
++    return;
++  }
++  const gfx::FontList font_list =
++      gfx::FontList().DeriveWithSizeDelta(size / 2 - 12).DeriveWithWeight(
++          gfx::Font::Weight::SEMIBOLD);
++  canvas->DrawStringRectWithFlags(glyph, font_list, glyph_color,
++                                  gfx::ToEnclosingRect(bounds),
++                                  gfx::Canvas::TEXT_ALIGN_CENTER);
++}
++
++ui::ImageModel GetSpaceIconImage(const Space& space, int size) {
++  return ui::ImageModel::FromImageGenerator(
++      base::BindRepeating(
++          [](std::u16string glyph, SkColor color, int size,
++             const ui::ColorProvider* colors) {
++            const SkColor text_color =
++                colors->GetColor(kColorTabForegroundActiveFrameActive);
++            return gfx::CanvasImageSource::MakeImageSkia<SpaceIconSource>(
++                glyph, color, text_color, size);
++          },
++          GetSpaceGlyph(space), space.color, size),
++      gfx::Size(size, size));
++}
++
++BEGIN_METADATA(SpaceIconView)
++END_METADATA
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/space_icon_view.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_ICON_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_ICON_VIEW_H_
++
++#include <string>
++
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/models/image_model.h"
++#include "ui/views/view.h"
++
++namespace gfx {
++class Canvas;
++class RectF;
++}  // namespace gfx
++
++namespace neon::spaces {
++
++struct Space;
++
++// A space's icon: a rounded square in the space's colour with its icon (an
++// emoji or a letter) in the middle. A space without a colour (the default
++// space unless the user picked one) is drawn as an outline in the text colour.
++class SpaceIconView : public views::View {
++  METADATA_HEADER(SpaceIconView, views::View)
++
++ public:
++  explicit SpaceIconView(int size);
++  SpaceIconView(const SpaceIconView&) = delete;
++  SpaceIconView& operator=(const SpaceIconView&) = delete;
++  ~SpaceIconView() override;
++
++  void SetSpace(const Space& space);
++  // Draws at full strength when |emphasized|, faded otherwise.
++  void SetEmphasized(bool emphasized);
++
++  // views::View:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++  void OnPaint(gfx::Canvas* canvas) override;
++
++ private:
++  const int size_;
++  std::u16string glyph_;
++  SkColor color_ = SK_ColorTRANSPARENT;
++  bool emphasized_ = true;
++};
++
++// The text drawn in a space's icon: its icon, or the first letter of its name.
++std::u16string GetSpaceGlyph(const Space& space);
++
++// Paints a space's icon of |size| centred in |bounds|. |text_color| is used for
++// the outline of a space without a colour.
++void PaintSpaceIcon(gfx::Canvas* canvas,
++                    const gfx::RectF& bounds,
++                    int size,
++                    const std::u16string& glyph,
++                    SkColor color,
++                    SkColor text_color,
++                    bool emphasized);
++
++// A space's icon as an image, for menus.
++ui::ImageModel GetSpaceIconImage(const Space& space, int size);
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_ICON_VIEW_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/space_page_view.cc
+@@ -0,0 +1,321 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/neon/spaces/space_page_view.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/logging.h"
++#include "content/public/browser/web_contents.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/neon/spaces/space.h"
++#include "chrome/browser/ui/layout_constants.h"
++#include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/views/neon/spaces/space_icon_view.h"
++#include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h"
++#include "chrome/browser/ui/views/tabs/common/root_tab_collection_node.h"
++#include "chrome/browser/ui/views/tabs/common/tab_collection_node.h"
++#include "chrome/browser/ui/views/tabs/common/tab_collection_animating_layout_manager.h"
++#include "chrome/browser/ui/views/tabs/common/tab_drag_handler.h"
++#include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.h"
++#include "chrome/browser/ui/views/tabs/common/tab_strip_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/compositor/layer.h"
++#include "ui/gfx/font.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/controls/scroll_view.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/style/typography.h"
++#include "ui/views/view_utils.h"
++
++namespace neon::spaces {
++
++namespace {
++
++constexpr int kHeaderHeight = 28;
++constexpr int kHeaderIconSize = 16;
++// The header icon sits where the tabs' favicons are.
++constexpr int kTabFaviconInset = 7;
++
++}  // namespace
++
++SpacePageView::SpacePageView(std::unique_ptr<views::View> tab_strip_view) {
++  Init();
++  AddTabStripView(std::move(tab_strip_view));
++}
++
++SpacePageView::SpacePageView(TabStripModel* model,
++                             BrowserView* browser_view,
++                             TabStripRegionView& region)
++    : model_(model) {
++  Init();
++  // A second view of the model, built the way
++  // BaseTabStripRegionView::InitializeTabStrip() builds the window's, but
++  // observing the model like any observer and without hover cards.
++  root_ = std::make_unique<RootTabCollectionNode>(
++      model,
++      base::BindRepeating(&SpacePageView::AddTabStripView,
++                          base::Unretained(this)),
++      base::BindRepeating(&SpacePageView::RemoveTabStripView,
++                          base::Unretained(this)),
++      TabStripOrientation::kVertical);
++  drag_handler_ = std::make_unique<TabDragHandler>(*model, *root_, region);
++  controller_ = std::make_unique<TabStripCollectionController>(
++      model, browser_view, *root_, *drag_handler_,
++      /*hover_card_controller=*/nullptr, TabStripOrientation::kVertical);
++  root_->SetController(controller_.get());
++  // Shows nothing until it is given a space.
++  SetPageSpace(controller_.get(), std::string(), tabs::TabHandle());
++  root_->Init(/*register_as_tab_strip_ui=*/false);
++
++  // A peek page is a picture of a space: it takes no input and is left out of
++  // the accessibility tree (the window's tab strip is the one users act on).
++  SetCanProcessEventsWithinSubtree(false);
++  GetViewAccessibility().SetIsLeaf(true);
++  GetViewAccessibility().SetIsIgnored(true);
++}
++
++SpacePageView::~SpacePageView() {
++  if (root_) {
++    ClearPageSpace(controller_.get());
++    root_->Reset();
++    root_->SetController(nullptr);
++    controller_.reset();
++    drag_handler_.reset();
++    root_.reset();
++  }
++}
++
++void SpacePageView::Init() {
++  SetPaintToLayer();
++  layer()->SetFillsBoundsOpaquely(false);
++
++  auto header = std::make_unique<views::View>();
++  auto* layout = header->SetLayoutManager(std::make_unique<views::BoxLayout>(
++      views::BoxLayout::Orientation::kHorizontal,
++      gfx::Insets::TLBR(0,
++                        GetLayoutConstant(
++                            LayoutConstant::kVerticalTabStripHorizontalPadding) +
++                            kTabFaviconInset,
++                        0, kTabFaviconInset),
++      /*between_child_spacing=*/8));
++  layout->set_cross_axis_alignment(
++      views::BoxLayout::CrossAxisAlignment::kCenter);
++  header_icon_ =
++      header->AddChildView(std::make_unique<SpaceIconView>(kHeaderIconSize));
++  auto label = std::make_unique<views::Label>(
++      std::u16string(), views::style::CONTEXT_LABEL,
++      views::style::STYLE_SECONDARY);
++  label->SetHorizontalAlignment(gfx::ALIGN_TO_HEAD);
++  label->SetFontList(
++      label->font_list().DeriveWithWeight(gfx::Font::Weight::MEDIUM));
++  label->SetElideBehavior(gfx::ELIDE_TAIL);
++  // Drawn on the page's transparent layer.
++  label->SetSubpixelRenderingEnabled(false);
++  header_label_ = header->AddChildView(std::move(label));
++  layout->SetFlexForView(header_label_, 1);
++  header->SetVisible(false);
++  header_ = AddChildView(std::move(header));
++}
++
++views::View* SpacePageView::AddTabStripView(std::unique_ptr<views::View> view) {
++  tab_strip_ = views::AsViewClass<TabStripView>(view.get());
++  CHECK(tab_strip_);
++  return AddChildView(std::move(view));
++}
++
++void SpacePageView::RemoveTabStripView(views::View* view) {
++  CHECK_EQ(view, tab_strip_.get());
++  tab_strip_ = nullptr;
++  RemoveChildViewT(view);
++}
++
++std::unique_ptr<views::View> SpacePageView::TakeTabStripView() {
++  CHECK(!is_peek());
++  views::View* view = std::exchange(tab_strip_, nullptr);
++  return view ? RemoveChildViewT(view) : nullptr;
++}
++
++void SpacePageView::ShowSpace(const std::string& space_id,
++                              tabs::TabInterface* active_tab) {
++  CHECK(is_peek());
++  const tabs::TabHandle new_active =
++      active_tab ? active_tab->GetHandle() : tabs::TabHandle();
++  if (space_id == space_id_ && new_active == active_tab_) {
++    return;
++  }
++  tabs::TabInterface* old_active = active_tab_.Get();
++  const bool space_changed = space_id != space_id_;
++  space_id_ = space_id;
++  active_tab_ = new_active;
++  SetPageSpace(controller_.get(), space_id_, active_tab_);
++  // Tabs work out whether they are active when their selection changes.
++  for (tabs::TabInterface* tab : {old_active, active_tab}) {
++    if (!tab || model_->GetIndexOfTab(tab) == TabStripModel::kNoTab) {
++      continue;
++    }
++    if (TabCollectionNode* node = root_->GetNodeForHandle(tab->GetHandle())) {
++      node->NotifyTabSelectionChanged();
++    }
++  }
++  if (space_changed) {
++    InvalidateTabLayout();
++  }
++}
++
++void SpacePageView::ClearSpace() {
++  if (space_id_.empty()) {
++    return;
++  }
++  ShowSpace(std::string(), nullptr);
++}
++
++void SpacePageView::SetHeader(const Space* space, bool show) {
++  if (space) {
++    header_icon_->SetSpace(*space);
++    header_label_->SetText(base::UTF8ToUTF16(space->name));
++  }
++  if (header_->GetVisible() != (show && space)) {
++    header_->SetVisible(show && space);
++    InvalidateLayout();
++  }
++}
++
++void SpacePageView::SetCollapsed(bool collapsed) {
++  if (tab_strip_) {
++    tab_strip_->SetCollapsedState(collapsed);
++  }
++}
++
++int SpacePageView::GetScroll() const {
++  if (!tab_strip_ || !tab_strip_->unpinned_tabs_scroll_view()) {
++    return 0;
++  }
++  return tab_strip_->unpinned_tabs_scroll_view()->GetVisibleRect().y();
++}
++
++void SpacePageView::ApplyScroll(std::optional<int> offset,
++                                const tabs::TabInterface* tab) {
++  if (!tab_strip_) {
++    return;
++  }
++  views::ScrollView* scroll_view = tab_strip_->unpinned_tabs_scroll_view();
++  if (scroll_view && scroll_view->contents()) {
++    const int max_offset = std::max(
++        0, scroll_view->contents()->height() -
++               scroll_view->GetVisibleRect().height());
++    scroll_view->ScrollToOffset(
++        gfx::PointF(0, std::clamp(offset.value_or(0), 0, max_offset)));
++  }
++  if (offset) {
++    // The tab strip scrolls a newly active tab into view after its next
++    // layout; the space comes back where it was left instead.
++    for (views::ScrollView* view : {scroll_view,
++                                    tab_strip_->pinned_tabs_scroll_view()}) {
++      if (view) {
++        view->RegisterPostLayoutCallback(base::DoNothing());
++      }
++    }
++  } else if (tab) {
++    tab_strip_->ScrollToFitTabs(tab, nullptr);
++  }
++  if (scroll_view) {
++    scroll_view->InvalidateLayout();
++  }
++  if (tab_strip_->pinned_tabs_scroll_view()) {
++    tab_strip_->pinned_tabs_scroll_view()->InvalidateLayout();
++  }
++}
++
++void SpacePageView::StepLoadingAnimations(base::TimeDelta elapsed) {
++  if (!root_) {
++    return;
++  }
++  for (tabs::TabInterface* tab : *model_) {
++    if (TabCollectionNode* node = root_->GetNodeForHandle(tab->GetHandle())) {
++      if (auto* tab_view = views::AsViewClass<TabView>(node->view())) {
++        tab_view->StepLoadingAnimation(elapsed);
++      }
++    }
++  }
++}
++
++void SpacePageView::InvalidateTabLayout() {
++  if (!tab_strip_) {
++    return;
++  }
++  if (views::View* pinned = tab_strip_->GetPinnedTabsContainer()) {
++    pinned->InvalidateLayout();
++  }
++  if (views::View* unpinned = tab_strip_->GetUnpinnedTabsContainer()) {
++    unpinned->InvalidateLayout();
++  }
++  tab_strip_->InvalidateLayout();
++}
++
++bool SpacePageView::SnapTabLayout() {
++  if (!tab_strip_) {
++    return false;
++  }
++  bool snapped = false;
++  std::vector<views::View*> pending = {tab_strip_};
++  while (!pending.empty()) {
++    views::View* view = pending.back();
++    pending.pop_back();
++    for (views::View* child : view->children()) {
++      pending.push_back(child);
++    }
++    // These install a TabCollectionAnimatingLayoutManager as their layout.
++    if (!views::IsViewClass<PinnedTabContainerView>(view) &&
++        !views::IsViewClass<UnpinnedTabContainerView>(view) &&
++        !views::IsViewClass<TabGroupView>(view)) {
++      continue;
++    }
++    auto* manager = static_cast<TabCollectionAnimatingLayoutManager*>(
++        view->GetLayoutManager());
++    if (!manager || !manager->is_animating()) {
++      continue;
++    }
++    std::vector<const views::View*> children(view->children().begin(),
++                                             view->children().end());
++    manager->ResetViewsToTargetLayout(children);
++    snapped = true;
++  }
++  return snapped;
++}
++
++int SpacePageView::GetHeaderHeight() const {
++  return header_->GetVisible() ? kHeaderHeight : 0;
++}
++
++void SpacePageView::Layout(PassKey) {
++  const int header_height = GetHeaderHeight();
++  header_->SetBounds(0, 0, width(), header_height);
++  if (tab_strip_) {
++    tab_strip_->SetBounds(0, header_height, width(),
++                          std::max(0, height() - header_height));
++  }
++}
++
++gfx::Size SpacePageView::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  gfx::Size size = tab_strip_ ? tab_strip_->GetPreferredSize(available_size)
++                              : gfx::Size();
++  size.Enlarge(0, GetHeaderHeight());
++  return size;
++}
++
++BEGIN_METADATA(SpacePageView)
++END_METADATA
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/space_page_view.h
+@@ -0,0 +1,128 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_PAGE_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_PAGE_VIEW_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "base/time/time.h"
++#include "components/tabs/public/tab_interface.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/views/view.h"
++
++class BrowserView;
++class RootTabCollectionNode;
++class TabDragHandler;
++class TabStripCollectionController;
++class TabStripModel;
++class TabStripRegionView;
++class TabStripView;
++
++namespace views {
++class Label;
++}  // namespace views
++
++namespace neon::spaces {
++
++struct Space;
++class SpaceIconView;
++
++// One page of the sidebar pager: the space's name at the top and a tab strip
++// below. The real page holds the window's own TabStripView, which always shows
++// the visible space. A peek page builds a second, live tab strip on the same
++// tab strip model (its own RootTabCollectionNode and controller, as
++// BaseTabStripRegionView::InitializeTabStrip does) and shows the space it is
++// given; the pager uses it for the neighbouring spaces while pages slide.
++class SpacePageView : public views::View {
++  METADATA_HEADER(SpacePageView, views::View)
++
++ public:
++  // The real page, around the window's tab strip view.
++  explicit SpacePageView(std::unique_ptr<views::View> tab_strip_view);
++  // A peek page: a live tab strip of |model|, input disabled.
++  SpacePageView(TabStripModel* model,
++                BrowserView* browser_view,
++                TabStripRegionView& region);
++  SpacePageView(const SpacePageView&) = delete;
++  SpacePageView& operator=(const SpacePageView&) = delete;
++  ~SpacePageView() override;
++
++  bool is_peek() const { return root_ != nullptr; }
++  TabStripView* tab_strip() const { return tab_strip_; }
++
++  // The real page gives back the window's tab strip view.
++  std::unique_ptr<views::View> TakeTabStripView();
++
++  // Peek pages: shows space |space_id| with |active_tab| drawn as active. The
++  // tab strip lays out again at the next layout; ApplyScroll() then scrolls.
++  void ShowSpace(const std::string& space_id, tabs::TabInterface* active_tab);
++  // Stops showing a space (the page is not in use).
++  void ClearSpace();
++  // The space a peek page shows, or empty.
++  const std::string& space_id() const { return space_id_; }
++  tabs::TabInterface* active_tab() const { return active_tab_.Get(); }
++
++  // Updates the header. Hidden when |show| is false.
++  void SetHeader(const Space* space, bool show);
++
++  // Mirrors the window's tab strip collapse state.
++  void SetCollapsed(bool collapsed);
++
++  // The scroll offset of the unpinned tabs.
++  int GetScroll() const;
++  // Scrolls the unpinned tabs to |offset| exactly, overriding the tab strip's
++  // own scrolling of a newly active tab into view. Without an offset (a space
++  // not shown before), scrolls to the top and then just enough to show |tab|,
++  // the way the tab strip scrolls a newly active tab into view. Takes effect
++  // at the next layout.
++  void ApplyScroll(std::optional<int> offset, const tabs::TabInterface* tab);
++
++  // Advances the throbbers of loading tabs (peek pages; the window steps the
++  // real page).
++  void StepLoadingAnimations(base::TimeDelta elapsed);
++
++  // Invalidates the layout of every container of the tab strip, after the set
++  // of tabs it shows changed.
++  void InvalidateTabLayout();
++
++  // Puts every tab of the tab strip at its place in the current layout at
++  // once. The tab strip animates layout changes that happen while one of its
++  // animations runs (a tab just opened or moved); a change of space must not
++  // animate inside the page while the page itself moves. Returns whether
++  // anything was animating.
++  bool SnapTabLayout();
++
++  // views::View:
++  void Layout(PassKey) override;
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++
++ private:
++  void Init();
++  views::View* AddTabStripView(std::unique_ptr<views::View> view);
++  void RemoveTabStripView(views::View* view);
++  int GetHeaderHeight() const;
++
++  raw_ptr<views::View> header_ = nullptr;
++  raw_ptr<SpaceIconView> header_icon_ = nullptr;
++  raw_ptr<views::Label> header_label_ = nullptr;
++  raw_ptr<TabStripView> tab_strip_ = nullptr;
++
++  // Peek pages only.
++  raw_ptr<TabStripModel> model_ = nullptr;
++  std::unique_ptr<RootTabCollectionNode> root_;
++  std::unique_ptr<TabDragHandler> drag_handler_;
++  std::unique_ptr<TabStripCollectionController> controller_;
++  std::string space_id_;
++  tabs::TabHandle active_tab_;
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_PAGE_VIEW_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/spaces_pager_view.cc
+@@ -0,0 +1,873 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/neon/spaces/spaces_pager_view.h"
++
++#include <algorithm>
++#include <cmath>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/i18n/rtl.h"
++#include "base/metrics/histogram_functions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/neon/spaces/space.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/neon/spaces/space_page_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_strip_view.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/compositor/compositor.h"
++#include "ui/compositor/layer.h"
++#include "ui/gfx/animation/animation.h"
++#include "ui/gfx/scoped_animation_duration_scale_mode.h"
++#include "ui/gfx/animation/tween.h"
++#include "ui/gfx/geometry/transform.h"
++#include "ui/views/view_class_properties.h"
++#include "ui/views/widget/widget.h"
++
++namespace neon::spaces {
++
++namespace {
++
++// A full page turn takes as long as the tab strip's own layout animations.
++constexpr base::TimeDelta kPageTurnDuration = base::Milliseconds(200);
++// A settle shorter than a page is quicker, but not below this share.
++constexpr double kMinDurationShare = 0.4;
++// Releasing past this share of a page turns it.
++constexpr double kTurnThreshold = 1.0 / 3.0;
++// Releasing faster than this (DIPs per second) turns the page in that
++// direction whatever the distance.
++constexpr double kFlingVelocity = 500;
++// The pager's share of the region's extra height against the views below.
++constexpr int kFlexWeight = 10000;
++// Throbbers of peek pages advance at this rate while they show.
++constexpr base::TimeDelta kLoadingAnimationInterval = base::Milliseconds(30);
++
++// How far the pages follow the fingers past the first or last space: |over|
++// pages of finger travel give this many pages of movement.
++double RubberBand(double over) {
++  return 1.0 - 1.0 / (over * 0.55 + 1.0);
++}
++
++void ReportSmoothness(const cc::FrameSequenceMetrics::CustomReportData& data) {
++  if (!data.frames_expected_v3) {
++    return;
++  }
++  base::UmaHistogramCounts1000("Neon.Spaces.Pager.FramesExpected",
++                               data.frames_expected_v3);
++  base::UmaHistogramCounts1000("Neon.Spaces.Pager.FramesDropped",
++                               data.frames_dropped_v3);
++  base::UmaHistogramPercentage(
++      "Neon.Spaces.Pager.Smoothness",
++      100 - static_cast<int>(100.0 * data.frames_dropped_v3 /
++                             data.frames_expected_v3));
++  base::UmaHistogramCounts1000("Neon.Spaces.Pager.Janks", data.jank_count_v3);
++}
++
++}  // namespace
++
++SpacesPagerView::SpacesPagerView(TabStripRegionView& region,
++                                 BrowserView* browser_view,
++                                 std::unique_ptr<views::View> tab_strip_view)
++    : AnimationDelegateViews(this),
++      region_(region),
++      browser_view_(browser_view),
++      model_(browser_view->browser()->GetTabStripModel()) {
++  // Pages move by transform inside the pager's bounds.
++  SetPaintToLayer();
++  layer()->SetFillsBoundsOpaquely(false);
++  layer()->SetMasksToBounds(true);
++
++  real_page_ = AddChildView(
++      std::make_unique<SpacePageView>(std::move(tab_strip_view)));
++
++  loading_animation_start_ = base::TimeTicks::Now();
++  model_->AddObserver(this);
++  if (auto* state_controller = tabs::VerticalTabStripStateController::From(
++          browser_view_->browser())) {
++    collapse_subscription_ =
++        state_controller->RegisterOnCollapseChanged(base::BindRepeating(
++            [](SpacesPagerView* pager, tabs::VerticalTabStripCollapseState) {
++              pager->OnCollapseStateChanged();
++            },
++            base::Unretained(this)));
++  }
++
++  if (SpacesWindowController* controller =
++          SpacesWindowController::FromBrowser(browser_view_->browser())) {
++    BindController(controller);
++  } else {
++    controller_created_subscription_ =
++        SpacesWindowController::RegisterCreatedCallback(base::BindRepeating(
++            [](SpacesPagerView* pager, SpacesWindowController* controller) {
++              if (controller->browser() == pager->browser_view_->browser()) {
++                pager->BindController(controller);
++              }
++            },
++            base::Unretained(this)));
++  }
++}
++
++SpacesPagerView::~SpacesPagerView() {
++  // The row observes the pager: remove it while the pager is whole.
++  SetBottomView(nullptr);
++  animation_.Stop();
++  loading_timer_.Stop();
++  UnbindController();
++  if (model_) {
++    model_->RemoveObserver(this);
++  }
++  DestroyPeeks();
++}
++
++void SpacesPagerView::BindController(SpacesWindowController* controller) {
++  controller_created_subscription_ = {};
++  controller_ = controller;
++  controller_->SetPresenter(this);
++  spaces_observation_.Observe(controller_->service());
++  expected_visible_space_ = GetVisibleSpaceId();
++  strip_ = {expected_visible_space_};
++  UpdateActiveState();
++}
++
++void SpacesPagerView::UnbindController() {
++  if (!controller_) {
++    return;
++  }
++  animation_.Stop();
++  spaces_observation_.Reset();
++  if (controller_->presenter() == this) {
++    controller_->SetPresenter(nullptr);
++  }
++  controller_ = nullptr;
++}
++
++void SpacesPagerView::OnControllerDestroying() {
++  UnbindController();
++  UpdateActiveState();
++}
++
++// static
++SpacesPagerView* SpacesPagerView::FromTabStripView(
++    views::View* tab_strip_view) {
++  for (views::View* view = tab_strip_view; view; view = view->parent()) {
++    if (auto* pager = views::AsViewClass<SpacesPagerView>(view)) {
++      return pager;
++    }
++  }
++  return nullptr;
++}
++
++std::unique_ptr<views::View> SpacesPagerView::TakeTabStripView() {
++  animation_.Stop();
++  DestroyPeeks();
++  return real_page_->TakeTabStripView();
++}
++
++bool SpacesPagerView::IsActive() const {
++  return model_ && controller_ && controller_->IsActive();
++}
++
++std::string SpacesPagerView::GetVisibleSpaceId() const {
++  return model_ && controller_ ? controller_->GetVisibleSpaceId()
++                               : std::string();
++}
++
++int SpacesPagerView::GetSpaceIndex(const std::string& space_id) const {
++  if (!controller_) {
++    return -1;
++  }
++  std::optional<size_t> index = controller_->service()->GetSpaceIndex(space_id);
++  return index ? static_cast<int>(*index) : -1;
++}
++
++const Space* SpacesPagerView::GetSpace(const std::string& space_id) const {
++  return controller_ ? controller_->service()->GetSpace(space_id) : nullptr;
++}
++
++void SpacesPagerView::ShowSpace(const std::string& space_id) {
++  if (controller_) {
++    controller_->SwitchToSpace(space_id);
++  }
++}
++
++bool SpacesPagerView::ShouldAnimate() const {
++  // On Linux ShouldRenderRichAnimation() follows the desktop's animation
++  // setting only, so ask for reduced motion too.
++  return gfx::Animation::ShouldRenderRichAnimation() &&
++         !gfx::Animation::PrefersReducedMotion() &&
++         gfx::ScopedAnimationDurationScaleMode::duration_multiplier() > 0 &&
++         GetWidget() && GetWidget()->IsVisible() && width() > 0;
++}
++
++bool SpacesPagerView::PresentSpace(const std::string& space_id) {
++  if (!active_ || GetSpaceIndex(space_id) < 0) {
++    return false;
++  }
++  dragging_ = false;
++  if (!ShouldAnimate()) {
++    // Switches at once, keeping each space's scroll position.
++    animation_.Stop();
++    strip_ = {GetVisibleSpaceId()};
++    position_ = 0;
++    if (GetWidget() && width() > 0) {
++      Commit(space_id);
++    } else {
++      controller_->ActivateSpace(space_id);
++    }
++    SettleAtRest();
++    return true;
++  }
++  if (strip_.size() == 1 && strip_.front() == space_id &&
++      !animation_.is_animating()) {
++    return true;
++  }
++
++  // Keep the spaces on screen where they are and put the target next to
++  // them, on the side of its place in the space order.
++  const int last = static_cast<int>(strip_.size()) - 1;
++  const int first_shown = std::clamp(static_cast<int>(std::floor(position_)),
++                                     0, last);
++  const int last_shown =
++      std::clamp(static_cast<int>(std::ceil(position_)), 0, last);
++  std::vector<std::string> strip(strip_.begin() + first_shown,
++                                 strip_.begin() + last_shown + 1);
++  double position = position_ - first_shown;
++  int target = static_cast<int>(std::ranges::find(strip, space_id) -
++                                strip.begin());
++  if (target == static_cast<int>(strip.size())) {
++    const int nearest = std::clamp(static_cast<int>(std::lround(position)), 0,
++                                   static_cast<int>(strip.size()) - 1);
++    if (GetSpaceIndex(space_id) > GetSpaceIndex(strip[nearest])) {
++      strip.push_back(space_id);
++      target = static_cast<int>(strip.size()) - 1;
++    } else {
++      strip.insert(strip.begin(), space_id);
++      position += 1;
++      target = 0;
++    }
++  }
++  const bool was_moving = animation_.is_animating();
++  animation_.Stop();
++  strip_ = std::move(strip);
++  position_ = position;
++  StartMetrics();
++  Commit(space_id);
++  if (GetVisibleSpaceId() != space_id) {
++    SettleAtRest();
++    return true;
++  }
++  AnimateTo(target, /*ease_in=*/!was_moving);
++  return true;
++}
++
++std::string SpacesPagerView::GetTargetSpaceId() const {
++  if (strip_.size() <= 1 && !dragging_) {
++    return std::string();
++  }
++  // Moves always end on the visible space (see Commit()).
++  return GetVisibleSpaceId();
++}
++
++void SpacesPagerView::Commit(const std::string& space_id) {
++  const std::string visible = GetVisibleSpaceId();
++  if (space_id == visible) {
++    return;
++  }
++  // A scroll the tab strip has pending (a newly active tab scrolled into view
++  // over the next layouts) belongs to where the space is left.
++  if (GetWidget()) {
++    GetWidget()->LayoutRootViewIfNecessary();
++    GetWidget()->LayoutRootViewIfNecessary();
++  }
++  saved_scroll_[visible] = real_page_->GetScroll();
++  SpacePageView* shown = FindPeekShowing(space_id);
++  const std::optional<int> scroll =
++      shown ? std::optional<int>(shown->GetScroll()) : GetSavedScroll(space_id);
++
++  expected_visible_space_ = space_id;
++  controller_->ActivateSpace(space_id);
++  expected_visible_space_ = GetVisibleSpaceId();
++
++  // The real page now shows |space_id| and a peek page takes the slot of the
++  // space that was visible. Lay both out before anything is drawn.
++  UpdateHeaders();
++  AssignPages();
++  if (GetWidget()) {
++    GetWidget()->LayoutRootViewIfNecessary();
++  }
++  real_page_->SnapTabLayout();
++  ScrollPage(real_page_, scroll, model_->GetActiveTab());
++  UpdateTransforms();
++  NotifyPositionChanged();
++}
++
++void SpacesPagerView::ScrollPage(SpacePageView* page,
++                                 std::optional<int> offset,
++                                 const tabs::TabInterface* tab) {
++  // The tab list's height settles over a couple of layouts after the set of
++  // tabs changes; scroll once it holds the offset.
++  for (int attempt = 0; attempt < 3; ++attempt) {
++    if (GetWidget()) {
++      GetWidget()->LayoutRootViewIfNecessary();
++    }
++    page->ApplyScroll(offset, tab);
++    if (GetWidget()) {
++      GetWidget()->LayoutRootViewIfNecessary();
++    }
++    if (!offset || page->GetScroll() == *offset) {
++      return;
++    }
++  }
++}
++
++void SpacesPagerView::AnimateTo(double target, bool ease_in) {
++  animation_start_ = position_;
++  animation_target_ = target;
++  const double distance = std::abs(target - position_);
++  const base::TimeDelta duration =
++      kPageTurnDuration * std::clamp(distance, kMinDurationShare, 1.0);
++  if (distance == 0 || !ShouldAnimate()) {
++    position_ = target;
++    SettleAtRest();
++    return;
++  }
++  animation_.SetSlideDuration(duration);
++  animation_.SetTweenType(ease_in ? gfx::Tween::EASE_IN_OUT
++                                  : gfx::Tween::EASE_OUT);
++  animation_.Reset(0);
++  animation_.Show();
++}
++
++void SpacesPagerView::AnimationProgressed(const gfx::Animation* animation) {
++  position_ = animation_start_ + (animation_target_ - animation_start_) *
++                                     animation_.GetCurrentValue();
++  AssignPages();
++  UpdateTransforms();
++  NotifyPositionChanged();
++}
++
++void SpacesPagerView::AnimationEnded(const gfx::Animation* animation) {
++  position_ = animation_target_;
++  SettleAtRest();
++}
++
++void SpacesPagerView::AnimationCanceled(const gfx::Animation* animation) {
++  // Stop() was called by the pager, which goes on from the current position.
++}
++
++void SpacesPagerView::SettleAtRest() {
++  animation_.Stop();
++  dragging_ = false;
++  expected_visible_space_ = GetVisibleSpaceId();
++  strip_ = {expected_visible_space_};
++  position_ = 0;
++  StopMetrics();
++  UpdateHeaders();
++  AssignPages();
++  UpdateTransforms();
++  NotifyPositionChanged();
++}
++
++bool SpacesPagerView::CanDrag() const {
++  return active_ && GetWidget() && width() > 0 &&
++         region_->IsTabStripEditable();
++}
++
++void SpacesPagerView::BeginDrag() {
++  if (!CanDrag()) {
++    return;
++  }
++  animation_.Stop();
++  // Start from the pages on screen, with a neighbour on each side.
++  const int last = static_cast<int>(strip_.size()) - 1;
++  const int first_shown = std::clamp(static_cast<int>(std::floor(position_)),
++                                     0, last);
++  const int last_shown =
++      std::clamp(static_cast<int>(std::ceil(position_)), 0, last);
++  std::vector<std::string> strip(strip_.begin() + first_shown,
++                                 strip_.begin() + last_shown + 1);
++  double position = position_ - first_shown;
++  const std::vector<Space>& spaces = controller_->service()->spaces();
++  const int before = GetSpaceIndex(strip.front()) - 1;
++  if (before >= 0 && !std::ranges::contains(strip, spaces[before].id)) {
++    strip.insert(strip.begin(), spaces[before].id);
++    position += 1;
++  }
++  const int after = GetSpaceIndex(strip.back()) + 1;
++  if (after > 0 && after < static_cast<int>(spaces.size()) &&
++      !std::ranges::contains(strip, spaces[after].id)) {
++    strip.push_back(spaces[after].id);
++  }
++  strip_ = std::move(strip);
++  position_ = position;
++  drag_start_ = position_;
++  dragging_ = true;
++  StartMetrics();
++  AssignPages();
++  UpdateTransforms();
++  NotifyPositionChanged();
++}
++
++void SpacesPagerView::UpdateDrag(float distance) {
++  if (!dragging_) {
++    return;
++  }
++  const int width = GetPageWidth();
++  if (width <= 0) {
++    return;
++  }
++  const double direction = base::i18n::IsRTL() ? -1 : 1;
++  const double raw = drag_start_ - distance * direction / width;
++  const double last = static_cast<double>(strip_.size()) - 1;
++  if (raw < 0) {
++    position_ = -RubberBand(-raw);
++  } else if (raw > last) {
++    position_ = last + RubberBand(raw - last);
++  } else {
++    position_ = raw;
++  }
++  AssignPages();
++  UpdateTransforms();
++  NotifyPositionChanged();
++}
++
++void SpacesPagerView::EndDrag(float velocity) {
++  if (!dragging_) {
++    return;
++  }
++  dragging_ = false;
++  const double direction = base::i18n::IsRTL() ? -1 : 1;
++  // DIPs per second, positive towards the end of the strip.
++  const double speed = -velocity * direction;
++  const int last = static_cast<int>(strip_.size()) - 1;
++  const int start = std::clamp(static_cast<int>(std::lround(drag_start_)), 0,
++                               last);
++  int target = start;
++  if (std::abs(speed) >= kFlingVelocity) {
++    target = speed > 0 ? static_cast<int>(std::floor(position_)) + 1
++                       : static_cast<int>(std::ceil(position_)) - 1;
++    target = std::clamp(target, start - 1, start + 1);
++  } else if (position_ - start > kTurnThreshold) {
++    target = start + 1;
++  } else if (start - position_ > kTurnThreshold) {
++    target = start - 1;
++  }
++  target = std::clamp(target, 0, last);
++  Commit(strip_[target]);
++  if (GetVisibleSpaceId() != strip_[target]) {
++    SettleAtRest();
++    return;
++  }
++  AnimateTo(target, /*ease_in=*/false);
++}
++
++int SpacesPagerView::GetPageWidth() const {
++  return width();
++}
++
++void SpacesPagerView::AssignPages() {
++  if (!active_ || !peeks_[0]) {
++    return;
++  }
++  const std::string visible = GetVisibleSpaceId();
++  // The real page shows the visible space. A peek page that showed it before
++  // is stale (scroll, active tab): it starts afresh when needed again.
++  for (SpacePageView* peek : peeks_) {
++    if (peek->space_id() == visible) {
++      peek->ClearSpace();
++    }
++  }
++  std::vector<std::string> needed;
++  const int count = static_cast<int>(strip_.size());
++  for (double edge : {std::floor(position_), std::ceil(position_)}) {
++    const int index = static_cast<int>(edge);
++    if (index >= 0 && index < count && strip_[index] != visible &&
++        !std::ranges::contains(needed, strip_[index])) {
++      needed.push_back(strip_[index]);
++    }
++  }
++  const bool at_rest =
++      count == 1 && !dragging_ && !animation_.is_animating();
++  if (at_rest) {
++    // Get the neighbours ready, so a swipe starts without a layout.
++    const std::vector<Space>& spaces = controller_->service()->spaces();
++    const int index = GetSpaceIndex(visible);
++    for (int neighbour : {index - 1, index + 1}) {
++      if (neighbour >= 0 && neighbour < static_cast<int>(spaces.size())) {
++        needed.push_back(spaces[neighbour].id);
++      }
++    }
++  }
++
++  std::array<bool, 2> used = {false, false};
++  for (const std::string& space_id : needed) {
++    for (size_t i = 0; i < peeks_.size(); ++i) {
++      if (!used[i] && peeks_[i]->space_id() == space_id) {
++        used[i] = true;
++        break;
++      }
++    }
++  }
++  bool shown_new_space = false;
++  for (const std::string& space_id : needed) {
++    if (SpacePageView* peek = FindPeekShowing(space_id)) {
++      // Keeps its scroll, follows a change of the space's last active tab.
++      peek->ShowSpace(space_id, controller_->GetLastActiveTabOfSpace(space_id));
++      continue;
++    }
++    for (size_t i = 0; i < peeks_.size(); ++i) {
++      if (!used[i]) {
++        used[i] = true;
++        ShowSpaceInPeek(peeks_[i], space_id);
++        shown_new_space = true;
++        break;
++      }
++    }
++  }
++  if (shown_new_space && GetWidget()) {
++    // The peek pages lay out for their new space before they scroll.
++    GetWidget()->LayoutRootViewIfNecessary();
++    for (size_t i = 0; i < peeks_.size(); ++i) {
++      if (pending_scroll_[i]) {
++        pending_scroll_[i] = false;
++        peeks_[i]->SnapTabLayout();
++        ScrollPage(peeks_[i], GetSavedScroll(peeks_[i]->space_id()),
++                   peeks_[i]->active_tab());
++      }
++    }
++  }
++}
++
++SpacePageView* SpacesPagerView::FindPeekShowing(
++    const std::string& space_id) const {
++  for (SpacePageView* peek : peeks_) {
++    if (peek && !space_id.empty() && peek->space_id() == space_id) {
++      return peek;
++    }
++  }
++  return nullptr;
++}
++
++void SpacesPagerView::ShowSpaceInPeek(SpacePageView* peek,
++                                      const std::string& space_id) {
++  peek->ShowSpace(space_id, controller_->GetLastActiveTabOfSpace(space_id));
++  peek->SetHeader(GetSpace(space_id), active_);
++  for (size_t i = 0; i < peeks_.size(); ++i) {
++    if (peeks_[i] == peek) {
++      pending_scroll_[i] = true;
++    }
++  }
++}
++
++void SpacesPagerView::UpdateTransforms() {
++  const int width = GetPageWidth();
++  const int direction = base::i18n::IsRTL() ? -1 : 1;
++  // Whole pixels, and exactly one page width between neighbours.
++  const int base = static_cast<int>(std::lround(-position_ * width));
++  auto offset_of = [&](int index) {
++    return direction * (index * width + base);
++  };
++  const std::string visible = GetVisibleSpaceId();
++  const int count = static_cast<int>(strip_.size());
++
++  int real_index = static_cast<int>(std::ranges::find(strip_, visible) -
++                                    strip_.begin());
++  if (!active_ || real_index == count) {
++    real_index = 0;
++  }
++  const int real_offset = active_ ? offset_of(real_index) : 0;
++  real_page_->SetTransform(
++      real_offset ? gfx::Transform::MakeTranslation(real_offset, 0)
++                  : gfx::Transform());
++
++  bool peek_shown = false;
++  for (SpacePageView* peek : peeks_) {
++    if (!peek) {
++      continue;
++    }
++    const int index = static_cast<int>(
++        std::ranges::find(strip_, peek->space_id()) - strip_.begin());
++    const bool show = active_ && !peek->space_id().empty() &&
++                      peek->space_id() != visible && index < count &&
++                      std::abs(index - position_) < 1.0;
++    if (show) {
++      peek->SetTransform(gfx::Transform::MakeTranslation(offset_of(index), 0));
++      peek_shown = true;
++    }
++    peek->SetVisible(show);
++  }
++  if (peek_shown && !loading_timer_.IsRunning()) {
++    StepPeekLoadingAnimations();
++    loading_timer_.Start(FROM_HERE, kLoadingAnimationInterval, this,
++                         &SpacesPagerView::StepPeekLoadingAnimations);
++  } else if (!peek_shown) {
++    loading_timer_.Stop();
++  }
++}
++
++void SpacesPagerView::StepPeekLoadingAnimations() {
++  const base::TimeDelta elapsed =
++      base::TimeTicks::Now() - loading_animation_start_;
++  for (SpacePageView* peek : peeks_) {
++    if (peek && peek->GetVisible()) {
++      peek->StepLoadingAnimations(elapsed);
++    }
++  }
++}
++
++void SpacesPagerView::NotifyPositionChanged() {
++  for (Observer& observer : observers_) {
++    observer.OnPagerPositionChanged(strip_, position_);
++  }
++}
++
++void SpacesPagerView::CreatePeeks() {
++  if (peeks_[0] || !model_) {
++    return;
++  }
++  for (size_t i = 0; i < peeks_.size(); ++i) {
++    peeks_[i] = AddChildViewAt(
++        std::make_unique<SpacePageView>(model_, browser_view_, *region_), 0);
++    peeks_[i]->SetVisible(false);
++    peeks_[i]->SetCollapsed(IsCollapsed());
++    pending_scroll_[i] = false;
++  }
++  InvalidateLayout();
++}
++
++void SpacesPagerView::DestroyPeeks() {
++  loading_timer_.Stop();
++  for (raw_ptr<SpacePageView>& peek : peeks_) {
++    if (peek) {
++      RemoveChildViewT(std::exchange(peek, nullptr));
++    }
++  }
++}
++
++void SpacesPagerView::UpdateHeaders() {
++  // Shown in every collapse state, so collapsing or expanding the sidebar
++  // never moves the tabs up or down. Collapsed, only the icon fits.
++  const bool show = active_;
++  real_page_->SetHeader(GetSpace(GetVisibleSpaceId()), show);
++  for (SpacePageView* peek : peeks_) {
++    if (peek) {
++      peek->SetHeader(GetSpace(peek->space_id()), show);
++    }
++  }
++}
++
++bool SpacesPagerView::IsCollapsed() const {
++  auto* state_controller =
++      tabs::VerticalTabStripStateController::From(browser_view_->browser());
++  return state_controller && state_controller->GetCollapseState() !=
++                                 tabs::VerticalTabStripCollapseState::kExpanded;
++}
++
++void SpacesPagerView::OnCollapseStateChanged() {
++  const bool collapsed = IsCollapsed();
++  for (SpacePageView* peek : peeks_) {
++    if (peek) {
++      peek->SetCollapsed(collapsed);
++    }
++  }
++  UpdateHeaders();
++  InvalidateLayout();
++}
++
++void SpacesPagerView::UpdateActiveState() {
++  const bool active = IsActive();
++  if (active != active_) {
++    active_ = active;
++    if (active_) {
++      CreatePeeks();
++    } else {
++      animation_.Stop();
++      DestroyPeeks();
++    }
++    UpdateFlex();
++    PreferredSizeChanged();
++  }
++  SettleAtRest();
++  for (Observer& observer : observers_) {
++    observer.OnPagerSpacesChanged();
++  }
++}
++
++std::optional<int> SpacesPagerView::GetSavedScroll(
++    const std::string& space_id) const {
++  auto it = saved_scroll_.find(space_id);
++  return it == saved_scroll_.end() ? std::nullopt
++                                   : std::optional<int>(it->second);
++}
++
++void SpacesPagerView::StartMetrics() {
++  if (metrics_tracker_ || !GetWidget() || !GetWidget()->GetCompositor()) {
++    return;
++  }
++  move_start_ = base::TimeTicks::Now();
++  metrics_tracker_ =
++      GetWidget()->GetCompositor()->RequestNewCompositorMetricsTracker();
++  metrics_tracker_->Start(base::BindOnce(&ReportSmoothness));
++}
++
++void SpacesPagerView::StopMetrics() {
++  if (!metrics_tracker_) {
++    return;
++  }
++  base::UmaHistogramTimes("Neon.Spaces.Pager.MoveTime",
++                          base::TimeTicks::Now() - move_start_);
++  metrics_tracker_->Stop();
++  metrics_tracker_.reset();
++}
++
++void SpacesPagerView::SetBottomView(std::unique_ptr<views::View> view) {
++  if (bottom_view_) {
++    RemoveChildViewT(std::exchange(bottom_view_, nullptr));
++  }
++  if (view) {
++    bottom_view_ = AddChildView(std::move(view));
++  }
++  InvalidateLayout();
++}
++
++void SpacesPagerView::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void SpacesPagerView::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++void SpacesPagerView::Layout(PassKey) {
++  const int bottom_height = bottom_view_ && bottom_view_->GetVisible()
++                                ? bottom_view_->GetPreferredSize().height()
++                                : 0;
++  const gfx::Rect pages(0, 0, width(), std::max(0, height() - bottom_height));
++  real_page_->SetBoundsRect(pages);
++  for (SpacePageView* peek : peeks_) {
++    if (peek) {
++      peek->SetBoundsRect(pages);
++    }
++  }
++  if (bottom_view_) {
++    bottom_view_->SetBounds(0, pages.bottom(), width(), bottom_height);
++  }
++  UpdateTransforms();
++}
++
++gfx::Size SpacesPagerView::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  gfx::Size size = real_page_->GetPreferredSize(available_size);
++  if (active_ && bottom_view_ && bottom_view_->GetVisible()) {
++    size.Enlarge(0, bottom_view_->GetPreferredSize().height());
++  }
++  return size;
++}
++
++const views::FlexSpecification* SpacesPagerView::GetRegionFlex() const {
++  return region_flex_ ? &*region_flex_
++                      : GetProperty(views::kFlexBehaviorKey);
++}
++
++void SpacesPagerView::UpdateFlex() {
++  if (active_) {
++    if (!region_flex_) {
++      const views::FlexSpecification* flex =
++          GetProperty(views::kFlexBehaviorKey);
++      if (!flex) {
++        // Not added to the region yet.
++        return;
++      }
++      region_flex_ = *flex;
++    }
++    // The bottom buttons below can grow too, with weight 1: they get a
++    // rounded-away share of the extra height.
++    SetProperty(views::kFlexBehaviorKey,
++                views::FlexSpecification(
++                    views::MinimumFlexSizeRule::kScaleToMinimum,
++                    views::MaximumFlexSizeRule::kUnbounded)
++                    .WithWeight(kFlexWeight));
++  } else if (region_flex_) {
++    SetProperty(views::kFlexBehaviorKey, *std::exchange(region_flex_, {}));
++  }
++}
++
++void SpacesPagerView::ViewHierarchyChanged(
++    const views::ViewHierarchyChangedDetails& details) {
++  if (details.is_add && details.child == this) {
++    // The region sets the flex behaviour before adding the pager.
++    region_flex_.reset();
++    UpdateFlex();
++  }
++}
++
++void SpacesPagerView::AddedToWidget() {
++  SettleAtRest();
++}
++
++void SpacesPagerView::RemovedFromWidget() {
++  animation_.Stop();
++  if (metrics_tracker_) {
++    metrics_tracker_->Cancel();
++    metrics_tracker_.reset();
++  }
++}
++
++void SpacesPagerView::OnThemeChanged() {
++  views::View::OnThemeChanged();
++  SchedulePaint();
++}
++
++void SpacesPagerView::OnSpacesChanged() {
++  UpdateActiveState();
++}
++
++void SpacesPagerView::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  if (tab_strip_model->closing_all()) {
++    animation_.Stop();
++    return;
++  }
++  if (!selection.active_tab_changed() || !active_) {
++    return;
++  }
++  const std::string visible = GetVisibleSpaceId();
++  if (visible != expected_visible_space_) {
++    // Another space was shown without the pager (tab search, a link from
++    // another app, a tab dragged in): show it at rest. The tab strip has not
++    // laid out yet, so it still has the old space's scroll offset.
++    saved_scroll_[expected_visible_space_] = real_page_->GetScroll();
++    SettleAtRest();
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&SpacesPagerView::RestoreScroll,
++                                  weak_factory_.GetWeakPtr(), visible));
++  }
++}
++
++void SpacesPagerView::RestoreScroll(const std::string& space_id) {
++  if (!active_ || !GetWidget() || GetVisibleSpaceId() != space_id ||
++      strip_.size() != 1) {
++    return;
++  }
++  if (std::optional<int> scroll = GetSavedScroll(space_id)) {
++    ScrollPage(real_page_, scroll, model_->GetActiveTab());
++  }
++}
++
++void SpacesPagerView::OnTabStripModelDestroyed(TabStripModel* tab_strip_model) {
++  animation_.Stop();
++  DestroyPeeks();
++  model_ = nullptr;
++}
++
++BEGIN_METADATA(SpacesPagerView)
++END_METADATA
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/spaces_pager_view.h
+@@ -0,0 +1,266 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACES_PAGER_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACES_PAGER_VIEW_H_
++
++#include <array>
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/raw_ref.h"
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
++#include "base/scoped_observation.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "chrome/browser/ui/neon/spaces/spaces_window_controller.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/compositor/compositor_metrics_tracker.h"
++#include "ui/gfx/animation/slide_animation.h"
++#include "ui/views/animation/animation_delegate_views.h"
++#include "ui/views/layout/flex_layout_types.h"
++#include "ui/views/view.h"
++
++class BrowserView;
++class TabStripRegionView;
++class TabStripView;
++
++namespace neon::spaces {
++
++class SpacePageView;
++
++// The tab list area of the vertical tab strip, as a horizontal pager with one
++// page per space. At rest it shows the visible space's page: the window's own
++// tab strip view (the real page) with the space's name above it. While pages
++// move, the spaces next to it are shown by peek pages, live tab strips of the
++// same model, so both lists keep updating under the finger.
++//
++// Position model: the pages that take part in a move form a strip of spaces
++// in display order, and the pager shows a viewport onto that strip at a
++// fractional position. At rest the strip holds only the visible space. A
++// switch by command or click adds the target space next to the visible pages
++// and animates the position; a swipe moves the position with the fingers.
++// The window always shows the space of the active tab in the real page, so a
++// switch activates the target space at the moment it is decided (when a
++// command starts, when the fingers lift), and the real and peek pages trade
++// places in the same frame without moving anything on screen.
++//
++// With fewer than two spaces, or outside a normal window, the pager shows the
++// window's tab strip and nothing else, sized as the stock tab strip.
++class SpacesPagerView : public views::View,
++                        public views::AnimationDelegateViews,
++                        public SpacesWindowController::Presenter,
++                        public SpacesService::Observer,
++                        public TabStripModelObserver {
++  METADATA_HEADER(SpacesPagerView, views::View)
++
++ public:
++  // Told when the pager position changes, so other views can follow it.
++  class Observer : public base::CheckedObserver {
++   public:
++    // |strip| is the strip of spaces taking part, |position| the fractional
++    // index in it shown now. At rest |strip| is the visible space alone.
++    virtual void OnPagerPositionChanged(const std::vector<std::string>& strip,
++                                        double position) = 0;
++    // The space list, the visible space or the pager's active state changed.
++    virtual void OnPagerSpacesChanged() = 0;
++  };
++
++  // |browser_view| is a normal window of a profile with spaces. Its spaces
++  // controller may not exist yet; the pager starts using it once it does.
++  SpacesPagerView(TabStripRegionView& region,
++                  BrowserView* browser_view,
++                  std::unique_ptr<views::View> tab_strip_view);
++  SpacesPagerView(const SpacesPagerView&) = delete;
++  SpacesPagerView& operator=(const SpacesPagerView&) = delete;
++  ~SpacesPagerView() override;
++
++  // The pager that holds |tab_strip_view|, if any.
++  static SpacesPagerView* FromTabStripView(views::View* tab_strip_view);
++
++  // Gives back the window's tab strip view.
++  std::unique_ptr<views::View> TakeTabStripView();
++
++  // The flex behaviour the region gave the pager (meant for the tab strip
++  // view), before the pager changed it.
++  const views::FlexSpecification* GetRegionFlex() const;
++
++  SpacesWindowController* controller() const { return controller_; }
++  TabStripRegionView& region() const { return *region_; }
++
++  // Whether the window has spaces now: vertical layout and two or more spaces.
++  bool IsActive() const;
++  // The visible space, the space of the active tab.
++  std::string GetVisibleSpaceId() const;
++
++  // Starts showing |space_id|, animated unless animations are off. Same as
++  // PresentSpace(), for the switcher row.
++  void ShowSpace(const std::string& space_id);
++
++  // Finger tracking. BeginDrag() starts a drag from the current position,
++  // also during an animation. UpdateDrag() takes the horizontal distance the
++  // fingers moved since BeginDrag() in DIPs, positive to the right. EndDrag()
++  // takes the release velocity in DIPs per second (positive to the right) and
++  // settles on a page.
++  bool CanDrag() const;
++  void BeginDrag();
++  void UpdateDrag(float distance);
++  void EndDrag(float velocity);
++  bool is_dragging() const { return dragging_; }
++
++  // The widths of a page, for the gesture's thresholds.
++  int GetPageWidth() const;
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++  const std::vector<std::string>& strip() const { return strip_; }
++  double position() const { return position_; }
++
++  // views::View:
++  void Layout(PassKey) override;
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++  void AddedToWidget() override;
++  void RemovedFromWidget() override;
++  void ViewHierarchyChanged(
++      const views::ViewHierarchyChangedDetails& details) override;
++  void OnThemeChanged() override;
++
++  // SpacesWindowController::Presenter:
++  bool PresentSpace(const std::string& space_id) override;
++  std::string GetTargetSpaceId() const override;
++  void OnControllerDestroying() override;
++
++  // SpacesService::Observer:
++  void OnSpacesChanged() override;
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++  void OnTabStripModelDestroyed(TabStripModel* tab_strip_model) override;
++
++  // views::AnimationDelegateViews:
++  void AnimationProgressed(const gfx::Animation* animation) override;
++  void AnimationEnded(const gfx::Animation* animation) override;
++  void AnimationCanceled(const gfx::Animation* animation) override;
++
++  // The row or other bottom view the next patches put below the pages.
++  void SetBottomView(std::unique_ptr<views::View> view);
++  views::View* bottom_view() const { return bottom_view_; }
++
++ private:
++  void BindController(SpacesWindowController* controller);
++  void UnbindController();
++
++  // The index of |space_id| in the space list, or -1.
++  int GetSpaceIndex(const std::string& space_id) const;
++  const Space* GetSpace(const std::string& space_id) const;
++
++  // Whether a change of page should animate.
++  bool ShouldAnimate() const;
++
++  // Starts animating the position to |target| (an index in |strip_|).
++  void AnimateTo(double target, bool ease_in);
++  // Makes |space_id| the visible space (activates it) and moves the real
++  // page to its slot, with peek pages taking the other visible slots, without
++  // changing what is on screen.
++  void Commit(const std::string& space_id);
++  // Back to rest on the visible space, no animation.
++  void SettleAtRest();
++
++  // Gives each visible slot of the strip a page, and at rest prepares the
++  // peek pages for the neighbours of the visible space.
++  void AssignPages();
++  SpacePageView* FindPeekShowing(const std::string& space_id) const;
++  void ShowSpaceInPeek(SpacePageView* peek, const std::string& space_id);
++  // Scrolls |page| to |offset| (see SpacePageView::ApplyScroll()) and lays
++  // it out.
++  void ScrollPage(SpacePageView* page,
++                  std::optional<int> offset,
++                  const tabs::TabInterface* tab);
++  // Moves the pages to the current position.
++  void UpdateTransforms();
++  void NotifyPositionChanged();
++
++  void CreatePeeks();
++  void DestroyPeeks();
++  void UpdateHeaders();
++  void OnCollapseStateChanged();
++  bool IsCollapsed() const;
++  void UpdateActiveState();
++  // With spaces the pager takes all the height the region has to give, so
++  // pages of different lengths slide without the views below moving.
++  void UpdateFlex();
++  // Scrolls the real page to where |space_id| was left, after a switch the
++  // pager did not make.
++  void RestoreScroll(const std::string& space_id);
++  // Where space |space_id| was left, if it was shown before.
++  std::optional<int> GetSavedScroll(const std::string& space_id) const;
++
++  void StartMetrics();
++  void StopMetrics();
++  void StepPeekLoadingAnimations();
++
++  raw_ptr<SpacesWindowController> controller_ = nullptr;
++  base::CallbackListSubscription controller_created_subscription_;
++  raw_ref<TabStripRegionView> region_;
++  raw_ptr<BrowserView> browser_view_;
++  raw_ptr<TabStripModel> model_;
++
++  raw_ptr<SpacePageView> real_page_ = nullptr;
++  std::array<raw_ptr<SpacePageView>, 2> peeks_{};
++  // Peek pages given a new space that scroll once laid out.
++  std::array<bool, 2> pending_scroll_{};
++  raw_ptr<views::View> bottom_view_ = nullptr;
++
++  // See the class comment.
++  std::vector<std::string> strip_;
++  double position_ = 0;
++
++  // Animation of the position from |animation_start_| to |animation_target_|.
++  gfx::SlideAnimation animation_{this};
++  double animation_start_ = 0;
++  double animation_target_ = 0;
++
++  bool dragging_ = false;
++  // The position when the drag began.
++  double drag_start_ = 0;
++
++  // The visible space the last time the pager looked: a change the pager did
++  // not make (a tab of another space activated) resets it to rest.
++  std::string expected_visible_space_;
++  bool active_ = false;
++  std::optional<views::FlexSpecification> region_flex_;
++
++  // Unpinned scroll offsets of the spaces, kept while the window lives.
++  std::map<std::string, int> saved_scroll_;
++
++  // Smoothness of the current move, from the first frame to rest.
++  std::optional<ui::CompositorMetricsTracker> metrics_tracker_;
++  base::TimeTicks move_start_;
++
++  base::TimeTicks loading_animation_start_;
++  base::RepeatingTimer loading_timer_;
++
++  base::CallbackListSubscription collapse_subscription_;
++  base::ScopedObservation<SpacesService, SpacesService::Observer>
++      spaces_observation_{this};
++  base::ObserverList<Observer> observers_;
++  base::WeakPtrFactory<SpacesPagerView> weak_factory_{this};
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACES_PAGER_VIEW_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/tab_strip_wrapper.cc
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/neon/spaces/tab_strip_wrapper.h"
++
++#include <utility>
++
++#include "chrome/browser/neon/spaces/spaces_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/neon/spaces/spaces_pager_view.h"
++#include "ui/views/view.h"
++#include "ui/views/view_class_properties.h"
++
++namespace neon::spaces {
++
++std::unique_ptr<views::View> WrapTabStripView(
++    TabStripRegionView& region,
++    BrowserView* browser_view,
++    TabStripOrientation orientation,
++    std::unique_ptr<views::View> tab_strip_view) {
++  if (orientation != TabStripOrientation::kVertical || !browser_view) {
++    return tab_strip_view;
++  }
++  // The window's spaces controller is created after its views, so decide
++  // the way SpacesWindowManager does: normal windows of profiles with spaces.
++  BrowserWindowInterface* browser = browser_view->browser();
++  if (browser->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
++      !SpacesServiceFactory::GetForProfile(browser->GetProfile())) {
++    return tab_strip_view;
++  }
++  return std::make_unique<SpacesPagerView>(region, browser_view,
++                                           std::move(tab_strip_view));
++}
++
++void UnwrapTabStripView(views::View* tab_strip_view) {
++  SpacesPagerView* pager = SpacesPagerView::FromTabStripView(tab_strip_view);
++  if (!pager || !pager->parent()) {
++    return;
++  }
++  views::View* parent = pager->parent();
++  const size_t index = parent->GetIndexOf(pager).value();
++  std::unique_ptr<views::View> view = pager->TakeTabStripView();
++  // The region set these on the pager; the tab strip view had them before.
++  if (const views::FlexSpecification* flex = pager->GetRegionFlex()) {
++    view->SetProperty(views::kFlexBehaviorKey, *flex);
++  }
++  if (const auto* margins = pager->GetProperty(views::kMarginsKey)) {
++    view->SetProperty(views::kMarginsKey, *margins);
++  }
++  parent->RemoveChildViewT(pager);
++  parent->AddChildViewAt(std::move(view), index);
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/tab_strip_wrapper.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_NEON_SPACES_TAB_STRIP_WRAPPER_H_
++#define CHROME_BROWSER_UI_VIEWS_NEON_SPACES_TAB_STRIP_WRAPPER_H_
++
++#include <memory>
++
++#include "chrome/browser/ui/views/tabs/shared/tab_strip_types.h"
++
++class BrowserView;
++class TabStripRegionView;
++
++namespace views {
++class View;
++}  // namespace views
++
++namespace neon::spaces {
++
++// The two calls BaseTabStripRegionView makes into the sidebar pager.
++
++// Called with the tab strip view before the region adds it. For the vertical
++// tab strip of a window with spaces, returns the pager that holds it, for the
++// region to add in its place. Otherwise returns |tab_strip_view|.
++std::unique_ptr<views::View> WrapTabStripView(
++    TabStripRegionView& region,
++    BrowserView* browser_view,
++    TabStripOrientation orientation,
++    std::unique_ptr<views::View> tab_strip_view);
++
++// Called before the region removes |tab_strip_view|: puts it back where the
++// pager was and deletes the pager, so the region finds the hierarchy it built.
++void UnwrapTabStripView(views::View* tab_strip_view);
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_NEON_SPACES_TAB_STRIP_WRAPPER_H_
+--- a/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
+@@ -51,9 +51,13 @@ RootTabCollectionNode::RootTabCollection
+ 
+ RootTabCollectionNode::~RootTabCollectionNode() = default;
+ 
+-void RootTabCollectionNode::Init() {
++void RootTabCollectionNode::Init(bool register_as_tab_strip_ui) {
+   tab_strip_model_->Root()->AddObserver(this);
+-  tab_strip_model_->SetTabStripUI(this);
++  if (register_as_tab_strip_ui) {
++    tab_strip_model_->SetTabStripUI(this);
++  } else {
++    tab_strip_model_->AddObserver(this);
++  }
+   add_node_view_to_parent_.Run(Initialize());
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/common/root_tab_collection_node.h
++++ b/chrome/browser/ui/views/tabs/common/root_tab_collection_node.h
+@@ -31,7 +31,9 @@ class RootTabCollectionNode : public Tab
+       TabStripOrientation orientation);
+   ~RootTabCollectionNode() override;
+ 
+-  void Init();
++  // |register_as_tab_strip_ui| false makes this an extra view of the model
++  // (Neon's sidebar pages) that observes it like any other observer.
++  void Init(bool register_as_tab_strip_ui = true);
+   void Reset();
+ 
+   using ChildrenAddedCallback =
+--- a/chrome/browser/ui/views/tabs/common/tab_view.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/tab_view.h"
+ 
++#include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
++
+ #include <optional>
+ #include <string>
+ 
+@@ -1154,7 +1156,9 @@ void TabView::OnTabStateChanged() {
+   int index = tab_strip_model->GetIndexOfTab(tab);
+   CHECK(index != TabStripModel::kNoTab);
+ 
+-  active_ = tab_strip_model->IsTabInForeground(index);
++  active_ = neon::spaces::IsTabActiveInPage(
++      collection_node_->GetController(), tab,
++      tab_strip_model->IsTabInForeground(index));
+   split_ = tab->IsSplit();
+   pinned_ = tab->IsPinned();
+ 

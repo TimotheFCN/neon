@@ -297,7 +297,9 @@ def favicon_counts(path, x0=0, x1=SIDEBAR_WIDTH, y0=36, y1=None):
     """Favicons of each space colour in the sidebar region of a screenshot."""
     img = Image.open(path).convert('RGB')
     w, h = img.size
-    y1 = y1 or h
+    # Leaves out the bottom of the sidebar: the new tab button and, with spaces (M3), the
+    # switcher row, whose faded outline icon is close to the grey of an unloaded favicon.
+    y1 = y1 or h - 110
     px = img.load()
     counts = {}
     for space, rgb in list(COLORS.items()) + [('U', UNLOADED)]:
@@ -570,17 +572,14 @@ def phase_spaces(ctx):
 
 
 def click_new_tab_button(ctx):
-    """Clicks Helium's vertical new tab button, the row right below the last tab, found from
-    the favicons in a screenshot."""
+    """Clicks Helium's vertical new tab button, the lowest thing in the sidebar's icon column:
+    right below the last tab, or with spaces (M3) at the bottom, below the switcher row."""
     img = Image.open(shot(ctx, os.path.join(ctx.tmp, 'ntb.png'))).convert('RGB')
     px = img.load()
-    last = 36
-    for y in range(36, img.size[1]):
-        for x in range(8, 40):
-            p = px[x, y]
-            if any(all(abs(p[i] - rgb[i]) < 12 for i in range(3)) for rgb in COLORS.values()):
-                last = y
-    xdo(ctx, 'mousemove', '--sync', '60', str(last + 25))
+    y = img.size[1] - 4
+    while y > 36 and not any(max(px[x, y]) < 200 for x in range(10, 30)):
+        y -= 1
+    xdo(ctx, 'mousemove', '--sync', '60', str(y))
     xdo(ctx, 'click', '1')
     settle(1)
 

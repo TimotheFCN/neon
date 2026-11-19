@@ -1,0 +1,633 @@
+Neon spaces (M3), part 3 of 4: two-finger swipe.
+
+A pre-target handler on the tab strip region turns touchpad scrolls over the
+sidebar into finger-tracked swipes of the pager: the axis locks after 15 DIP
+(a mostly vertical gesture scrolls the tab list), the pages follow the
+fingers and resist past the first and last space, and on release they turn
+past a third of a page or a fling of 500 DIP/s, else snap back. The end of a
+gesture is the platform's lift (macOS phases, a fling start on Wayland and on
+X11 with libinput's scroll stop), or a quiet period of 120 ms without one.
+A notched sideways wheel turns one page per notch. SpacesSwipeTracker holds
+the gesture logic without ui::Event, so a macOS patch can feed it native
+phases. No hooks. Neon code, GPL-3.0.
+
+--- a/chrome/browser/ui/views/neon/spaces/BUILD.gn
++++ b/chrome/browser/ui/views/neon/spaces/BUILD.gn
+@@ -13,6 +13,10 @@ source_set("spaces") {
+     "space_switcher_row.h",
+     "spaces_pager_view.cc",
+     "spaces_pager_view.h",
++    "spaces_swipe_handler.cc",
++    "spaces_swipe_handler.h",
++    "spaces_swipe_tracker.cc",
++    "spaces_swipe_tracker.h",
+     "tab_strip_wrapper.cc",
+     "tab_strip_wrapper.h",
+   ]
+@@ -26,6 +30,7 @@ source_set("spaces") {
+     "//components/tabs:public",
+     "//ui/base/metadata",
+     "//ui/compositor",
++    "//ui/events",
+     "//ui/gfx",
+     "//ui/menus",
+     "//ui/views",
+--- a/chrome/browser/ui/views/neon/spaces/spaces_pager_view.cc
++++ b/chrome/browser/ui/views/neon/spaces/spaces_pager_view.cc
+@@ -18,6 +18,7 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/neon/spaces/space_page_view.h"
++#include "chrome/browser/ui/views/neon/spaces/spaces_swipe_handler.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_view.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/compositor/compositor.h"
+@@ -86,6 +87,7 @@ SpacesPagerView::SpacesPagerView(TabStri
+       std::make_unique<SpacePageView>(std::move(tab_strip_view)));
+ 
+   loading_animation_start_ = base::TimeTicks::Now();
++  swipe_handler_ = std::make_unique<SpacesSwipeHandler>(this);
+   model_->AddObserver(this);
+   if (auto* state_controller = tabs::VerticalTabStripStateController::From(
+           browser_view_->browser())) {
+@@ -115,6 +117,9 @@ SpacesPagerView::SpacesPagerView(TabStri
+ SpacesPagerView::~SpacesPagerView() {
+   // The row observes the pager: remove it while the pager is whole.
+   SetBottomView(nullptr);
++  if (swipe_handler_installed_) {
++    region_->RemovePreTargetHandler(swipe_handler_.get());
++  }
+   animation_.Stop();
+   loading_timer_.Stop();
+   UnbindController();
+@@ -807,10 +812,18 @@ void SpacesPagerView::ViewHierarchyChang
+ }
+ 
+ void SpacesPagerView::AddedToWidget() {
++  if (!swipe_handler_installed_) {
++    region_->AddPreTargetHandler(swipe_handler_.get());
++    swipe_handler_installed_ = true;
++  }
+   SettleAtRest();
+ }
+ 
+ void SpacesPagerView::RemovedFromWidget() {
++  if (swipe_handler_installed_) {
++    region_->RemovePreTargetHandler(swipe_handler_.get());
++    swipe_handler_installed_ = false;
++  }
+   animation_.Stop();
+   if (metrics_tracker_) {
+     metrics_tracker_->Cancel();
+--- a/chrome/browser/ui/views/neon/spaces/spaces_pager_view.h
++++ b/chrome/browser/ui/views/neon/spaces/spaces_pager_view.h
+@@ -38,6 +38,7 @@ class TabStripView;
+ namespace neon::spaces {
+ 
+ class SpacePageView;
++class SpacesSwipeHandler;
+ 
+ // The tab list area of the vertical tab strip, as a horizontal pager with one
+ // page per space. At rest it shows the visible space's page: the window's own
+@@ -254,6 +255,10 @@ class SpacesPagerView : public views::Vi
+   base::TimeTicks loading_animation_start_;
+   base::RepeatingTimer loading_timer_;
+ 
++  // Two-finger swipes over the sidebar, installed on the region view.
++  std::unique_ptr<SpacesSwipeHandler> swipe_handler_;
++  bool swipe_handler_installed_ = false;
++
+   base::CallbackListSubscription collapse_subscription_;
+   base::ScopedObservation<SpacesService, SpacesService::Observer>
+       spaces_observation_{this};
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/spaces_swipe_tracker.h
+@@ -0,0 +1,126 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACES_SWIPE_TRACKER_H_
++#define CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACES_SWIPE_TRACKER_H_
++
++#include <optional>
++
++#include "base/containers/circular_deque.h"
++#include "base/memory/raw_ptr.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++
++namespace neon::spaces {
++
++// Finger tracking for the two-finger swipe between spaces, independent of
++// where the events come from. A platform adapter feeds it scroll deltas and,
++// when the platform has them, the phase of the gesture. It locks each gesture
++// to an axis: a mostly vertical gesture is left alone (the tab list scrolls),
++// a horizontal one drags the pages.
++//
++// The end of a gesture comes from the platform when it says so: a lift
++// (macOS phases; on Linux a fling start, which Wayland sends on axis stop and
++// Chromium's X11 code makes of the zero scroll libinput sends at lift; or a
++// native tracker on macOS). Without one (X11 drivers that send no zero scroll,
++// wheels) the gesture ends after a short quiet period, and once a lift has
++// ended a gesture the tracker trusts lifts from then on.
++class SpacesSwipeTracker {
++ public:
++  enum class Phase {
++    // A delta without phase information.
++    kUnknown,
++    // Fingers touched the touchpad (macOS "may begin", Wayland hold).
++    kMayBegin,
++    // A delta while the fingers are known to be down.
++    kChanged,
++    // Momentum after the fingers lifted (macOS inertial scrolling).
++    kMomentum,
++    // The momentum ended.
++    kMomentumEnded,
++  };
++
++  class Delegate {
++   public:
++    virtual ~Delegate() = default;
++    // Whether a horizontal gesture may move the pages now.
++    virtual bool CanSwipe() = 0;
++    virtual void BeginSwipe() = 0;
++    // |distance| in DIPs since BeginSwipe(), positive when the fingers moved
++    // right.
++    virtual void UpdateSwipe(float distance) = 0;
++    // |velocity| in DIPs per second, positive to the right.
++    virtual void EndSwipe(float velocity) = 0;
++  };
++
++  // Axis lock distance, as Chromium's focus mode swipe.
++  static constexpr float kAxisLockThreshold = 15.0f;
++  // Without lift events, a gesture ends this long after its last event.
++  static constexpr base::TimeDelta kQuietTimeout = base::Milliseconds(120);
++  // With lift events, a gesture that sends nothing for this long is over
++  // anyway (a lost lift).
++  static constexpr base::TimeDelta kLostLiftTimeout = base::Seconds(3);
++  // The release velocity is measured over this window before the last event.
++  static constexpr base::TimeDelta kVelocityWindow = base::Milliseconds(100);
++
++  explicit SpacesSwipeTracker(Delegate* delegate);
++  SpacesSwipeTracker(const SpacesSwipeTracker&) = delete;
++  SpacesSwipeTracker& operator=(const SpacesSwipeTracker&) = delete;
++  ~SpacesSwipeTracker();
++
++  // A scroll delta in DIPs, positive when the fingers move right or down
++  // (content follows the fingers). Returns true when the event belongs to a
++  // horizontal swipe and must not reach other views.
++  bool OnScroll(base::TimeTicks time, float dx, float dy, Phase phase);
++
++  // The fingers lifted. |velocity| is the platform's release velocity in DIPs
++  // per second, if it has one. Returns true if a swipe consumed it.
++  bool OnLift(base::TimeTicks time, std::optional<float> velocity);
++
++  bool is_tracking() const { return state_ == State::kTracking; }
++  // Whether lifts are known to arrive (seen once, or the platform always
++  // sends them), so quiet periods no longer end gestures.
++  bool trusts_lifts() const { return trusts_lifts_; }
++  void set_trusts_lifts(bool trusts_lifts) { trusts_lifts_ = trusts_lifts; }
++
++ private:
++  enum class State {
++    kIdle,
++    // Locked to the vertical axis: events pass through until the gesture
++    // ends.
++    kVertical,
++    // Locked to the horizontal axis but the pages cannot move (a tab drag):
++    // events pass through.
++    kIgnored,
++    kTracking,
++    // The swipe ended; momentum events of the same gesture are swallowed.
++    kEnded,
++  };
++
++  void Reset();
++  void EndTracking(std::optional<float> velocity);
++  void OnTimeout();
++  void ArmTimer();
++  float EstimateVelocity() const;
++
++  const raw_ptr<Delegate> delegate_;
++  State state_ = State::kIdle;
++  float total_x_ = 0;
++  float total_y_ = 0;
++  // Horizontal distance at the moment of the axis lock, so the pages start
++  // from where the fingers are instead of jumping by the lock distance.
++  float lock_x_ = 0;
++  base::TimeTicks last_event_;
++  bool trusts_lifts_ = false;
++  struct Sample {
++    base::TimeTicks time;
++    float x;
++  };
++  base::circular_deque<Sample> samples_;
++  base::OneShotTimer timer_;
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACES_SWIPE_TRACKER_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/spaces_swipe_tracker.cc
+@@ -0,0 +1,176 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/neon/spaces/spaces_swipe_tracker.h"
++
++#include <cmath>
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++
++namespace neon::spaces {
++
++SpacesSwipeTracker::SpacesSwipeTracker(Delegate* delegate)
++    : delegate_(delegate) {
++  CHECK(delegate_);
++}
++
++SpacesSwipeTracker::~SpacesSwipeTracker() = default;
++
++void SpacesSwipeTracker::Reset() {
++  state_ = State::kIdle;
++  total_x_ = 0;
++  total_y_ = 0;
++  lock_x_ = 0;
++  samples_.clear();
++  timer_.Stop();
++}
++
++void SpacesSwipeTracker::ArmTimer() {
++  timer_.Start(FROM_HERE, trusts_lifts_ ? kLostLiftTimeout : kQuietTimeout,
++               base::BindOnce(&SpacesSwipeTracker::OnTimeout,
++                              base::Unretained(this)));
++}
++
++void SpacesSwipeTracker::OnTimeout() {
++  if (state_ == State::kTracking) {
++    // No lift signal: the fingers stopped, so the gesture is over.
++    EndTracking(std::nullopt);
++  }
++  Reset();
++}
++
++float SpacesSwipeTracker::EstimateVelocity() const {
++  if (samples_.size() < 2) {
++    return 0;
++  }
++  const Sample& last = samples_.back();
++  const Sample* first = &samples_.front();
++  for (const Sample& sample : samples_) {
++    if (last.time - sample.time <= kVelocityWindow) {
++      first = &sample;
++      break;
++    }
++  }
++  const double seconds = (last.time - first->time).InSecondsF();
++  if (seconds < 0.008) {
++    return 0;
++  }
++  return static_cast<float>((last.x - first->x) / seconds);
++}
++
++void SpacesSwipeTracker::EndTracking(std::optional<float> velocity) {
++  CHECK_EQ(state_, State::kTracking);
++  state_ = State::kEnded;
++  delegate_->EndSwipe(velocity.value_or(EstimateVelocity()));
++}
++
++bool SpacesSwipeTracker::OnScroll(base::TimeTicks time,
++                                  float dx,
++                                  float dy,
++                                  Phase phase) {
++  switch (phase) {
++    case Phase::kMayBegin:
++      // Fingers down: a new gesture.
++      if (state_ == State::kTracking) {
++        EndTracking(0);
++      }
++      Reset();
++      last_event_ = time;
++      return false;
++    case Phase::kMomentum:
++    case Phase::kMomentumEnded: {
++      // Momentum belongs to the gesture that just ended: swallow it after a
++      // swipe so the tab list does not scroll.
++      const bool swallow =
++          state_ == State::kEnded || state_ == State::kTracking;
++      if (state_ == State::kTracking) {
++        EndTracking(std::nullopt);
++      }
++      last_event_ = time;
++      if (phase == Phase::kMomentumEnded) {
++        Reset();
++      } else {
++        ArmTimer();
++      }
++      return swallow;
++    }
++    case Phase::kUnknown:
++    case Phase::kChanged:
++      break;
++  }
++
++  // Deltas. After a swipe ended, or after a pause, they start a new gesture.
++  if (state_ == State::kEnded ||
++      (state_ != State::kTracking && !last_event_.is_null() &&
++       time - last_event_ > kQuietTimeout && phase == Phase::kUnknown)) {
++    Reset();
++  }
++  last_event_ = time;
++
++  switch (state_) {
++    case State::kVertical:
++    case State::kIgnored:
++    case State::kEnded:
++      ArmTimer();
++      return false;
++    case State::kIdle: {
++      total_x_ += dx;
++      total_y_ += dy;
++      const float ax = std::abs(total_x_);
++      const float ay = std::abs(total_y_);
++      if (ay >= kAxisLockThreshold && ay > ax) {
++        state_ = State::kVertical;
++      } else if (ax >= kAxisLockThreshold && ax > ay) {
++        if (!delegate_->CanSwipe()) {
++          state_ = State::kIgnored;
++        } else {
++          state_ = State::kTracking;
++          lock_x_ = std::copysign(kAxisLockThreshold, total_x_);
++          samples_.clear();
++          samples_.push_back({time, total_x_ - lock_x_});
++          delegate_->BeginSwipe();
++          delegate_->UpdateSwipe(total_x_ - lock_x_);
++          ArmTimer();
++          return true;
++        }
++      }
++      ArmTimer();
++      return false;
++    }
++    case State::kTracking:
++      total_x_ += dx;
++      total_y_ += dy;
++      samples_.push_back({time, total_x_ - lock_x_});
++      while (samples_.size() > 2 &&
++             samples_.back().time - samples_.front().time >
++                 2 * kVelocityWindow) {
++        samples_.pop_front();
++      }
++      delegate_->UpdateSwipe(total_x_ - lock_x_);
++      ArmTimer();
++      return true;
++  }
++  return false;
++}
++
++bool SpacesSwipeTracker::OnLift(base::TimeTicks time,
++                                std::optional<float> velocity) {
++  // A lift that ends a gesture shows the platform sends lifts. (X11 also
++  // reports the first scroll after start as a lift, outside any gesture.)
++  if (state_ != State::kIdle || total_x_ != 0 || total_y_ != 0) {
++    trusts_lifts_ = true;
++  }
++  last_event_ = time;
++  if (state_ == State::kTracking) {
++    EndTracking(velocity);
++    ArmTimer();
++    return true;
++  }
++  const bool swallow = state_ == State::kEnded;
++  Reset();
++  return swallow;
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/spaces_swipe_handler.h
+@@ -0,0 +1,64 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACES_SWIPE_HANDLER_H_
++#define CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACES_SWIPE_HANDLER_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/views/neon/spaces/spaces_swipe_tracker.h"
++#include "ui/events/event_handler.h"
++
++namespace neon::spaces {
++
++class SpacesPagerView;
++
++// Turns the scroll and wheel events that reach the sidebar into swipes of the
++// pager. Installed by the pager as a pre-target handler on the tab strip
++// region, so it sees every scroll over the sidebar before the tab list does.
++//
++// - Touchpad scrolls (ui::ScrollEvent) drive SpacesSwipeTracker, which locks
++//   the axis and tracks the fingers. On macOS the momentum phase tells when
++//   fingers touch and lift; Wayland signals the lift with a fling start; X11
++//   has neither, so the tracker ends a gesture after a quiet period.
++// - A notched mouse wheel scrolled sideways (or with Shift) turns one page
++//   per notch with the page animation; smooth wheels are tracked like a
++//   touchpad.
++//
++// A macOS-only patch can feed SpacesSwipeTracker from the native event
++// (NSEvent phases, -trackSwipeEventWithOptions:) instead, without changes to
++// the pager: everything it needs is OnScroll(), OnLift() and the delegate.
++class SpacesSwipeHandler : public ui::EventHandler,
++                           public SpacesSwipeTracker::Delegate {
++ public:
++  explicit SpacesSwipeHandler(SpacesPagerView* pager);
++  SpacesSwipeHandler(const SpacesSwipeHandler&) = delete;
++  SpacesSwipeHandler& operator=(const SpacesSwipeHandler&) = delete;
++  ~SpacesSwipeHandler() override;
++
++  SpacesSwipeTracker& tracker() { return tracker_; }
++
++  // ui::EventHandler:
++  void OnScrollEvent(ui::ScrollEvent* event) override;
++  void OnMouseEvent(ui::MouseEvent* event) override;
++
++  // SpacesSwipeTracker::Delegate:
++  bool CanSwipe() override;
++  void BeginSwipe() override;
++  void UpdateSwipe(float distance) override;
++  void EndSwipe(float velocity) override;
++
++ private:
++  const raw_ptr<SpacesPagerView> pager_;
++  SpacesSwipeTracker tracker_{this};
++  // The time of the last scroll event: an unhandled scroll event comes back
++  // as a wheel event with the same time, which must not count twice.
++  base::TimeTicks last_scroll_time_;
++  // macOS: whether the current gesture went into momentum.
++  bool saw_momentum_ = false;
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACES_SWIPE_HANDLER_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/spaces_swipe_handler.cc
+@@ -0,0 +1,153 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/neon/spaces/spaces_swipe_handler.h"
++
++#include <cmath>
++#include <cstdlib>
++
++#include "base/i18n/rtl.h"
++#include "build/build_config.h"
++#include "chrome/browser/ui/neon/spaces/spaces_window_controller.h"
++#include "chrome/browser/ui/views/neon/spaces/spaces_pager_view.h"
++#include "ui/events/event.h"
++#include "ui/events/event_constants.h"
++
++namespace neon::spaces {
++
++SpacesSwipeHandler::SpacesSwipeHandler(SpacesPagerView* pager)
++    : pager_(pager) {
++#if BUILDFLAG(IS_MAC)
++  // Every macOS trackpad gesture ends with a phase.
++  tracker_.set_trusts_lifts(true);
++#endif
++}
++
++SpacesSwipeHandler::~SpacesSwipeHandler() = default;
++
++void SpacesSwipeHandler::OnScrollEvent(ui::ScrollEvent* event) {
++  if (!pager_->IsActive()) {
++    return;
++  }
++  const base::TimeTicks time = event->time_stamp();
++  bool consumed = false;
++  switch (event->type()) {
++    case ui::EventType::kScrollFlingStart:
++      // The fingers lifted. Wayland gives the release velocity; X11 sends a
++      // scroll of zero (libinput's scroll stop), and the tracker measures it.
++      consumed = tracker_.OnLift(
++          time, event->x_offset() != 0 || event->y_offset() != 0
++                    ? std::optional<float>(event->x_offset())
++                    : std::nullopt);
++      break;
++    case ui::EventType::kScrollFlingCancel:
++      // Fingers down on the touchpad.
++      tracker_.OnScroll(time, 0, 0, SpacesSwipeTracker::Phase::kMayBegin);
++      break;
++    case ui::EventType::kScroll: {
++      last_scroll_time_ = time;
++      SpacesSwipeTracker::Phase phase = SpacesSwipeTracker::Phase::kUnknown;
++#if BUILDFLAG(IS_MAC)
++      switch (event->momentum_phase()) {
++        case ui::EventMomentumPhase::MAY_BEGIN:
++          saw_momentum_ = false;
++          phase = SpacesSwipeTracker::Phase::kMayBegin;
++          break;
++        case ui::EventMomentumPhase::NONE:
++          phase = SpacesSwipeTracker::Phase::kChanged;
++          break;
++        case ui::EventMomentumPhase::END:
++          if (!saw_momentum_) {
++            // An end before any momentum is the lift.
++            consumed = tracker_.OnLift(time, std::nullopt);
++            if (consumed) {
++              event->SetHandled();
++              event->StopPropagation();
++            }
++            return;
++          }
++          saw_momentum_ = false;
++          phase = SpacesSwipeTracker::Phase::kMomentumEnded;
++          break;
++        case ui::EventMomentumPhase::INERTIAL_UPDATE:
++        case ui::EventMomentumPhase::BLOCKED:
++          saw_momentum_ = true;
++          phase = SpacesSwipeTracker::Phase::kMomentum;
++          break;
++      }
++#endif
++      consumed =
++          tracker_.OnScroll(time, event->x_offset(), event->y_offset(), phase);
++      break;
++    }
++    default:
++      return;
++  }
++  if (consumed) {
++    event->SetHandled();
++    event->StopPropagation();
++  }
++}
++
++void SpacesSwipeHandler::OnMouseEvent(ui::MouseEvent* event) {
++  if (!event->IsMouseWheelEvent() || !pager_->IsActive()) {
++    return;
++  }
++  const base::TimeTicks time = event->time_stamp();
++  if (time == last_scroll_time_) {
++    // A scroll event nobody handled, seen already.
++    return;
++  }
++  ui::MouseWheelEvent* wheel = event->AsMouseWheelEvent();
++  int dx = wheel->x_offset();
++  int dy = wheel->y_offset();
++  if (dx == 0 && wheel->IsShiftDown()) {
++    // Shift turns the wheel sideways.
++    dx = dy;
++    dy = 0;
++  }
++  if (dx == 0 || std::abs(dy) > std::abs(dx)) {
++    return;
++  }
++  bool consumed = false;
++  if (dx % ui::MouseWheelEvent::kWheelDelta == 0) {
++    // A notched wheel: one page per notch, animated. Scrolling left shows
++    // the space on the left.
++    if (pager_->CanDrag() && !tracker_.is_tracking() && pager_->controller()) {
++      const int notches = dx / ui::MouseWheelEvent::kWheelDelta;
++      const int direction = base::i18n::IsRTL() ? 1 : -1;
++      for (int i = 0; i < std::abs(notches); ++i) {
++        pager_->controller()->SwitchToRelativeSpace(
++            notches > 0 ? direction : -direction);
++      }
++    }
++    consumed = true;
++  } else {
++    // A smooth wheel: track it like a touchpad without phases.
++    consumed = tracker_.OnScroll(time, dx, dy,
++                                 SpacesSwipeTracker::Phase::kUnknown);
++  }
++  if (consumed) {
++    event->SetHandled();
++    event->StopPropagation();
++  }
++}
++
++bool SpacesSwipeHandler::CanSwipe() {
++  return pager_->CanDrag();
++}
++
++void SpacesSwipeHandler::BeginSwipe() {
++  pager_->BeginDrag();
++}
++
++void SpacesSwipeHandler::UpdateSwipe(float distance) {
++  pager_->UpdateDrag(distance);
++}
++
++void SpacesSwipeHandler::EndSwipe(float velocity) {
++  pager_->EndDrag(velocity);
++}
++
++}  // namespace neon::spaces

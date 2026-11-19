@@ -1,0 +1,33 @@
+Neon spaces (M3), part 4 of 4: range selection and keyboard moves.
+
+Shift-click range selection took every tab between the two clicked tabs in
+model order, so a range from a pinned to an unpinned tab took in other
+spaces' tabs. Moving a tab with Ctrl+Shift+PgDn or PgUp could step into
+another space's tabs. TabStripModel::GetTabRange, used only for selection ranges, now drops
+hidden tabs, and MoveTabRelative stops at a hidden neighbour.
+
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -4339,7 +4339,11 @@ std::vector<tabs::TabInterface*> TabStri
+   auto start = tabs::TabCollection::TabIterator(left);
+   auto end = ++tabs::TabCollection::TabIterator(right);
+ 
+-  return {start, end};
++  std::vector<tabs::TabInterface*> range(start, end);
++  std::erase_if(range, [this](tabs::TabInterface* tab) {
++    return neon::spaces::IsTabHidden(this, tab);
++  });
++  return range;
+ }
+ 
+ tabs::TabInterface* TabStripModel::GetFirstSelectedTab() const {
+@@ -4705,7 +4709,8 @@ void TabStripModel::MoveTabRelative(TabR
+                            ? moving_index_range.end()
+                            : moving_index_range.start() - 1;
+   if (ContainsIndex(neighbor_index) &&
+-      IsTabPinned(moving_index_range.start()) == IsTabPinned(neighbor_index)) {
++      IsTabPinned(moving_index_range.start()) == IsTabPinned(neighbor_index) &&
++      !neon::spaces::IsTabHidden(this, GetTabAtIndex(neighbor_index))) {
+     int offset = 1;
+     if (tabs::TabInterface* neighbor = GetTabAtIndex(neighbor_index);
+         neighbor->IsSplit()) {

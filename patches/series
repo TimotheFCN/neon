@@ -396,3 +396,7 @@ neon/spaces/window-controller.patch
 neon/spaces/model-filter.patch
 neon/spaces/strip-filter.patch
 neon/spaces/commands.patch
+neon/spaces/pager.patch
+neon/spaces/switcher-row.patch
+neon/spaces/swipe.patch
+neon/spaces/range-filter.patch
