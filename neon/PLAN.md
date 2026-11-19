@@ -59,7 +59,7 @@ across spaces on purpose.
 | R1 | Containers port study: map Brave's implementation onto Helium's patch layout | done | |
 | R2 | Spaces design: data model, sidebar pager, persistence | done | |
 | R3 | Study: all spaces as containers, a global context for extensions, per-space extension access | done | |
-| R4 | Study: upstream's pinned tabs pull requests and per-space pins | doing | |
+| R4 | Study: upstream's pinned tabs pull requests and per-space pins | done | |
 | M1 | Containers core: a tab can live in a named persistent container | done | M0, R1 |
 | M1b | Containers hardening: fix the review findings on the port | done | M2 |
 | M2 | Spaces model: tabs grouped by space, one visible space, switch by command | done | M1, R2 |
@@ -257,7 +257,10 @@ Left open by M4:
 M5 follows `neon/docs/global-space-design.md` (patch X5 with its spaces-layer changes, and
 patch X3 for tabs opened by extensions). M6 covers that document's "Clear browsing data", "Site
 data settings" and "DevTools" rows. M8 is its patches X1 and X2, M9 is X4. M7 waits for study
-R4 (`neon/docs/pinned-tabs-design.md`). Each milestone ends with the feature working in the
+R4 (`neon/docs/pinned-tabs-design.md`), which recommends importing upstream's persistent pinned
+tabs (pull request #2931) as a Neon-carried patch block and adding a small per-space patch on
+top, and leaving the two UI pull requests until upstream merges them. Re-read the upstream
+branch head when M7 starts, because it was force-pushed seven times in two days. Each milestone ends with the feature working in the
 Linux build, its patches in `patches/neon/`, and a scripted check that proves it.
 
 ## Product defaults taken from the design study
