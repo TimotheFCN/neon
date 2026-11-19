@@ -610,3 +610,38 @@ the next agent can build incrementally.
 - `--load-extension` needs `--disable-features=DisableLoadExtensionCommandLineSwitch` on this
   build. The test extension's service worker is a DevTools target of type `service_worker`;
   `Runtime.evaluate` with `awaitPromise` runs `chrome.*` calls there.
+
+## Notes from M6 (data tools per space)
+
+- **`quilt pop PATCH` pops the patches above PATCH**, not PATCH itself. To refresh a Neon patch
+  that shares files with a later one, move the later one to the end with
+  `neon/quilt_place.py PATCH platform`, `quilt pop` (no argument), refresh the earlier patch,
+  `quilt push PATCH`, move it back with `quilt_place.py PATCH core`. Save and restore the
+  mtimes of the moved patch's files around this (as in the M4 note) and nothing rebuilds.
+- **Where each partition keeps what**, under `Default/` for the global context and under
+  `Default/Storage/ext/containers/<hash>/` for a container: `Cookies` (SQLite),
+  `Local Storage/leveldb`, `IndexedDB/http_<host>_<port>.indexeddb.leveldb`,
+  `Service Worker/Database` (registrations) and `Service Worker/CacheStorage`, and the HTTP
+  cache in `Cache/Cache_Data` (one file per entry, its key holds the URL).
+- **leveldb on disk keeps deleted bytes** in its log until a compaction, so a grep for a
+  deleted localStorage key still finds it. `neon/tests/data_tools_m6.py` replays the logs
+  (`leveldb_state`) to get the live keys. A database reopened by a later run moves its log into
+  `.ldb` tables, which the replay only reads as raw bytes, so on-disk storage checks are made
+  on a profile that ran once.
+- **Markers must not be prefixes of each other** (`ls_A` matches `ls_A2`). The M6 check uses
+  single letters that never prefix one another.
+- **Driving DevTools.** F12 docks DevTools; its front end is a `page` target at
+  `devtools://devtools/bundled/devtools_app.html`. Attach to it and `Runtime.evaluate`
+  `await import('./core/sdk/sdk.js')` (and `./panels/application/application.js`) to reach the
+  inspected target (`SDK.TargetManager.TargetManager.instance().primaryPageTarget()`), its
+  protocol agents and the panels' own code, such as `App.StorageView.StorageView.clear()`.
+- **HTTP cache without the network**: `fetch(url, {cache: 'only-if-cached', mode:
+  'same-origin'})` fails unless the entry is cached, which checks a cache without refilling it.
+- **A `BrowsingDataFilterBuilder` in `kDelete` mode with no origins hits a CHECK** in the
+  remover. An empty removal (mask 0, no filter) is fine and is how Neon waits for queued
+  removals.
+- **Content-setting patterns with a port** (`http://127.0.0.1:PORT,*`) do not match for cookie
+  deletion on exit, which looks up the host only. Use `127.0.0.1,*` in seeded prefs.
+- `Target.activateTarget` on a page tab of another space switches the window to that space;
+  a check that clicks in a settings tab must bring it back to the front first
+  (`click_in` in the M6 check does).
