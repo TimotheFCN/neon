@@ -67,7 +67,7 @@ across spaces on purpose.
 | M4 | Space management: create, rename, icon, colour, delete, reorder, settings page | done | M2 |
 | M5 | All spaces as containers: global context, no default space, extension pages in a separate window, tabs opened by extensions land in the current space | doing | M4, R3 |
 | M6 | Clear browsing data, site data settings and DevTools per space | todo | M5 |
-| M7 | Per-space pinned tabs | todo | M5, R4 |
+| M7 | Per-space pinned tabs | blocked | Upstream merging its persistent pinned tabs (#2931) |
 | M8 | Extension switch per space | todo | M5 |
 | M9 | Floating overlay for global pages (extension pages, extension sign-in) | todo | M5 |
 | M10 | Web push and notification clicks in containers | todo | M5 |
@@ -75,7 +75,7 @@ across spaces on purpose.
 | Mac | macOS: build from `neon-macos`, finger-tracked swipe, per-space glass tint | blocked | Mac access |
 | Dist | Distribution: own bundle id and data dir, updater off, sync script | todo | Mac for the Mac parts |
 
-The order of M5 to M11 is the owner's (2026-11-19). The macOS and distribution work was called
+The order of M5 to M11 is the owner's (2026-11-19). M7 waits for upstream, so M8 follows M6. The macOS and distribution work was called
 M6 and M7 in older notes and commit messages.
 
 ### M0: Linux dev build
@@ -257,10 +257,19 @@ Left open by M4:
 M5 follows `neon/docs/global-space-design.md` (patch X5 with its spaces-layer changes, and
 patch X3 for tabs opened by extensions). M6 covers that document's "Clear browsing data", "Site
 data settings" and "DevTools" rows. M8 is its patches X1 and X2, M9 is X4. M7 waits for study
-R4 (`neon/docs/pinned-tabs-design.md`), which recommends importing upstream's persistent pinned
-tabs (pull request #2931) as a Neon-carried patch block and adding a small per-space patch on
-top, and leaving the two UI pull requests until upstream merges them. Re-read the upstream
-branch head when M7 starts, because it was force-pushed seven times in two days. Each milestone ends with the feature working in the
+R4 (`neon/docs/pinned-tabs-design.md`).
+
+The owner decided on 2026-11-19 not to import upstream's pinned tabs pull request before it
+merges, and not to build our own pins in the meantime: #2931 was force-pushed seven times in two
+days and its first review asked for restructuring. M7 starts at the sync that brings the merged
+code (the release whose `series` lists `helium/core/pins/pin-sync.patch`). The per-space patch
+the study describes (about 250 new lines, section D) is then part of that sync, because the
+upstream feature breaks spaces without it. Until then pinned tabs are stock Chromium ones:
+hidden per space by the layout filter, restored into their container by session restore, and
+untested. Finding 7 of M1b stays open (with session restore off, Helium's deferred pinned
+startup tabs lose their container).
+
+Each milestone ends with the feature working in the
 Linux build, its patches in `patches/neon/`, and a scripted check that proves it.
 
 ## Product defaults taken from the design study
