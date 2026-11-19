@@ -1,6 +1,6 @@
 # Linux dev build
 
-How to build, run and change Neon on the Linux dev VM (codebox-01). Everything here was measured
+How to build, run and change Neon on the Linux dev VM. Everything here was measured
 on that VM in November 2026 with Helium 0.22.1 (Chromium 158.0.8127.36), building from
 `~/projects/neon-linux`.
 
@@ -40,7 +40,7 @@ needs no compiler on the host. What it does need are the `-dev` packages that GN
 `pkg-config` (GTK, NSS, PipeWire and so on), quilt for the patch queue, and Xvfb plus the X
 libraries to run the browser. Upstream already lists those in `docker/build.Dockerfile`, and its
 release build runs in that image, so the dev flow uses it too. The host stays clean and nothing
-had to be added to `/opt/codebox`.
+had to be installed on it.
 
 The Neon layer (`neon/docker/dev.Dockerfile`) adds quilt, xdotool, `python3-websocket` for the
 DevTools client, and Noto fonts.

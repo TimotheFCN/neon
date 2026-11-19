@@ -5,7 +5,7 @@ milestones land. Subagents report results back instead of editing the status tab
 
 ## Goal
 
-One browser window whose sidebar holds several spaces (perso, work, dossardclub, ...). Each space
+One browser window whose sidebar holds several spaces (personal, work, a client, ...). Each space
 has its own tabs, pinned tabs, icon and colour, and its own logins. A two-finger swipe on the
 sidebar slides between spaces, as in Arc. Settings, extensions, history and bookmarks are shared
 across spaces on purpose.
@@ -40,8 +40,16 @@ across spaces on purpose.
    container and stored nowhere else. The visible space of a window is the space of its active
    tab, so switching space is activating a tab. This copies how Chromium's tab group focus mode
    hides tabs. See `neon/docs/spaces-design.md`.
-10. **The default storage partition is the first space.** Existing logins stay where they are
-    and show up in that space.
+10. **Every visible space is a container. The default storage partition is the global context.**
+    It holds the browser's own pages and the extensions, and no space the user sees. All spaces
+    then behave the same, any of them can be deleted except the last, and it is plain that
+    extensions belong to the browser and not to a space. Decided by the owner on 2026-11-19,
+    replacing "the default partition is the first space". Cost accepted: every container limit
+    applies to all browsing until fixed (see `neon/docs/global-space-design.md`, section 2).
+11. **Extensions are global, with a per-space off switch.** An extension runs in every space
+    unless turned off for a space. Its pages and sign-in flows belong to the global context and
+    open outside any space: first in a small separate window, later in a floating overlay.
+    Tabs an extension opens for the user land in the current space.
 
 ## Milestones
 
@@ -50,15 +58,25 @@ across spaces on purpose.
 | M0 | Linux dev build of stock Helium 0.22.1 from `neon-linux`, running under Xvfb | done | |
 | R1 | Containers port study: map Brave's implementation onto Helium's patch layout | done | |
 | R2 | Spaces design: data model, sidebar pager, persistence | done | |
-| R3 | Study: all spaces as containers, a global context for extensions, per-space extension access | doing | |
+| R3 | Study: all spaces as containers, a global context for extensions, per-space extension access | done | |
+| R4 | Study: upstream's pinned tabs pull requests and per-space pins | doing | |
 | M1 | Containers core: a tab can live in a named persistent container | done | M0, R1 |
 | M1b | Containers hardening: fix the review findings on the port | done | M2 |
 | M2 | Spaces model: tabs grouped by space, one visible space, switch by command | done | M1, R2 |
 | M3 | Sidebar pager: space switcher row, slide animation, scroll gesture | done | M2 |
-| M4 | Space management: create, rename, icon, colour, delete, reorder, settings page | doing | M2 |
-| M5 | Per-space pinned tabs, and site rules that route a URL to a space | todo | M3 |
-| M6 | macOS: build from `neon-macos`, finger-tracked swipe, per-space glass tint | blocked | Mac access |
-| M7 | Distribution: own bundle id and data dir, updater off, hosting, sync script | todo | M6 for the Mac parts |
+| M4 | Space management: create, rename, icon, colour, delete, reorder, settings page | done | M2 |
+| M5 | All spaces as containers: global context, no default space, extension pages in a separate window, tabs opened by extensions land in the current space | doing | M4, R3 |
+| M6 | Clear browsing data, site data settings and DevTools per space | todo | M5 |
+| M7 | Per-space pinned tabs | todo | M5, R4 |
+| M8 | Extension switch per space | todo | M5 |
+| M9 | Floating overlay for global pages (extension pages, extension sign-in) | todo | M5 |
+| M10 | Web push and notification clicks in containers | todo | M5 |
+| M11 | Site rules that route a URL to a space | todo | M5 |
+| Mac | macOS: build from `neon-macos`, finger-tracked swipe, per-space glass tint | blocked | Mac access |
+| Dist | Distribution: own bundle id and data dir, updater off, sync script | todo | Mac for the Mac parts |
+
+The order of M5 to M11 is the owner's (2026-11-19). The macOS and distribution work was called
+M6 and M7 in older notes and commit messages.
 
 ### M0: Linux dev build
 
@@ -131,7 +149,7 @@ three were handed to the M2 agent because they sit in the new-tab code it is cha
 | 4 | Saved tab groups reopen their tabs in the default partition (also Brave issue #58219) | M1b |
 | 5 | Brave skips platform SSO in container tabs and the port does not. On a managed Mac every container would be signed into the device's work account | M1b |
 | 6 | New split tabs do not inherit the container | M1b |
-| 7 | Helium's deferred pinned startup tabs ignore the container | M5, with per-space pins |
+| 7 | Helium's deferred pinned startup tabs ignore the container | M7, with per-space pins |
 | 8 | The M1 check never tests lazy restore, reopen closed tab or window, Back and Forward after restart, discard and reload | M2 for the first three, M1b for the rest |
 
 Findings 1 to 3 are fixed (commit `09af908b`). The suggested fix for blank tabs was unsafe: a
@@ -154,28 +172,18 @@ checks). It added `containers/platform-auth.patch` and `spaces/groups.patch`. Wh
 - View source keeps the tab's container. Extension pages stay in the default partition.
 - Removing a split with spaces on crashed (SIGSEGV). Fixed.
 - The platform SSO skip is ported from Brave. It only compiles on macOS and Windows and has
-  never run. Check it on a managed Mac in M6.
+  never run. Check it on a managed Mac in the macOS milestone.
 
 Behaviour M1b chose, and the owner's answer (2026-11-19):
 
-1. Extension pages (options, popups opened as tabs) always open in the default space. Under
-   review, see "Open design question" below.
+1. Extension pages (options, popups opened as tabs) always open in the default space. Replaced
+   by decision 11: they open outside any space.
 2. A tab group belongs to the space of the first tab that joined. A tab from another space that
    is dragged in is taken out of the group. Confirmed.
 3. A split that ends up spanning two spaces is unsplit. Confirmed.
-4. Extension popup windows open on the space of the last active window. Under review with 1.
+4. Extension popup windows open on the space of the last active window. Replaced by decision
+   11: they are global.
 5. In a space with a single tab, the split picker shows a plain new tab page. Confirmed.
-
-#### Open design question: extensions and spaces
-
-Extensions are shared by all spaces, and an extension signed in to one account acts on pages of
-every space. The owner wants a model that makes this obvious and controllable. Their proposal:
-no visible space uses the default partition. Every space the user sees is a container, and the
-default partition becomes a "global" context that holds the browser's own pages and the
-extensions. Pages that belong to no space (extension pages, extension sign-in) would open in a
-floating window over the browser, as Arc does, and extensions could be turned off per space.
-This would replace decision 10. Study R3 (`neon/docs/global-space-design.md`) checks what it
-costs before anything is decided.
 
 ### M2: Spaces model (done)
 
@@ -187,13 +195,13 @@ new Chromium hook.
 
 Left open by M2, to be picked up where noted:
 
-- Pinned tabs are hidden per space by the same layout hook but no test pins a tab (M5).
+- Pinned tabs are hidden per space by the same layout hook but no test pins a tab (M7).
 - Shift-click range selection and Ctrl+Shift+PgDn are not filtered by space (M3).
 - A change to the space list at runtime does not relay out the sidebar until the active tab
   changes (M4).
 - Keeping a space's tabs together was skipped in a section that contains a group or split, and
   groups that mixed containers were not ungrouped. Fixed in M1b (`spaces/groups.patch`).
-- macOS shortcuts are not wired, and Ctrl+Alt+Up/Down may clash with GNOME (M6).
+- macOS shortcuts are not wired, and Ctrl+Alt+Up/Down may clash with GNOME (macOS milestone).
 - Tabs in a container that no space uses count as the default space.
 - Not tested: dragging tabs between windows, tab search, tabs opened by extensions, bookmarks.
 
@@ -212,15 +220,45 @@ Left open by M3:
 - Each window builds three full copies of every tab view, and a switch costs about 40 ms of
   layout with 90 tabs. Measure on real hardware before optimising.
 - The swipe was only run on X11 with a synthetic touchpad. Wayland and macOS paths compile but
-  have never run. The macOS patch feeds `SpacesSwipeTracker` with native phases (M6).
+  have never run. The macOS patch feeds `SpacesSwipeTracker` with native phases (macOS milestone).
 - Screen readers and the accessibility tree were not tested with peek pages.
 - Labels in the switcher row and its menu are English only.
 
-### M4 and M5
+### M4: Space management (done)
 
-The patch list for each is in `neon/docs/spaces-design.md`. Each milestone ends with the feature
-working in the Linux build, its patches in `patches/neon/`, and a test or scripted check that
-proves it. Each is scoped in detail when the one before it lands.
+Three patches (management-ui, settings-page, move-to-space): about 2,100 new lines, 24 hook
+lines in 7 settings files and 15 in 5 tab menu files. `neon/tests/spaces_m4.py` (76 checks)
+drives the row, the bubbles, the settings page and the tab menu with real input, and proves
+that a deleted space's cookies and site storage are gone at once and its directory after a
+restart. It also fixed a use-after-free in `SpacesService::UpdateSpace` from M2.
+
+Behaviour M4 chose, to be confirmed by the owner:
+
+1. "+" creates the space at once ("Space N", first unused colour), shows it with a new tab
+   page and opens the edit bubble. Edits apply as they are made.
+2. Tabs of a deleted space close without unload prompts and leave no "recently closed" entries.
+3. "Reopen in space" makes the first reopened tab active, so the window follows the tabs. The
+   tabs go to the end of the target space and leave their group or split.
+4. With six or more spaces the row falls back to a single icon with a menu.
+5. With one space the row is hidden, so the first extra space is created from Settings or from
+   "Reopen in space". M5 changes what "one space" means and should revisit this.
+6. Nine colours plus none. Icons are the first letter, an emoji or one of ten vector icons.
+
+Left open by M4:
+
+- Strings are English literals, not in a `.grdp`.
+- "Reopen in space" on a split, and on a tab that was restored but never loaded, are untested.
+- No test swipes while a delete is in progress.
+- No shortcut for "New space", and tabs cannot be dragged onto a space icon.
+- Keyboard and screen reader use of the edit bubble and the row menu are untested.
+
+### M5 to M11
+
+M5 follows `neon/docs/global-space-design.md` (patch X5 with its spaces-layer changes, and
+patch X3 for tabs opened by extensions). M6 covers that document's "Clear browsing data", "Site
+data settings" and "DevTools" rows. M8 is its patches X1 and X2, M9 is X4. M7 waits for study
+R4 (`neon/docs/pinned-tabs-design.md`). Each milestone ends with the feature working in the
+Linux build, its patches in `patches/neon/`, and a scripted check that proves it.
 
 ## Product defaults taken from the design study
 
@@ -233,19 +271,24 @@ These follow the study's recommendations until the owner says otherwise:
 - Moving a tab to another space reloads it there, so the menu entry reads "Reopen in space".
 - The swipe works anywhere on the sidebar.
 - Outside the vertical tabs layout, all tabs show and the space switcher is hidden.
-- Extensions see the tabs of every space in a window.
+- Extensions see the tabs of every space in a window, until M8 adds the per-space switch.
 
 ## Known constraints
 
 - One Chromium tree and one build at a time on the dev VM. Work that needs compiling is
   serialized. Research and design can run in parallel.
 - A Neon build must not share Helium's data directory, bundle id or updater on the owner's Mac,
-  or the two installs will overwrite each other. Handled in M7, before the first Mac install.
+  or the two installs will overwrite each other. Handled in the distribution work, before the
+  first Mac install.
 - Chromium's large test binaries (`unit_tests`, `browser_tests`, `interactive_ui_tests`) do not
   compile on a Helium tree. Neon is tested with scripts that drive the real browser over the
   DevTools protocol, kept under `neon/tests/`. See `neon/docs/dev-linux.md`.
-- Hosting is undecided. Until then the three repos exist only on the dev VM.
+- The three repos are public on GitHub as standalone repos, not GitHub forks, so that no pull
+  request can target Helium by accident. GitHub Actions is turned off on them because Helium's
+  release workflows come along with the code.
 - Containers inherit Brave's limits: extensions cannot read or set a container's cookies, tabs
   opened by an extension land in the default partition, site permissions are shared across
-  containers, and web push inside a container is unverified. Password manager and sign-in flows
-  that rely on an extension opening tabs may misbehave outside the default space.
+  containers, and web push never reaches a container. Under decision 10 these apply to all
+  browsing. The full list is in `neon/docs/global-space-design.md`, section 2.
+- No migration from an existing Helium profile. A profile copied into Neon keeps its settings
+  and extensions, and its logins stay in the global context where no space sees them.

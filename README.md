@@ -2,6 +2,8 @@
 > This is Neon, a personal fork of [Helium](https://github.com/imputnet/helium) that adds
 > Arc-style spaces. It is not affiliated with or supported by the Helium maintainers, so
 > please do not report Neon problems to them. See [neon/PLAN.md](neon/PLAN.md).
+> The platform repos are [neon-linux](https://github.com/TimotheFCN/neon-linux) and
+> [neon-macos](https://github.com/TimotheFCN/neon-macos).
 
 <div align="center">
     <img src="resources/branding/app_icon/raw.png"
