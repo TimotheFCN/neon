@@ -568,6 +568,11 @@ the next agent can build incrementally.
 
 ## Notes from M5 (all spaces as containers)
 
+- **`quilt refresh` drops files that have no change yet.** A file added to a patch with
+  `quilt add` before you edit it, then refreshed while still unchanged, is no longer tracked:
+  a later edit stays in the tree only, the build passes, and a clean apply of the series would
+  not compile. Add a file right before editing it, and check `quilt files PATCH` before
+  committing. M5 hit this once (`space_switcher_row.h`).
 - **Always `quilt refresh` before any pop or move.** Edits to files a patch tracks live only in
   the tree until refreshed; `quilt pop` refuses an unrefreshed patch ("does not remove
   cleanly"), which is the safe outcome, but a script that goes on from there leaves the series

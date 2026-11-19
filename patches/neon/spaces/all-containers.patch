@@ -1224,3 +1224,25 @@ context menu gets "New space" (command id 39520).
  
    switch (command_id) {
      case IDC_NEW_TAB:
+--- a/chrome/browser/ui/views/neon/spaces/space_switcher_row.h
++++ b/chrome/browser/ui/views/neon/spaces/space_switcher_row.h
+@@ -21,6 +21,7 @@
+ #include "ui/views/context_menu_controller.h"
+ #include "ui/views/view.h"
+ 
++class BrowserWindowInterface;
+ class Profile;
+ 
+ namespace views {
+@@ -58,6 +59,11 @@ class SpaceSwitcherRow : public views::V
+   // Whether only the visible space's icon shows (the icons do not fit).
+   bool IsCompact() const;
+ 
++  // The "New space" item of the new tab button's menu, for |browser|'s row:
++  // whether it applies, or (|execute|) creating the space, as "+" does.
++  static bool HandleNewSpaceMenu(BrowserWindowInterface* browser,
++                                 bool execute);
++
+   // views::View:
+   void Layout(PassKey) override;
+   gfx::Size CalculatePreferredSize(
