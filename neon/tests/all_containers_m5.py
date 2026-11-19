@@ -582,8 +582,9 @@ def phase_manage(ctx):
     click(ctx, center(bounds), settle_time=1.5)   # show Personal
     click(ctx, center(bounds), button=3, settle_time=1)
     items = menu_items(b)
-    check(len(items) >= 3, f'the first space\'s menu has Edit, Delete, New space ({len(items)})')
-    delete_item = items[1] if len(items) >= 3 else None
+    check(len(items) >= 4,
+          f'the first space\'s menu has Edit, Clear data, Delete, New space ({len(items)})')
+    delete_item = items[2] if len(items) >= 4 else None
     if delete_item:
         enabled = b.ui.props(delete_item[0]).get('Enabled')
         check(enabled == 'true', f'Delete is enabled for the first space ({enabled})')
