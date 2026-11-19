@@ -1,0 +1,1577 @@
+Neon spaces (M6): delete browsing data per space, and clear a space's data.
+
+The "Delete browsing data" dialog (Ctrl+Shift+Delete, settings) gets a scope:
+the space its settings tab is in, chosen by default, or all spaces, which also
+covers the global context (the default partition). With one space chosen it
+offers only the data a space keeps apart (cookies and site data, cached files)
+and says that history, downloads, passwords and autofill are shared. The two
+counters count the partitions in scope; the stock ones read the default
+partition only. Deleting from all spaces waits until the per-container
+removals are done.
+
+"Clear this space's data..." in a space's menu in the switcher row and "Clear
+data" on the Spaces settings page delete a space's cookies, site storage and
+cache (all time) after a confirmation, keep the space and its tabs, and reload
+its loaded tabs (containers_api::ClearContainerStorage, as deleting a space
+does).
+
+Adds containers_api::GetStoragePartitionConfig and ListUsedContainerIds,
+chrome/browser/ui/neon/spaces/space_data.{h,cc}, space_data_handler.{h,cc},
+chrome/browser/ui/views/neon/spaces/space_clear_confirmation.{h,cc} and the
+dialog's settings-neon-space-scope element.
+--- a/chrome/browser/neon/containers_api.cc
++++ b/chrome/browser/neon/containers_api.cc
+@@ -247,6 +247,29 @@ void ClearContainerStorage(Profile* prof
+       base::Time(), base::Time::Max(), /*filter=*/nullptr, barrier);
+ }
+ 
++std::optional<content::StoragePartitionConfig> GetStoragePartitionConfig(
++    Profile* profile,
++    std::string_view id) {
++  if (!profile) {
++    return std::nullopt;
++  }
++  if (id.empty()) {
++    return content::StoragePartitionConfig::CreateDefault(profile);
++  }
++  if (!GetService(profile) ||
++      !containers::IsValidStoragePartitionKeyComponent(id)) {
++    return std::nullopt;
++  }
++  return content::StoragePartitionConfig::Create(
++      profile, containers::kContainersStoragePartitionDomain, std::string(id),
++      profile->IsOffTheRecord());
++}
++
++std::vector<std::string> ListUsedContainerIds(Profile* profile) {
++  containers::ContainersService* service = GetService(profile);
++  return service ? service->GetUsedContainerIds() : std::vector<std::string>();
++}
++
+ void ForgetContainerInClosedTabs(Profile* profile, std::string_view id) {
+   if (!GetService(profile) || id.empty()) {
+     return;
+--- a/chrome/browser/neon/containers_api.h
++++ b/chrome/browser/neon/containers_api.h
+@@ -19,6 +19,7 @@ class GURL;
+ class Profile;
+ 
+ namespace content {
++class StoragePartitionConfig;
+ class WebContents;
+ }  // namespace content
+ 
+@@ -95,6 +96,18 @@ void ClearContainerStorage(Profile* prof
+                            std::string_view id,
+                            base::OnceClosure done);
+ 
++// The storage partition of container |id|, or of the default partition (the
++// global context) for the empty |id|. std::nullopt for an invalid id, or for a
++// container id when containers are unavailable.
++std::optional<content::StoragePartitionConfig> GetStoragePartitionConfig(
++    Profile* profile,
++    std::string_view id);
++
++// Every container whose partition may hold data: those a tab has used, listed
++// or not (Brave's used containers). Deleted containers stay in it until their
++// storage is removed at a later start.
++std::vector<std::string> ListUsedContainerIds(Profile* profile);
++
+ // Drops every recently closed tab, window and group navigation that was in
+ // container |id|, so reopening a closed tab cannot bring the container back
+ // and the next start can delete its storage. Loads the recently closed list
+--- a/chrome/browser/resources/settings/BUILD.gn
++++ b/chrome/browser/resources/settings/BUILD.gn
+@@ -280,6 +280,9 @@ build_webui("build") {
+     "clear_browsing_data_dialog/clear_browsing_data_time_picker.ts",
+     "clear_browsing_data_dialog/history_deletion_dialog.html.ts",
+     "clear_browsing_data_dialog/history_deletion_dialog.ts",
++    "clear_browsing_data_dialog/neon_data_scope_browser_proxy.ts",
++    "clear_browsing_data_dialog/neon_space_scope.html.ts",
++    "clear_browsing_data_dialog/neon_space_scope.ts",
+     "clear_browsing_data_dialog/other_google_data_dialog.html.ts",
+     "clear_browsing_data_dialog/other_google_data_dialog.ts",
+     "controls/controlled_button.html.ts",
+@@ -634,6 +637,7 @@ build_webui("build") {
+     "clear_browsing_data_dialog/clear_browsing_data_account_indicator.css",
+     "clear_browsing_data_dialog/clear_browsing_data_dialog.css",
+     "clear_browsing_data_dialog/clear_browsing_data_time_picker.css",
++    "clear_browsing_data_dialog/neon_space_scope.css",
+     "clear_browsing_data_dialog/other_google_data_dialog.css",
+     "controls/collapse_radio_button.css",
+     "controls/controlled_button.css",
+--- a/chrome/browser/resources/settings/appearance_page/neon_spaces_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/neon_spaces_page.html.ts
+@@ -57,6 +57,10 @@ export function getHtml(this: SettingsNe
+           <span class="space-tabs cr-secondary-text">
+             ${this.tabsText_(space)}
+           </span>
++          <cr-button class="clear-data" @click="${this.onClearDataClick_}"
++              aria-label="Clear the data of ${space.name}">
++            Clear data
++          </cr-button>
+           <cr-icon-button class="move-up" iron-icon="cr:keyboard-arrow-up"
+               title="Move up" aria-label="Move ${space.name} up"
+               ?disabled="${index === 0}"
+@@ -133,6 +137,23 @@ export function getHtml(this: SettingsNe
+     </cr-button>
+   </div>
+ </cr-dialog>
++<cr-dialog id="clearDataDialog" @close="${this.onClearDataDialogClose_}">
++  <div slot="title">Clear the data of “${this.clearing_?.name || ''}”?</div>
++  <div slot="body">
++    Deletes this space's cookies, site data and cached files, so you will be
++    signed out of its sites. The space and its tabs stay, and open tabs
++    reload. History is shared by all spaces and is kept.
++  </div>
++  <div slot="button-container">
++    <cr-button class="cancel-button" @click="${this.onClearDataCancelClick_}">
++      Cancel
++    </cr-button>
++    <cr-button id="confirmClearData" class="action-button"
++        @click="${this.onClearDataConfirmClick_}">
++      Clear data
++    </cr-button>
++  </div>
++</cr-dialog>
+ <!--_html_template_end_-->`;
+   // clang-format on
+ }
+--- a/chrome/browser/resources/settings/appearance_page/neon_spaces_page.ts
++++ b/chrome/browser/resources/settings/appearance_page/neon_spaces_page.ts
+@@ -20,6 +20,7 @@ import type {CrToggleElement} from 'chro
+ import {WebUiListenerMixinLit} from 'chrome://resources/cr_elements/web_ui_listener_mixin_lit.js';
+ import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ 
++import {NeonDataScopeBrowserProxyImpl} from '../clear_browsing_data_dialog/neon_data_scope_browser_proxy.js';
+ import {SettingsViewMixinLit} from '../settings_page/settings_view_mixin_lit.js';
+ 
+ import type {NeonSpace, NeonSpacesBrowserProxy, NeonSpacesState} from './neon_spaces_browser_proxy.js';
+@@ -49,6 +50,7 @@ const EMOJI_OPTION = 'emoji';
+ export interface SettingsNeonSpacesPageElement {
+   $: {
+     deleteDialog: CrDialogElement,
++    clearDataDialog: CrDialogElement,
+     showSwitcherRow: CrToggleElement,
+     swipeToSwitch: CrToggleElement,
+   };
+@@ -76,6 +78,7 @@ export class SettingsNeonSpacesPageEleme
+       state_: {type: Object},
+       deleting_: {type: Object},
+       deletingTabs_: {type: Number},
++      clearing_: {type: Object},
+       emojiRows_: {type: Object},
+     };
+   }
+@@ -84,6 +87,8 @@ export class SettingsNeonSpacesPageEleme
+   // The space the delete dialog asks about.
+   protected accessor deleting_: NeonSpace|null = null;
+   protected accessor deletingTabs_: number = 0;
++  // The space the "clear data" dialog asks about.
++  protected accessor clearing_: NeonSpace|null = null;
+   // Spaces whose icon menu is on "Emoji" while the emoji field is empty.
+   protected accessor emojiRows_: Set<string> = new Set();
+ 
+@@ -294,6 +299,31 @@ export class SettingsNeonSpacesPageEleme
+     this.deleting_ = null;
+   }
+ 
++  protected onClearDataClick_(e: Event) {
++    const space = this.spaceOf_(e);
++    if (!space) {
++      return;
++    }
++    this.clearing_ = space;
++    this.$.clearDataDialog.showModal();
++  }
++
++  protected async onClearDataConfirmClick_() {
++    const space = this.clearing_;
++    this.$.clearDataDialog.close();
++    if (space) {
++      await NeonDataScopeBrowserProxyImpl.getInstance().clearSpace(space.id);
++    }
++  }
++
++  protected onClearDataCancelClick_() {
++    this.$.clearDataDialog.cancel();
++  }
++
++  protected onClearDataDialogClose_() {
++    this.clearing_ = null;
++  }
++
+   protected onAddClick_() {
+     this.browserProxy_.createSpace();
+   }
+--- a/chrome/browser/resources/settings/clear_browsing_data_dialog/clear_browsing_data_dialog.css
++++ b/chrome/browser/resources/settings/clear_browsing_data_dialog/clear_browsing_data_dialog.css
+@@ -61,6 +61,10 @@
+   position: fixed;
+ }
+ 
++#neonSharedNote {
++  padding: 12px var(--cr-section-padding) 0 var(--cr-section-padding);
++}
++
+ #showMoreButton {
+   --cr-button-background-color: var(--dbd-container-color);
+   --cr-button-height: auto;
+--- a/chrome/browser/resources/settings/clear_browsing_data_dialog/clear_browsing_data_dialog.html.ts
++++ b/chrome/browser/resources/settings/clear_browsing_data_dialog/clear_browsing_data_dialog.html.ts
+@@ -14,6 +14,9 @@ export function getHtml(this: SettingsCl
+     @cancel="${this.onDialogCancel_}">
+   <div slot="title" class="dialog-title">$i18n{clearBrowsingData}</div>
+   <div slot="header">
++    <settings-neon-space-scope id="neonScope"
++        @neon-scope-change="${this.onNeonScopeChange_}">
++    </settings-neon-space-scope>
+     <settings-clear-browsing-data-time-picker id="timePicker"
+         @selected-time-period-change="${this.onSelectedTimePeriodChange_}">
+     </settings-clear-browsing-data-time-picker>
+@@ -48,6 +51,11 @@ export function getHtml(this: SettingsCl
+           role="presentation">
+       </cr-icon>
+     </cr-button>
++    <div id="neonSharedNote" class="cr-secondary-text"
++        ?hidden="${!this.neonSpaceId_}">
++      History, downloads, passwords and autofill are shared by all spaces.
++      To delete them, choose All spaces.
++    </div>
+   </div>
+   <div slot="button-container" class="row-aligned">
+ <if expr="not is_chromeos">
+--- a/chrome/browser/resources/settings/clear_browsing_data_dialog/clear_browsing_data_dialog.ts
++++ b/chrome/browser/resources/settings/clear_browsing_data_dialog/clear_browsing_data_dialog.ts
+@@ -16,6 +16,7 @@ import './clear_browsing_data_account_in
+ import './clear_browsing_data_time_picker.js';
+ import './history_deletion_dialog.js';
+ import './other_google_data_dialog.js';
++import './neon_space_scope.js';
+ 
+ import type {SyncBrowserProxy, SyncStatus} from '/shared/settings/people_page/sync_browser_proxy.js';
+ import {SyncBrowserProxyImpl} from '/shared/settings/people_page/sync_browser_proxy.js';
+@@ -44,6 +45,8 @@ import {getHtml} from './clear_browsing_
+ import {canDeleteAccountData, isSignedIn} from './clear_browsing_data_signin_util.js';
+ import type {SettingsClearBrowsingDataTimePickerElement} from './clear_browsing_data_time_picker.js';
+ import {getTimePeriodString} from './clear_browsing_data_time_picker.js';
++import {NeonDataScopeBrowserProxyImpl} from './neon_data_scope_browser_proxy.js';
++import type {NeonScopeChangeDetail} from './neon_space_scope.js';
+ 
+ /**
+  * @param dialog the dialog to close
+@@ -88,6 +91,16 @@ const ALL_BROWSING_DATATYPES_LIST: Brows
+   BrowsingDataType.SKILLS,
+ ];
+ 
++/**
++ * Neon: the data types each space keeps apart, the only ones the dialog
++ * offers when it deletes from one space. Their counters come from Neon, which
++ * counts the partitions in scope; the stock ones read the default partition.
++ */
++const NEON_PER_SPACE_DATATYPES: BrowsingDataType[] = [
++  BrowsingDataType.SITE_DATA,
++  BrowsingDataType.CACHE,
++];
++
+ /** The list of Browsing Data types that should be expanded by default. */
+ const DEFAULT_BROWSING_DATATYPES_LIST: BrowsingDataType[] = [
+   BrowsingDataType.HISTORY,
+@@ -176,6 +189,7 @@ export class SettingsClearBrowsingDataDi
+       expandedBrowsingDataTypeOptionsList_: {type: Array},
+       moreBrowsingDataTypeOptionsList_: {type: Array},
+       syncStatus_: {type: Object},
++      neonSpaceId_: {type: String},
+     };
+   }
+ 
+@@ -191,6 +205,10 @@ export class SettingsClearBrowsingDataDi
+   protected accessor moreBrowsingDataTypeOptionsList_:
+       BrowsingDataTypeOption[] = [];
+   private accessor syncStatus_: SyncStatus|undefined;
++  // Neon: the space to delete from, empty for all spaces; and whether the
++  // profile has spaces at all.
++  protected accessor neonSpaceId_: string = '';
++  private neonAvailable_: boolean = false;
+ 
+   private clearBrowsingDataBrowserProxy_: ClearBrowsingDataBrowserProxy =
+       ClearBrowsingDataBrowserProxyImpl.getInstance();
+@@ -274,6 +292,9 @@ export class SettingsClearBrowsingDataDi
+     const moreOptionsList: BrowsingDataTypeOption[] = [];
+ 
+     ALL_BROWSING_DATATYPES_LIST.forEach((datatype) => {
++      if (this.neonSpaceId_ && !NEON_PER_SPACE_DATATYPES.includes(datatype)) {
++        return;
++      }
+       // The Skills data type is only available when the Skills feature is
+       // enabled for this profile.
+       if (datatype === BrowsingDataType.SKILLS &&
+@@ -306,8 +327,20 @@ export class SettingsClearBrowsingDataDi
+    * @param prefName Browsing data type deletion preference.
+    * @param text The text with which to update the counter.
+    */
+-  private async updateCounterText_(prefName: string, text: string) {
++  private async updateCounterText_(
++      prefName: string, text: string, fromNeon: boolean = false) {
+     await PrefService.getInstance().whenInitialized();
++    if (this.neonAvailable_ &&
++        NEON_PER_SPACE_DATATYPES.some(t => getDataTypePrefName(t) === prefName) &&
++        !fromNeon) {
++      return;
++    }
++    if (![...this.expandedBrowsingDataTypeOptionsList_,
++          ...this.moreBrowsingDataTypeOptionsList_]
++             .some(option => option.prefKey === prefName)) {
++      // Neon: a type the space scope does not offer.
++      return;
++    }
+ 
+     // If the corresponding datatype is in the expanded options list, update the
+     // sub-label.
+@@ -372,6 +405,35 @@ export class SettingsClearBrowsingDataDi
+   protected onSelectedTimePeriodChange_() {
+     this.clearBrowsingDataBrowserProxy_.restartCounters(
+         this.$.timePicker.getSelectedTimePeriod());
++    this.updateNeonCounters_();
++  }
++
++  protected async onNeonScopeChange_(e: CustomEvent<NeonScopeChangeDetail>) {
++    this.neonAvailable_ = e.detail.available;
++    this.neonSpaceId_ = e.detail.spaceId;
++    await PrefService.getInstance().whenInitialized();
++    this.setUpDataTypeOptionLists_();
++    this.clearBrowsingDataBrowserProxy_.restartCounters(
++        this.$.timePicker.getSelectedTimePeriod());
++    this.updateNeonCounters_();
++  }
++
++  private async updateNeonCounters_() {
++    if (!this.neonAvailable_) {
++      return;
++    }
++    const spaceId = this.neonSpaceId_;
++    const period = this.$.timePicker.getSelectedTimePeriod();
++    const counts =
++        await NeonDataScopeBrowserProxyImpl.getInstance().count(spaceId, period);
++    if (!counts || spaceId !== this.neonSpaceId_ ||
++        period !== this.$.timePicker.getSelectedTimePeriod()) {
++      return;
++    }
++    await this.updateCounterText_(
++        getDataTypePrefName(BrowsingDataType.SITE_DATA), counts.cookies, true);
++    await this.updateCounterText_(
++        getDataTypePrefName(BrowsingDataType.CACHE), counts.cache, true);
+   }
+ 
+   protected onCancelClick_() {
+@@ -413,9 +475,16 @@ export class SettingsClearBrowsingDataDi
+             prefService.setPrefValue(checkbox.prefKey, checkbox.checked));
+     this.$.timePicker.sendPrefChange();
+ 
+-    const {showHistoryNotice} =
++    // Neon: one space's data, or everything; the per-container deletions of
++    // the latter finish after the dialog's own.
++    const neonProxy = NeonDataScopeBrowserProxyImpl.getInstance();
++    const {showHistoryNotice} = this.neonSpaceId_ ?
++        await neonProxy.clear(this.neonSpaceId_, dataTypes, timePeriod) :
+         await this.clearBrowsingDataBrowserProxy_.clearBrowsingData(
+             dataTypes, timePeriod);
++    if (this.neonAvailable_ && !this.neonSpaceId_) {
++      await neonProxy.waitForRemovals();
++    }
+     this.isDeletionInProgress_ = false;
+     this.showHistoryDeletionDialog_ = showHistoryNotice;
+     this.showDeletionConfirmationToast_(timePeriod);
+--- /dev/null
++++ b/chrome/browser/resources/settings/clear_browsing_data_dialog/neon_data_scope_browser_proxy.ts
+@@ -0,0 +1,75 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++/**
++ * @fileoverview Talks to chrome/browser/ui/neon/spaces/space_data_handler.cc:
++ * the space scope of the "Delete browsing data" dialog, and clearing a space.
++ */
++
++import {sendWithPromise} from 'chrome://resources/js/cr.js';
++
++import type {ClearBrowsingDataResult} from './clear_browsing_data_browser_proxy.js';
++
++export interface NeonDataScope {
++  // Whether the profile has spaces.
++  available: boolean;
++  // The space the settings tab is in. Absent outside every space.
++  space?: {id: string, name: string};
++}
++
++export interface NeonDataCounts {
++  // Counter texts, worded as the stock counters word them.
++  cookies: string;
++  cache: string;
++}
++
++export interface NeonDataScopeBrowserProxy {
++  getScope(): Promise<NeonDataScope>;
++  // Deletes the per-space types among |dataTypes| (deletion pref names) from
++  // space |spaceId|.
++  clear(spaceId: string, dataTypes: string[], timePeriod: number):
++      Promise<ClearBrowsingDataResult>;
++  // Resolves once every deletion queued so far is done.
++  waitForRemovals(): Promise<void>;
++  // Counts for space |spaceId|, or for all spaces and the global context
++  // when |spaceId| is empty.
++  count(spaceId: string, timePeriod: number): Promise<NeonDataCounts|null>;
++  // Clears all of space |spaceId|'s data and reloads its tabs.
++  clearSpace(spaceId: string): Promise<boolean>;
++}
++
++export class NeonDataScopeBrowserProxyImpl implements
++    NeonDataScopeBrowserProxy {
++  getScope() {
++    return sendWithPromise<NeonDataScope>('neonDataGetScope');
++  }
++
++  clear(spaceId: string, dataTypes: string[], timePeriod: number) {
++    return sendWithPromise<ClearBrowsingDataResult>(
++        'neonDataClear', spaceId, dataTypes, timePeriod);
++  }
++
++  waitForRemovals() {
++    return sendWithPromise<void>('neonDataWaitForRemovals');
++  }
++
++  count(spaceId: string, timePeriod: number) {
++    return sendWithPromise<NeonDataCounts|null>(
++        'neonDataCount', spaceId, timePeriod);
++  }
++
++  clearSpace(spaceId: string) {
++    return sendWithPromise<boolean>('neonDataClearSpace', spaceId);
++  }
++
++  static getInstance(): NeonDataScopeBrowserProxy {
++    return instance || (instance = new NeonDataScopeBrowserProxyImpl());
++  }
++
++  static setInstance(obj: NeonDataScopeBrowserProxy) {
++    instance = obj;
++  }
++}
++
++let instance: NeonDataScopeBrowserProxy|null = null;
+--- /dev/null
++++ b/chrome/browser/resources/settings/clear_browsing_data_dialog/neon_space_scope.css
+@@ -0,0 +1,19 @@
++/* Copyright 2026 The Neon Authors
++ * You can use, redistribute, and/or modify this source code under
++ * the terms of the GPL-3.0 license that can be found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #import=chrome://resources/cr_elements/cr_shared_vars.css.js
++ * #css_wrapper_metadata_end */
++
++/* Laid out like the time period chips below it. */
++.row {
++  align-items: center;
++  display: flex;
++  margin-bottom: 8px;
++}
++
++.scope-chip {
++  margin-inline-end: 5px;
++}
+--- /dev/null
++++ b/chrome/browser/resources/settings/clear_browsing_data_dialog/neon_space_scope.html.ts
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import {html} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import type {SettingsNeonSpaceScopeElement} from './neon_space_scope.js';
++
++export function getHtml(this: SettingsNeonSpaceScopeElement) {
++  // clang-format off
++  return html`<!--_html_template_start_-->
++${this.showChips_() ? html`
++  <div class="row" id="scope" role="radiogroup" aria-label="Delete from">
++    <cr-chip id="spaceChip" class="scope-chip" role="radio"
++        aria-checked="${this.spaceSelected_}"
++        ?selected="${this.spaceSelected_}" @click="${this.onSpaceClick_}">
++      <cr-icon icon="cr:check" ?hidden="${!this.spaceSelected_}"></cr-icon>
++      ${this.scope_!.space!.name}
++    </cr-chip>
++    <cr-chip id="allChip" class="scope-chip" role="radio"
++        aria-checked="${!this.spaceSelected_}"
++        ?selected="${!this.spaceSelected_}" @click="${this.onAllClick_}">
++      <cr-icon icon="cr:check" ?hidden="${this.spaceSelected_}"></cr-icon>
++      All spaces
++    </cr-chip>
++  </div>
++` : ''}
++<!--_html_template_end_-->`;
++  // clang-format on
++}
+--- /dev/null
++++ b/chrome/browser/resources/settings/clear_browsing_data_dialog/neon_space_scope.ts
+@@ -0,0 +1,106 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++/**
++ * @fileoverview 'settings-neon-space-scope' picks what the "Delete browsing
++ * data" dialog deletes from: the space the settings tab is in, or all spaces
++ * (which also covers the global context of extensions and the browser's own
++ * pages). It shows nothing without spaces, or outside every space, where only
++ * "all spaces" makes sense. Fires 'neon-scope-change' with
++ * {available, spaceId}, spaceId being empty for all spaces, once known and on
++ * every change.
++ */
++import 'chrome://resources/cr_elements/cr_chip/cr_chip.js';
++import 'chrome://resources/cr_elements/cr_icon/cr_icon.js';
++import 'chrome://resources/cr_elements/icons.html.js';
++
++import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import type {NeonDataScope} from './neon_data_scope_browser_proxy.js';
++import {NeonDataScopeBrowserProxyImpl} from './neon_data_scope_browser_proxy.js';
++import {getCss} from './neon_space_scope.css.js';
++import {getHtml} from './neon_space_scope.html.js';
++
++export interface NeonScopeChangeDetail {
++  available: boolean;
++  spaceId: string;
++}
++
++export class SettingsNeonSpaceScopeElement extends CrLitElement {
++  static get is() {
++    return 'settings-neon-space-scope';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      scope_: {type: Object},
++      spaceSelected_: {type: Boolean},
++    };
++  }
++
++  protected accessor scope_: NeonDataScope|null = null;
++  // Starts on the current space when there is one.
++  protected accessor spaceSelected_: boolean = true;
++
++  override firstUpdated() {
++    NeonDataScopeBrowserProxyImpl.getInstance().getScope().then(scope => {
++      this.scope_ = scope;
++      this.notify_();
++    });
++  }
++
++  // The space id the dialog deletes from, empty for all spaces.
++  getSpaceId(): string {
++    return this.scope_?.space && this.spaceSelected_ ? this.scope_.space.id :
++                                                       '';
++  }
++
++  protected showChips_(): boolean {
++    return !!this.scope_?.available && !!this.scope_.space;
++  }
++
++  protected onSpaceClick_() {
++    this.select_(true);
++  }
++
++  protected onAllClick_() {
++    this.select_(false);
++  }
++
++  private select_(space: boolean) {
++    if (this.spaceSelected_ === space) {
++      return;
++    }
++    this.spaceSelected_ = space;
++    this.notify_();
++  }
++
++  private notify_() {
++    this.fire('neon-scope-change', {
++      available: !!this.scope_?.available,
++      spaceId: this.getSpaceId(),
++    });
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'settings-neon-space-scope': SettingsNeonSpaceScopeElement;
++  }
++
++  interface HTMLElementEventMap {
++    'neon-scope-change': CustomEvent<NeonScopeChangeDetail>;
++  }
++}
++
++customElements.define(
++    SettingsNeonSpaceScopeElement.is, SettingsNeonSpaceScopeElement);
+--- a/chrome/browser/ui/neon/spaces/BUILD.gn
++++ b/chrome/browser/ui/neon/spaces/BUILD.gn
+@@ -94,3 +94,36 @@ source_set("settings") {
+     "//ui/gfx",
+   ]
+ }
++
++# Per-space data: clearing a space or one space's part of "Delete browsing
++# data", and the dialog's per-partition counters.
++source_set("data") {
++  sources = [
++    "space_data.cc",
++    "space_data.h",
++    "space_data_handler.cc",
++    "space_data_handler.h",
++  ]
++
++  public_deps = [
++    "//base",
++    "//content/public/browser",
++  ]
++
++  deps = [
++    "//chrome/browser/browsing_data:constants",
++    "//chrome/browser/neon:containers_api",
++    "//chrome/browser/neon/spaces",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/tabs:tab_strip",
++    "//components/browsing_data/content",
++    "//components/browsing_data/core",
++    "//components/strings:components_strings",
++    "//net",
++    "//services/network/public/mojom",
++    "//storage/browser",
++    "//ui/base",
++    "//url",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/space_data.cc
+@@ -0,0 +1,338 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/neon/spaces/space_data.h"
++
++#include <memory>
++#include <set>
++#include <utility>
++
++#include "base/byte_size.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/weak_ptr.h"
++#include "base/numerics/safe_conversions.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/neon/containers_api.h"
++#include "chrome/browser/neon/spaces/space.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "chrome/browser/neon/spaces/spaces_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/browsing_data/content/browsing_data_helper.h"
++#include "components/browsing_data/content/conditional_cache_counting_helper.h"
++#include "components/strings/grit/components_strings.h"
++#include "content/public/browser/browsing_data_filter_builder.h"
++#include "content/public/browser/browsing_data_remover.h"
++#include "content/public/browser/dom_storage_context.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/reload_type.h"
++#include "content/public/browser/storage_partition.h"
++#include "content/public/browser/storage_partition_config.h"
++#include "content/public/browser/storage_usage_info.h"
++#include "content/public/browser/web_contents.h"
++#include "net/cookies/canonical_cookie.h"
++#include "net/cookies/cookie_util.h"
++#include "services/network/public/mojom/cookie_manager.mojom.h"
++#include "storage/browser/quota/quota_manager_proxy.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/text/bytes_formatting.h"
++#include "url/gurl.h"
++
++namespace neon::spaces {
++
++namespace {
++
++// Reports the end of one removal task, then deletes itself.
++class RemovalObserver : public content::BrowsingDataRemover::Observer {
++ public:
++  RemovalObserver(content::BrowsingDataRemover* remover,
++                  base::OnceCallback<void(uint64_t)> done)
++      : done_(std::move(done)) {
++    observation_.Observe(remover);
++  }
++
++  void OnBrowsingDataRemoverDone(uint64_t failed_data_types) override {
++    observation_.Reset();
++    std::move(done_).Run(failed_data_types);
++    delete this;
++  }
++
++ private:
++  base::OnceCallback<void(uint64_t)> done_;
++  base::ScopedObservation<content::BrowsingDataRemover,
++                          content::BrowsingDataRemover::Observer>
++      observation_{this};
++};
++
++const Space* FindSpace(Profile* profile, const std::string& space_id) {
++  SpacesService* service = SpacesServiceFactory::GetForProfile(profile);
++  return service ? service->GetSpace(space_id) : nullptr;
++}
++
++// Counts sites and cache bytes over several partitions; owned by the
++// callbacks it hands out, so it outlives none of the partitions' answers.
++class Counter : public base::RefCounted<Counter> {
++ public:
++  Counter(base::Time begin, base::OnceCallback<void(const DataCount&)> done)
++      : begin_(begin), done_(std::move(done)) {}
++
++  void CountPartition(content::StoragePartition* partition) {
++    Add(1);
++    partition->GetCookieManagerForBrowserProcess()->GetAllCookies(
++        base::BindOnce(&Counter::OnCookies, this));
++    Add(1);
++    partition->GetQuotaManagerProxy()->GetBucketsModifiedBetween(
++        begin_, base::Time::Max(), base::BindOnce(&Counter::OnBuckets, this));
++    if (content::DOMStorageContext* dom_storage =
++            partition->GetDOMStorageContext()) {
++      Add(1);
++      dom_storage->GetLocalStorageUsage(
++          base::BindOnce(&Counter::OnLocalStorage, this));
++    }
++    Add(1);
++    browsing_data::ConditionalCacheCountingHelper::Count(
++        partition, begin_, base::Time::Max(),
++        base::BindOnce(&Counter::OnCache, this));
++  }
++
++  // Called once every partition has been asked.
++  void Start() { Done(); }
++
++ private:
++  friend class base::RefCounted<Counter>;
++  ~Counter() = default;
++
++  void Add(int tasks) { pending_ += tasks; }
++
++  void AddSite(const GURL& url) {
++    if (browsing_data::HasWebScheme(url)) {
++      hosts_.insert(url.GetHost());
++    }
++  }
++
++  void OnCookies(const net::CookieList& cookies) {
++    for (const net::CanonicalCookie& cookie : cookies) {
++      if (cookie.CreationDate() >= begin_) {
++        AddSite(net::cookie_util::CookieOriginToURL(cookie.Domain(),
++                                                    cookie.SecureAttribute()));
++      }
++    }
++    Done();
++  }
++
++  void OnBuckets(const std::set<storage::BucketLocator>& buckets) {
++    for (const storage::BucketLocator& bucket : buckets) {
++      AddSite(bucket.storage_key.origin().GetURL());
++    }
++    Done();
++  }
++
++  void OnLocalStorage(const std::vector<content::StorageUsageInfo>& infos) {
++    for (const content::StorageUsageInfo& info : infos) {
++      if (info.last_modified >= begin_) {
++        AddSite(info.storage_key.origin().GetURL());
++      }
++    }
++    Done();
++  }
++
++  void OnCache(bool is_upper_limit, int64_t bytes) {
++    // A negative size is a net error: count nothing.
++    if (bytes > 0) {
++      count_.cache_bytes += bytes;
++    }
++    count_.cache_is_upper_limit |= is_upper_limit;
++    Done();
++  }
++
++  // Each answer, and Start(), ends one pending task.
++  void Done() {
++    if (--pending_ > 0) {
++      return;
++    }
++    count_.sites = base::checked_cast<int>(hosts_.size());
++    std::move(done_).Run(count_);
++  }
++
++  const base::Time begin_;
++  base::OnceCallback<void(const DataCount&)> done_;
++  // Starts at 1 for Start().
++  int pending_ = 1;
++  std::set<std::string> hosts_;
++  DataCount count_;
++};
++
++}  // namespace
++
++uint64_t GetPerSpaceDataTypes() {
++  return content::BrowsingDataRemover::DATA_TYPE_ON_STORAGE_PARTITION;
++}
++
++std::optional<SpaceRef> GetSpaceOfContainer(Profile* profile,
++                                            const std::string& container_id) {
++  SpacesService* service = SpacesServiceFactory::GetForProfile(profile);
++  if (!service || container_id.empty()) {
++    return std::nullopt;
++  }
++  const Space* space = service->GetSpaceForContainer(container_id);
++  if (!space) {
++    return std::nullopt;
++  }
++  return SpaceRef{space->id, space->name, space->container_id};
++}
++
++bool RemoveSpaceData(Profile* profile,
++                     const std::string& space_id,
++                     base::Time begin,
++                     base::Time end,
++                     uint64_t remove_mask,
++                     uint64_t origin_type_mask,
++                     base::OnceCallback<void(uint64_t)> done) {
++  const Space* space = FindSpace(profile, space_id);
++  std::optional<content::StoragePartitionConfig> config =
++      space ? containers_api::GetStoragePartitionConfig(profile,
++                                                        space->container_id)
++            : std::nullopt;
++  if (!config || space->container_id.empty()) {
++    return false;
++  }
++  // Whatever is not on the partition belongs to every space.
++  remove_mask &= GetPerSpaceDataTypes();
++  content::BrowsingDataRemover* remover = profile->GetBrowsingDataRemover();
++  if (!remove_mask) {
++    std::move(done).Run(0);
++    return true;
++  }
++  auto filter = content::BrowsingDataFilterBuilder::Create(
++      content::BrowsingDataFilterBuilder::Mode::kPreserve);
++  filter->SetStoragePartitionConfig(*config);
++  remover->RemoveWithFilterAndReply(
++      begin, end, remove_mask, origin_type_mask, std::move(filter),
++      new RemovalObserver(remover, std::move(done)));
++  return true;
++}
++
++void WaitForQueuedRemovals(Profile* profile, base::OnceClosure done) {
++  // Tasks run one at a time in the order they were queued, so a task that
++  // removes nothing, queued now, finishes after all of them.
++  content::BrowsingDataRemover* remover = profile->GetBrowsingDataRemover();
++  remover->RemoveAndReply(
++      base::Time(), base::Time::Max(), /*remove_mask=*/0,
++      /*origin_type_mask=*/0,
++      new RemovalObserver(remover,
++                          base::IgnoreArgs<uint64_t>(std::move(done))));
++}
++
++std::vector<std::string> GetAllDataContainerIds(Profile* profile) {
++  std::set<std::string> ids;
++  for (const std::string& id : containers_api::ListUsedContainerIds(profile)) {
++    ids.insert(id);
++  }
++  for (const containers_api::ContainerInfo& info :
++       containers_api::ListContainers(profile)) {
++    ids.insert(info.id);
++  }
++  std::vector<std::string> out = {std::string()};
++  out.insert(out.end(), ids.begin(), ids.end());
++  return out;
++}
++
++void CountData(Profile* profile,
++               const std::vector<std::string>& container_ids,
++               base::Time begin,
++               base::OnceCallback<void(const DataCount&)> done) {
++  auto counter = base::MakeRefCounted<Counter>(begin, std::move(done));
++  for (const std::string& id : container_ids) {
++    std::optional<content::StoragePartitionConfig> config =
++        containers_api::GetStoragePartitionConfig(profile, id);
++    if (!config) {
++      continue;
++    }
++    // Loads the partition if needed: a space's data is on disk even when
++    // none of its pages has been opened yet this session.
++    if (content::StoragePartition* partition =
++            profile->GetStoragePartition(*config)) {
++      counter->CountPartition(partition);
++    }
++  }
++  counter->Start();
++}
++
++std::pair<std::u16string, std::u16string> GetCounterTexts(
++    const DataCount& count) {
++  std::u16string cookies = l10n_util::GetPluralStringFUTF16(
++      IDS_DEL_COOKIES_COUNTER_ADVANCED, count.sites);
++  // As the stock cache counter on desktop: "Less than 1 MB" below a megabyte.
++  std::u16string cache;
++  const base::ByteSize bytes(base::checked_cast<uint64_t>(count.cache_bytes));
++  if (bytes >= base::MiB(1)) {
++    std::u16string size =
++        ui::GetByteDisplayUnits(bytes) >= ui::DataUnits::kMebibyte
++            ? ui::FormatBytes(bytes)
++            : ui::FormatBytesWithUnits(bytes, ui::DataUnits::kMebibyte, true);
++    cache = count.cache_is_upper_limit
++                ? l10n_util::GetStringFUTF16(
++                      IDS_DEL_CACHE_COUNTER_UPPER_ESTIMATE, size)
++                : size;
++  } else {
++    cache = l10n_util::GetStringUTF16(IDS_DEL_CACHE_COUNTER_ALMOST_EMPTY);
++  }
++  return {cookies, cache};
++}
++
++bool ClearSpaceData(Profile* profile,
++                    const std::string& space_id,
++                    base::OnceClosure done) {
++  const Space* space = FindSpace(profile, space_id);
++  std::optional<content::StoragePartitionConfig> config =
++      space ? containers_api::GetStoragePartitionConfig(profile,
++                                                        space->container_id)
++            : std::nullopt;
++  if (!config || space->container_id.empty()) {
++    return false;
++  }
++  // ClearContainerStorage() only clears a loaded partition; the space keeps
++  // its data on disk otherwise, so load it.
++  profile->GetStoragePartition(*config);
++  containers_api::ClearContainerStorage(
++      profile, space->container_id,
++      base::BindOnce(
++          [](base::WeakPtr<Profile> profile, std::string container_id,
++             base::OnceClosure done) {
++            if (profile) {
++              // Reload the space's pages, so none keeps running on data that
++              // is gone. Tabs that were never loaded stay as they are.
++              GlobalBrowserCollection::GetInstance()->ForEach(
++                  [&](BrowserWindowInterface* browser) {
++                    TabStripModel* model = browser->GetTabStripModel();
++                    if (browser->GetProfile() != profile.get() || !model) {
++                      return true;
++                    }
++                    for (int i = 0; i < model->count(); ++i) {
++                      content::WebContents* contents =
++                          model->GetWebContentsAt(i);
++                      if (containers_api::GetTabContainerId(contents) ==
++                              container_id &&
++                          !contents->WasDiscarded() &&
++                          !contents->GetController().NeedsReload() &&
++                          contents->GetController().GetLastCommittedEntry()) {
++                        contents->GetController().Reload(
++                            content::ReloadType::NORMAL,
++                            /*check_for_repost=*/false);
++                      }
++                    }
++                    return true;
++                  });
++            }
++            std::move(done).Run();
++          },
++          profile->GetWeakPtr(), space->container_id, std::move(done)));
++  return true;
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/space_data.h
+@@ -0,0 +1,92 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NEON_SPACES_SPACE_DATA_H_
++#define CHROME_BROWSER_UI_NEON_SPACES_SPACE_DATA_H_
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback_forward.h"
++#include "base/time/time.h"
++
++class Profile;
++
++// Clearing and counting the data each space keeps apart from the others.
++//
++// A space's own data is everything on its container's storage partition:
++// cookies, site storage (local storage, IndexedDB, Cache Storage, service
++// workers...) and the HTTP cache. History, downloads, passwords, autofill and
++// site settings belong to the profile and are shared by every space.
++namespace neon::spaces {
++
++// The data types of a BrowsingDataRemover mask that a space keeps apart:
++// content::BrowsingDataRemover::DATA_TYPE_ON_STORAGE_PARTITION.
++uint64_t GetPerSpaceDataTypes();
++
++// The space a WebUI or web page belongs to: the space of its tab's container.
++// std::nullopt outside every space (the global context) or when there are no
++// spaces.
++struct SpaceRef {
++  std::string id;
++  std::string name;
++  std::string container_id;
++};
++std::optional<SpaceRef> GetSpaceOfContainer(Profile* profile,
++                                            const std::string& container_id);
++
++// Removes the data types of |remove_mask| that live on a storage partition
++// from the container of space |space_id|, for the time range [begin, end).
++// Runs |done| with the data types that failed. Returns false, without running
++// |done|, if there is no such space.
++bool RemoveSpaceData(Profile* profile,
++                     const std::string& space_id,
++                     base::Time begin,
++                     base::Time end,
++                     uint64_t remove_mask,
++                     uint64_t origin_type_mask,
++                     base::OnceCallback<void(uint64_t)> done);
++
++// Runs |done| once every removal queued on |profile|'s BrowsingDataRemover so
++// far has finished, including those that a removal without a storage
++// partition queues for each container (see ChromeBrowsingDataRemoverDelegate).
++void WaitForQueuedRemovals(Profile* profile, base::OnceClosure done);
++
++// Every storage partition "all spaces" covers, as container ids: the global
++// context (the empty id) and every container in use or listed.
++std::vector<std::string> GetAllDataContainerIds(Profile* profile);
++
++// What clearing would remove from the partitions of |container_ids|, for the
++// time range starting at |begin|.
++struct DataCount {
++  // Sites with cookies or site storage set or changed since |begin|.
++  int sites = 0;
++  // Bytes of HTTP cache entries used since |begin|.
++  int64_t cache_bytes = 0;
++  // Whether |cache_bytes| is only an upper bound (time-limited counts).
++  bool cache_is_upper_limit = false;
++};
++void CountData(Profile* profile,
++               const std::vector<std::string>& container_ids,
++               base::Time begin,
++               base::OnceCallback<void(const DataCount&)> done);
++
++// The counter texts of the clear browsing data dialog for |count|, as the
++// stock counters word them: {cookies and site data, cached files}.
++std::pair<std::u16string, std::u16string> GetCounterTexts(
++    const DataCount& count);
++
++// Clears all the cookies, site storage and cache of space |space_id| (all
++// time), keeping the space and its tabs, then reloads the space's loaded tabs
++// in every window. Runs |done| when finished. Returns false, without running
++// |done|, if there is no such space.
++bool ClearSpaceData(Profile* profile,
++                    const std::string& space_id,
++                    base::OnceClosure done);
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_NEON_SPACES_SPACE_DATA_H_
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/space_data_handler.cc
+@@ -0,0 +1,199 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/neon/spaces/space_data_handler.h"
++
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/browsing_data/chrome_browsing_data_remover_constants.h"
++#include "chrome/browser/neon/containers_api.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "chrome/browser/neon/spaces/spaces_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/neon/spaces/space_data.h"
++#include "components/browsing_data/core/browsing_data_utils.h"
++#include "content/public/browser/browsing_data_remover.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_ui.h"
++
++namespace neon::spaces {
++
++namespace {
++
++std::optional<browsing_data::TimePeriod> ToTimePeriod(const base::Value& v) {
++  constexpr int kLast =
++      static_cast<int>(browsing_data::TimePeriod::TIME_PERIOD_LAST);
++  if (!v.is_int() || v.GetInt() < 0 || v.GetInt() > kLast) {
++    return std::nullopt;
++  }
++  return static_cast<browsing_data::TimePeriod>(v.GetInt());
++}
++
++}  // namespace
++
++SpaceDataHandler::SpaceDataHandler(Profile* profile) : profile_(profile) {}
++
++SpaceDataHandler::~SpaceDataHandler() = default;
++
++void SpaceDataHandler::RegisterMessages() {
++  web_ui()->RegisterMessageCallback(
++      "neonDataGetScope", base::BindRepeating(&SpaceDataHandler::HandleGetScope,
++                                              base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "neonDataClear", base::BindRepeating(&SpaceDataHandler::HandleClear,
++                                           base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "neonDataWaitForRemovals",
++      base::BindRepeating(&SpaceDataHandler::HandleWaitForRemovals,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "neonDataCount", base::BindRepeating(&SpaceDataHandler::HandleCount,
++                                           base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "neonDataClearSpace",
++      base::BindRepeating(&SpaceDataHandler::HandleClearSpace,
++                          base::Unretained(this)));
++}
++
++void SpaceDataHandler::OnJavascriptDisallowed() {
++  weak_factory_.InvalidateWeakPtrs();
++}
++
++void SpaceDataHandler::Resolve(const std::string& callback_id,
++                               base::Value value) {
++  if (IsJavascriptAllowed()) {
++    ResolveJavascriptCallback(base::Value(callback_id), value);
++  }
++}
++
++void SpaceDataHandler::HandleGetScope(const base::ListValue& args) {
++  // [callback id]
++  AllowJavascript();
++  base::DictValue scope;
++  SpacesService* service = SpacesServiceFactory::GetForProfile(profile_);
++  scope.Set("available",
++            service != nullptr && containers_api::IsAvailable(profile_));
++  // The settings page opens as a tab of the visible space, in its container.
++  std::optional<SpaceRef> space = GetSpaceOfContainer(
++      profile_,
++      containers_api::GetTabContainerId(web_ui()->GetWebContents()));
++  if (space) {
++    scope.Set("space",
++              base::DictValue().Set("id", space->id).Set("name", space->name));
++  }
++  ResolveJavascriptCallback(args[0], scope);
++}
++
++void SpaceDataHandler::HandleClear(const base::ListValue& args) {
++  // [callback id, space id, list of deletion pref names, time period]
++  AllowJavascript();
++  const std::string callback_id = args[0].GetString();
++  std::optional<browsing_data::TimePeriod> period;
++  if (args.size() == 4 && args[1].is_string() && args[2].is_list()) {
++    period = ToTimePeriod(args[3]);
++  }
++  base::DictValue result;
++  result.Set("showHistoryNotice", false);
++  result.Set("showPasswordsNotice", false);
++  if (!period) {
++    ResolveJavascriptCallback(args[0], result);
++    return;
++  }
++  uint64_t remove_mask = 0;
++  uint64_t origin_mask = 0;
++  for (const base::Value& pref : args[2].GetList()) {
++    if (!pref.is_string()) {
++      continue;
++    }
++    std::optional<browsing_data::BrowsingDataType> type =
++        browsing_data::GetDataTypeFromDeletionPreference(pref.GetString());
++    if (type == browsing_data::BrowsingDataType::SITE_DATA) {
++      remove_mask |= chrome_browsing_data_remover::DATA_TYPE_SITE_DATA;
++      origin_mask |= content::BrowsingDataRemover::ORIGIN_TYPE_UNPROTECTED_WEB;
++    } else if (type == browsing_data::BrowsingDataType::CACHE) {
++      remove_mask |= content::BrowsingDataRemover::DATA_TYPE_CACHE;
++    }
++    // Every other type belongs to the profile, shared by all spaces; the
++    // dialog does not offer them for one space.
++  }
++  const bool started = RemoveSpaceData(
++      profile_, args[1].GetString(),
++      browsing_data::CalculateBeginDeleteTime(*period),
++      browsing_data::CalculateEndDeleteTime(*period), remove_mask, origin_mask,
++      base::BindOnce(
++          [](base::WeakPtr<SpaceDataHandler> self, std::string callback_id,
++             base::DictValue result, uint64_t failed) {
++            if (self) {
++              self->Resolve(callback_id, base::Value(std::move(result)));
++            }
++          },
++          weak_factory_.GetWeakPtr(), callback_id, result.Clone()));
++  if (!started) {
++    ResolveJavascriptCallback(args[0], result);
++  }
++}
++
++void SpaceDataHandler::HandleWaitForRemovals(const base::ListValue& args) {
++  // [callback id]
++  AllowJavascript();
++  WaitForQueuedRemovals(
++      profile_,
++      base::BindOnce(&SpaceDataHandler::Resolve, weak_factory_.GetWeakPtr(),
++                     args[0].GetString(), base::Value()));
++}
++
++void SpaceDataHandler::HandleCount(const base::ListValue& args) {
++  // [callback id, space id or "" for all spaces, time period]
++  AllowJavascript();
++  std::optional<browsing_data::TimePeriod> period;
++  if (args.size() == 3 && args[1].is_string()) {
++    period = ToTimePeriod(args[2]);
++  }
++  if (!period) {
++    ResolveJavascriptCallback(args[0], base::Value());
++    return;
++  }
++  std::vector<std::string> container_ids;
++  if (args[1].GetString().empty()) {
++    container_ids = GetAllDataContainerIds(profile_);
++  } else if (SpacesService* service =
++                 SpacesServiceFactory::GetForProfile(profile_)) {
++    if (const Space* space = service->GetSpace(args[1].GetString())) {
++      container_ids.push_back(space->container_id);
++    }
++  }
++  CountData(profile_, container_ids,
++            browsing_data::CalculateBeginDeleteTime(*period),
++            base::BindOnce(&SpaceDataHandler::OnCounted,
++                           weak_factory_.GetWeakPtr(), args[0].GetString()));
++}
++
++void SpaceDataHandler::OnCounted(const std::string& callback_id,
++                                 const DataCount& count) {
++  auto [cookies, cache] = GetCounterTexts(count);
++  Resolve(callback_id, base::Value(base::DictValue()
++                                       .Set("cookies", cookies)
++                                       .Set("cache", cache)
++                                       .Set("sites", count.sites)));
++}
++
++void SpaceDataHandler::HandleClearSpace(const base::ListValue& args) {
++  // [callback id, space id]
++  AllowJavascript();
++  const std::string callback_id = args[0].GetString();
++  const bool started =
++      args.size() == 2 && args[1].is_string() &&
++      ClearSpaceData(profile_, args[1].GetString(),
++                     base::BindOnce(&SpaceDataHandler::Resolve,
++                                    weak_factory_.GetWeakPtr(), callback_id,
++                                    base::Value(true)));
++  if (!started) {
++    ResolveJavascriptCallback(args[0], base::Value(false));
++  }
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/space_data_handler.h
+@@ -0,0 +1,58 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NEON_SPACES_SPACE_DATA_HANDLER_H_
++#define CHROME_BROWSER_UI_NEON_SPACES_SPACE_DATA_HANDLER_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/values.h"
++#include "content/public/browser/web_ui_message_handler.h"
++
++class Profile;
++
++namespace neon::spaces {
++
++struct DataCount;
++
++// Backs the space scope of chrome://settings' "Delete browsing data" dialog
++// and the "Clear data" action of the Spaces page:
++// - neonDataGetScope: the space the settings tab is in, if any;
++// - neonDataClear: deletes the per-space data types of the dialog from one
++//   space, for a time period;
++// - neonDataWaitForRemovals: resolves once every queued removal is done (the
++//   per-container removals of an "all spaces" deletion finish after the
++//   dialog's own);
++// - neonDataCount: the dialog's two per-partition counters (cookies and site
++//   data, cached files) for one space or for all spaces and the global
++//   context; the stock counters only read the default partition;
++// - neonDataClearSpace: clears all of a space's data and reloads its tabs.
++class SpaceDataHandler : public content::WebUIMessageHandler {
++ public:
++  explicit SpaceDataHandler(Profile* profile);
++  SpaceDataHandler(const SpaceDataHandler&) = delete;
++  SpaceDataHandler& operator=(const SpaceDataHandler&) = delete;
++  ~SpaceDataHandler() override;
++
++  // content::WebUIMessageHandler:
++  void RegisterMessages() override;
++  void OnJavascriptDisallowed() override;
++
++ private:
++  void HandleGetScope(const base::ListValue& args);
++  void HandleClear(const base::ListValue& args);
++  void HandleWaitForRemovals(const base::ListValue& args);
++  void HandleCount(const base::ListValue& args);
++  void HandleClearSpace(const base::ListValue& args);
++
++  void Resolve(const std::string& callback_id, base::Value value);
++  void OnCounted(const std::string& callback_id, const DataCount& count);
++
++  raw_ptr<Profile> profile_;
++  base::WeakPtrFactory<SpaceDataHandler> weak_factory_{this};
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_NEON_SPACES_SPACE_DATA_HANDLER_H_
+--- a/chrome/browser/ui/views/neon/spaces/BUILD.gn
++++ b/chrome/browser/ui/views/neon/spaces/BUILD.gn
+@@ -7,6 +7,8 @@ source_set("spaces") {
+   sources = [
+     "reopen_in_space_menu_model.cc",
+     "reopen_in_space_menu_model.h",
++    "space_clear_confirmation.cc",
++    "space_clear_confirmation.h",
+     "space_edit_bubble.cc",
+     "space_edit_bubble.h",
+     "space_icon_view.cc",
+@@ -43,6 +45,7 @@ source_set("spaces") {
+   deps = [
+     "//base:i18n",
+     "//chrome/app/vector_icons",
++    "//chrome/browser/ui/neon/spaces:data",
+     "//chrome/browser/ui/neon/spaces:icons",
+     "//components/prefs",
+     "//cc/paint",
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/space_clear_confirmation.cc
+@@ -0,0 +1,66 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/neon/spaces/space_clear_confirmation.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/strings/strcat.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/neon/spaces/space.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "chrome/browser/neon/spaces/spaces_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/neon/spaces/space_data.h"
++#include "ui/base/models/dialog_model.h"
++#include "ui/base/mojom/dialog_button.mojom.h"
++#include "ui/views/bubble/bubble_border.h"
++#include "ui/views/bubble/bubble_dialog_delegate_view.h"
++#include "ui/views/bubble/bubble_dialog_model_host.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
++
++namespace neon::spaces {
++
++void ShowClearSpaceDataConfirmation(views::View* anchor,
++                                    Profile* profile,
++                                    const std::string& space_id) {
++  SpacesService* service = SpacesServiceFactory::GetForProfile(profile);
++  const Space* space = service ? service->GetSpace(space_id) : nullptr;
++  if (!anchor || !anchor->GetWidget() || !space) {
++    return;
++  }
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder()
++          .SetTitle(base::StrCat({u"Clear the data of “",
++                                  base::UTF8ToUTF16(space->name), u"”?"}))
++          .AddParagraph(ui::DialogModelLabel(
++              u"Deletes this space's cookies, site data and cached files, so "
++              u"you will be signed out of its sites. The space and its tabs "
++              u"stay, and open tabs reload. History is shared by all spaces "
++              u"and is kept."))
++          .AddOkButton(
++              base::BindOnce(
++                  [](base::WeakPtr<Profile> profile, std::string space_id) {
++                    if (profile) {
++                      ClearSpaceData(profile.get(), space_id,
++                                     base::DoNothing());
++                    }
++                  },
++                  profile->GetWeakPtr(), space_id),
++              ui::DialogModel::Button::Params().SetLabel(u"Clear data"))
++          .AddCancelButton(base::DoNothing())
++          .OverrideDefaultButton(ui::mojom::DialogButton::kCancel)
++          .Build();
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), anchor, views::BubbleBorder::LEFT_BOTTOM);
++  views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
++      ->Show();
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/space_clear_confirmation.h
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_CLEAR_CONFIRMATION_H_
++#define CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_CLEAR_CONFIRMATION_H_
++
++#include <string>
++
++class Profile;
++
++namespace views {
++class View;
++}  // namespace views
++
++namespace neon::spaces {
++
++// Asks whether to clear the data of space |space_id| (its cookies, site
++// storage and cache), in a bubble anchored to |anchor|. Clears it and reloads
++// the space's tabs on confirmation (see ClearSpaceData()); the space and its
++// tabs stay.
++void ShowClearSpaceDataConfirmation(views::View* anchor,
++                                    Profile* profile,
++                                    const std::string& space_id);
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_CLEAR_CONFIRMATION_H_
+--- a/chrome/browser/ui/views/neon/spaces/space_switcher_row.cc
++++ b/chrome/browser/ui/views/neon/spaces/space_switcher_row.cc
+@@ -21,6 +21,7 @@
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/neon/spaces/space_management.h"
+ #include "chrome/browser/ui/neon/spaces/spaces_window_controller.h"
++#include "chrome/browser/ui/views/neon/spaces/space_clear_confirmation.h"
+ #include "chrome/browser/ui/views/neon/spaces/space_edit_bubble.h"
+ #include "chrome/browser/ui/views/neon/spaces/space_icon_view.h"
+ #include "components/prefs/pref_service.h"
+@@ -67,6 +68,7 @@ constexpr int kEdgePadding = 4;
+ constexpr int kEditCommand = 1000;
+ constexpr int kDeleteCommand = 1001;
+ constexpr int kNewSpaceCommand = 1002;
++constexpr int kClearDataCommand = 1003;
+ 
+ void InstallInkDrop(views::Button* button) {
+   views::InstallRoundRectHighlightPathGenerator(button, gfx::Insets(),
+@@ -502,6 +504,7 @@ void SpaceSwitcherRow::ShowContextMenuFo
+   menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
+   if (!menu_space_id_.empty()) {
+     menu_model_->AddItem(kEditCommand, u"Edit space…");
++    menu_model_->AddItem(kClearDataCommand, u"Clear this space's data…");
+     menu_model_->AddItem(kDeleteCommand, u"Delete space…");
+     menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
+   }
+@@ -531,6 +534,12 @@ void SpaceSwitcherRow::ExecuteCommand(in
+           base::BindOnce(&SpaceSwitcherRow::ConfirmDeleteSpace,
+                          weak_factory_.GetWeakPtr(), space_id));
+       return;
++    case kClearDataCommand:
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE,
++          base::BindOnce(&SpaceSwitcherRow::ConfirmClearSpaceData,
++                         weak_factory_.GetWeakPtr(), space_id));
++      return;
+     case kNewSpaceCommand:
+       base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+           FROM_HERE, base::BindOnce(&SpaceSwitcherRow::CreateSpace,
+@@ -596,6 +605,15 @@ void SpaceSwitcherRow::ConfirmDeleteSpac
+   ShowDeleteSpaceConfirmation(anchor, GetProfile(), space_id);
+ }
+ 
++void SpaceSwitcherRow::ConfirmClearSpaceData(const std::string& space_id) {
++  views::View* anchor = GetButton(space_id);
++  if (!anchor || !anchor->GetVisible()) {
++    anchor = IsCompact() && compact_button_ ? compact_button_.get()
++                                            : static_cast<views::View*>(this);
++  }
++  ShowClearSpaceDataConfirmation(anchor, GetProfile(), space_id);
++}
++
+ bool SpaceSwitcherRow::CanReorder(const SpaceButton* button) const {
+   // A lone icon has nowhere to go.
+   return pager_->controller() && !IsCompact() && buttons_.size() > 1 &&
+--- a/chrome/browser/ui/views/neon/spaces/space_switcher_row.h
++++ b/chrome/browser/ui/views/neon/spaces/space_switcher_row.h
+@@ -101,6 +101,7 @@ class SpaceSwitcherRow : public views::V
+   void CreateSpace();
+   void EditSpace(const std::string& space_id);
+   void ConfirmDeleteSpace(const std::string& space_id);
++  void ConfirmClearSpaceData(const std::string& space_id);
+   // The space the row shows as current at the pager's position.
+   std::string GetShownSpaceId() const;
+   // The highlight's bounds at the pager's position, or nullopt when hidden.
+--- a/chrome/browser/ui/webui/settings/BUILD.gn
++++ b/chrome/browser/ui/webui/settings/BUILD.gn
+@@ -212,6 +212,7 @@ source_set("impl") {
+   deps = [
+     ":settings",
+     "//chrome/app:command_ids",
++    "//chrome/browser/ui/neon/spaces:data",
+     "//chrome/browser/ui/neon/spaces:settings",
+     "//chrome/app:generated_resources",
+     "//chrome/app/vector_icons",
+--- a/chrome/browser/ui/webui/settings/settings_ui.cc
++++ b/chrome/browser/ui/webui/settings/settings_ui.cc
+@@ -65,6 +65,7 @@
+ #include "chrome/browser/ui/webui/sanitized_image/sanitized_image_source.h"
+ #include "chrome/browser/ui/webui/settings/about_handler.h"
+ #include "chrome/browser/ui/webui/settings/accessibility_main_handler.h"
++#include "chrome/browser/ui/neon/spaces/space_data_handler.h"
+ #include "chrome/browser/ui/neon/spaces/spaces_settings_handler.h"
+ #include "chrome/browser/ui/webui/settings/appearance_handler.h"
+ #include "chrome/browser/ui/webui/settings/brave_import_data_handler.h"
+@@ -279,6 +280,8 @@ SettingsUI::SettingsUI(content::WebUI* w
+   AddSettingsPageUIHandler(std::make_unique<AppearanceHandler>(web_ui));
+   web_ui->AddMessageHandler(
+       std::make_unique<neon::spaces::SpacesSettingsHandler>(profile));
++  web_ui->AddMessageHandler(
++      std::make_unique<neon::spaces::SpaceDataHandler>(profile));
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+   AddSettingsPageUIHandler(std::make_unique<LanguagesHandler>(profile));

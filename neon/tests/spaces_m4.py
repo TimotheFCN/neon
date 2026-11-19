@@ -45,8 +45,8 @@ The one phase, main, in order:
    tab page; typing names it; an icon and a colour are picked. A typed URL in that new tab page
    loads in the new container.
 2. "New space" in the row's context menu does the same; an emoji is typed as its icon.
-3. Every space's menu has Edit, Delete and New space, the first space's too (M5: there is no
-   default space); Edit on another space renames it.
+3. Every space's menu has Edit, Clear data (M6), Delete and New space, the first space's too
+   (M5: there is no default space); Edit on another space renames it.
 4. Dragging an icon reorders both rows, the first space's icon too; Ctrl+Alt+Up/Down follow the
    new order.
 5. Settings > Appearance > Spaces lists the spaces; renaming, recolouring, moving, picking an
@@ -905,14 +905,14 @@ def phase_main(ctx):
     bounds, _ = button(b, D)
     click(ctx, center(bounds), button=3, settle_time=1)
     items = menu_items(b)
-    check(items and [e for _, e in items[-1]] == [True, True, True],
-          f'the first space\'s menu has Edit, an enabled Delete and New space {items}')
+    check(items and [e for _, e in items[-1]] == [True, True, True, True],
+          f'the first space\'s menu has Edit, Clear data, an enabled Delete and New space {items}')
     key(ctx, 'Escape')
     bounds, _ = button(b, A)
     click(ctx, center(bounds), button=3, settle_time=1)
     items = menu_items(b)
-    check(items and [e for _, e in items[-1]] == [True, True, True],
-          f'another space\'s menu has Edit, Delete and New space {items}')
+    check(items and [e for _, e in items[-1]] == [True, True, True, True],
+          f'another space\'s menu has Edit, Clear data, Delete and New space {items}')
     save_shot(ctx, 'row-context-menu.png', crop=(0, SCREEN[1] - 260, 400, SCREEN[1]))
     if items:
         click(ctx, center(items[-1][0][0]), settle_time=1.2)   # Edit
@@ -1151,7 +1151,7 @@ def phase_main(ctx):
     click(ctx, center(button(b, P, window=1)[0]), button=3, settle_time=1)
     items = menu_items(b)
     if items:
-        click(ctx, center(items[-1][1][0]), settle_time=1.2)   # Delete
+        click(ctx, center(items[-1][2][0]), settle_time=1.2)   # Delete
     msg = labels(b, lambda t: 'open tab' in t)
     check(any('3 open tabs will close' in m for m in msg), f'the confirmation counts Play\'s 3 tabs '
           f'in all windows ({msg})')
@@ -1203,7 +1203,7 @@ def phase_main(ctx):
         click(ctx, center(bounds), button=3, settle_time=1)
         items = menu_items(b)
         if items:
-            click(ctx, center(items[-1][1][0]), settle_time=1.2)
+            click(ctx, center(items[-1][2][0]), settle_time=1.2)   # Delete
         msg = labels(b, lambda t: 'open tab' in t or 'No tabs' in t)
         check(any(tabs_text in m for m in msg), f'{label}: the confirmation says "{tabs_text}" '
               f'({msg})')

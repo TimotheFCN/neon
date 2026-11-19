@@ -409,3 +409,7 @@ neon/extensions/global-window.patch
 neon/containers/blank-tabs.patch
 neon/spaces/all-containers.patch
 neon/extensions/tab-target.patch
+neon/containers/clear-browsing-data.patch
+neon/containers/devtools.patch
+neon/spaces/data-scope.patch
+neon/spaces/site-data-page.patch

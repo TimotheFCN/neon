@@ -1,0 +1,217 @@
+Neon containers port (M6): clearing browsing data also clears the containers.
+
+A removal that names no storage partition (the "Delete browsing data" dialog
+for all spaces, clear on exit, an extension's browsingData call) clears the
+data types that live on a storage partition in every used container too, with
+the same time range and origin filter. Ported from brave-core v1.100.58
+(bd6d26d1): BraveBrowsingDataRemoverDelegate::RemoveEmbedderData
+(browser/browsing_data/brave_browsing_data_remover_delegate.cc) becomes a hunk
+in ChromeBrowsingDataRemoverDelegate::RemoveEmbedderData, and
+browser/containers/used_container_storage_partitions.{h,cc} is copied as is.
+
+The per-container removals are queued behind the removal that started them.
+Neon adds one thing Brave lacks: the clear-on-exit observer waits for them
+(an empty removal queued after them), or the browser exits before they run.
+
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at https://mozilla.org/MPL/2.0/.
+
+Copyright (c) 2020-2026, The Brave Authors
+Copyright (c) 2026, The Neon Authors
+
+Alternatively, the contents of this file may be used under the terms
+of the GNU General Public License Version 3, as described below:
+
+Copyright (C) 2026 The Neon Authors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+--- a/chrome/browser/browsing_data/BUILD.gn
++++ b/chrome/browser/browsing_data/BUILD.gn
+@@ -105,6 +105,7 @@ source_set("impl") {
+     "//chrome/browser/autofill",
+     "//chrome/browser/bookmarks",
+     "//chrome/browser/commerce",
++    "//chrome/browser/containers",
+     "//chrome/browser/content_settings:content_settings_factory",
+     "//chrome/browser/crash_upload_list",
+     "//chrome/browser/custom_handlers",
+--- a/chrome/browser/browsing_data/chrome_browsing_data_remover_delegate.cc
++++ b/chrome/browser/browsing_data/chrome_browsing_data_remover_delegate.cc
+@@ -39,6 +39,7 @@
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/browsing_data/chrome_browsing_data_remover_constants.h"
+ #include "chrome/browser/browsing_data/navigation_entry_remover.h"
++#include "chrome/browser/containers/used_container_storage_partitions.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/crash_upload_list/crash_upload_list.h"
+ #include "chrome/browser/custom_handlers/protocol_handler_registry_factory.h"
+@@ -104,6 +105,7 @@
+ #include "components/bookmarks/browser/bookmark_model.h"
+ #include "components/browsing_data/content/browsing_data_helper.h"
+ #include "components/browsing_data/core/features.h"
++#include "components/containers/core/common/features.h"
+ #include "components/content_settings/core/browser/content_settings_registry.h"
+ #include "components/content_settings/core/browser/content_settings_utils.h"
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+@@ -343,6 +345,28 @@ void ChromeBrowsingDataRemoverDelegate::
+   content::GetUIThreadTaskRunner({})->PostDelayedTask(
+       FROM_HERE, slow_pending_tasks_closure_.callback(), kSlowTaskTimeout);
+ 
++  // Clear containers storage when no storage partition is specified in the
++  // filter. (Brave: BraveBrowsingDataRemoverDelegate::RemoveEmbedderData.)
++  if (base::FeatureList::IsEnabled(containers::features::kContainers) &&
++      !filter_builder->GetStoragePartitionConfig().has_value()) {
++    const uint64_t container_remove_mask =
++        content::BrowsingDataRemover::DATA_TYPE_ON_STORAGE_PARTITION &
++        remove_mask;
++    // Only clear the storage when the remove mask covers data types that live
++    // on a storage partition.
++    if (container_remove_mask) {
++      for (const content::StoragePartitionConfig& config :
++           containers::GetUsedContainerStoragePartitionConfigs(profile_)) {
++        std::unique_ptr<content::BrowsingDataFilterBuilder> partition_filter =
++            filter_builder->Copy();
++        partition_filter->SetStoragePartitionConfig(config);
++        profile_->GetBrowsingDataRemover()->RemoveWithFilter(
++            delete_begin, delete_end, container_remove_mask, origin_type_mask,
++            std::move(partition_filter));
++      }
++    }
++  }
++
+   // Embedder-defined DOM-accessible storage currently contains only
+   // one datatype, which is the persistent storage permission.
+   if (remove_mask &
+--- a/chrome/browser/containers/BUILD.gn
++++ b/chrome/browser/containers/BUILD.gn
+@@ -19,6 +19,8 @@ source_set("containers") {
+     "containers_service_delegate.h",
+     "containers_service_factory.cc",
+     "containers_service_factory.h",
++    "used_container_storage_partitions.cc",
++    "used_container_storage_partitions.h",
+   ]
+ 
+   # Neon: public so that the hooks in //chrome/browser can include them.
+--- /dev/null
++++ b/chrome/browser/containers/used_container_storage_partitions.cc
+@@ -0,0 +1,42 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "chrome/browser/containers/used_container_storage_partitions.h"
++
++#include <string>
++
++#include "base/check.h"
++#include "base/containers/to_vector.h"
++#include "chrome/browser/containers/containers_service_factory.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
++#include "components/containers/core/browser/containers_service.h"
++#include "components/containers/core/common/features.h"
++#include "chrome/browser/profiles/profile.h"
++#include "content/public/browser/storage_partition_config.h"
++
++namespace containers {
++
++std::vector<content::StoragePartitionConfig>
++GetUsedContainerStoragePartitionConfigs(Profile* profile) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++
++  if (!profile) {
++    return {};
++  }
++
++  ContainersService* service = ContainersServiceFactory::GetForProfile(profile);
++  if (!service) {
++    return {};
++  }
++
++  return base::ToVector(service->GetUsedContainerIds(),
++                        [&](const std::string& id) {
++                          return content::StoragePartitionConfig::Create(
++                              profile, kContainersStoragePartitionDomain, id,
++                              profile->IsOffTheRecord());
++                        });
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/chrome/browser/containers/used_container_storage_partitions.h
+@@ -0,0 +1,24 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef CHROME_BROWSER_CONTAINERS_USED_CONTAINER_STORAGE_PARTITIONS_H_
++#define CHROME_BROWSER_CONTAINERS_USED_CONTAINER_STORAGE_PARTITIONS_H_
++
++#include <vector>
++
++#include "content/public/browser/storage_partition_config.h"
++
++class Profile;
++
++namespace containers {
++
++// Returns StoragePartitionConfig for each locally used container. Returns an
++// empty vector when the ContainersService is unavailable.
++std::vector<content::StoragePartitionConfig>
++GetUsedContainerStoragePartitionConfigs(Profile* profile);
++
++}  // namespace containers
++
++#endif  // CHROME_BROWSER_CONTAINERS_USED_CONTAINER_STORAGE_PARTITIONS_H_
+--- a/chrome/browser/browsing_data/chrome_browsing_data_lifetime_manager.cc
++++ b/chrome/browser/browsing_data/chrome_browsing_data_lifetime_manager.cc
+@@ -89,6 +89,16 @@ class BrowsingDataRemoverObserver
+ 
+   // content::BrowsingDataRemover::Observer:
+   void OnBrowsingDataRemoverDone(uint64_t failed_data_types) override {
++    // Neon: a removal without a storage partition queues one per container
++    // (ChromeBrowsingDataRemoverDelegate::RemoveEmbedderData). Finish once
++    // those ran too, so the browser does not exit first: tasks run in order,
++    // so an empty removal queued now runs after them.
++    if (!waited_for_containers_) {
++      waited_for_containers_ = true;
++      remover_->RemoveAndReply(base::Time(), base::Time::Max(),
++                               /*remove_mask=*/0, /*origin_type_mask=*/0, this);
++      return;
++    }
+     base::UmaHistogramMediumTimes(duration_histogram(),
+                                   base::TimeTicks::Now() - start_time_);
+     // Having |keep_browser_alive_| being true means that the deletion that just
+@@ -109,7 +119,8 @@ class BrowsingDataRemoverObserver
+                               bool filterable_deletion,
+                               Profile* profile,
+                               bool keep_browser_alive)
+-      : start_time_(base::TimeTicks::Now()),
++      : remover_(remover),
++        start_time_(base::TimeTicks::Now()),
+         filterable_deletion_(filterable_deletion),
+         profile_(profile),
+         keep_browser_alive_(keep_browser_alive) {
+@@ -139,6 +150,8 @@ class BrowsingDataRemoverObserver
+   base::ScopedObservation<content::BrowsingDataRemover,
+                           content::BrowsingDataRemover::Observer>
+       browsing_data_remover_observer_{this};
++  const raw_ptr<content::BrowsingDataRemover> remover_;
++  bool waited_for_containers_ = false;
+   const base::TimeTicks start_time_;
+   const bool filterable_deletion_;
+ 
