@@ -65,8 +65,8 @@ across spaces on purpose.
 | M2 | Spaces model: tabs grouped by space, one visible space, switch by command | done | M1, R2 |
 | M3 | Sidebar pager: space switcher row, slide animation, scroll gesture | done | M2 |
 | M4 | Space management: create, rename, icon, colour, delete, reorder, settings page | done | M2 |
-| M5 | All spaces as containers: global context, no default space, extension pages in a separate window, tabs opened by extensions land in the current space | doing | M4, R3 |
-| M6 | Clear browsing data, site data settings and DevTools per space | todo | M5 |
+| M5 | All spaces as containers: global context, no default space, extension pages in a separate window, tabs opened by extensions land in the current space | done | M4, R3 |
+| M6 | Clear browsing data, site data settings and DevTools per space | doing | M5 |
 | M7 | Per-space pinned tabs | blocked | Upstream merging its persistent pinned tabs (#2931) |
 | M8 | Extension switch per space | todo | M5 |
 | M9 | Floating overlay for global pages (extension pages, extension sign-in) | todo | M5 |
@@ -252,10 +252,60 @@ Left open by M4:
 - No shortcut for "New space", and tabs cannot be dragged onto a space icon.
 - Keyboard and screen reader use of the edit bubble and the row menu are untested.
 
-### M5 to M11
+### M5: All spaces as containers (done)
 
-M5 follows `neon/docs/global-space-design.md` (patch X5 with its spaces-layer changes, and
-patch X3 for tabs opened by extensions). M6 covers that document's "Clear browsing data", "Site
+Four patches: `containers/blank-tabs`, `spaces/all-containers`, `extensions/global-window`,
+`extensions/tab-target`. `neon/tests/all_containers_m5.py` (86 checks) proves on a fresh
+profile that nothing the user browses reaches the default partition (cookies read on disk), and
+on a profile written by the M4 build that its tabs come back in the first space. The five older
+suites were updated to the model without a default space.
+
+What changed:
+
+- A fresh profile starts with one container space, "Personal". An older profile's default space
+  becomes a container space. Any space can be moved or deleted, except the last one.
+- Blank pages stay in their container. This needed one condition in
+  `content/browser/browsing_instance.cc`: a BrowsingInstance fixed to a non-default partition
+  assigns a site to pages that have none, as content already does for `<webview>` guests. It is
+  the only hook in `content/` outside the containers port, so watch it at each sync. It also
+  fixed a leak present since M2: new tab page, then `about:blank`, then a typed URL loaded in
+  the default partition.
+- Extension pages open in a popup window centred on the browser (the interim global window).
+  The routing decision is in `chrome/browser/neon/global_context.{h,cc}` for the overlay (M9) to
+  reuse. `windows.create` popups stay in the default partition. `identity.launchWebAuthFlow`
+  already used its own window in the default partition.
+- A tab an extension opens lands in the visible space, or in its opener's space.
+- A tab whose page commits outside every space's container is reopened by URL in its space
+  (`space_tab_tracker`). Nothing is copied from the default partition.
+- "New space" is in the context menu of the sidebar's New Tab button, since the switcher row is
+  hidden with a single space and the empty sidebar area is window caption.
+
+Behaviour M5 chose, to be confirmed by the owner:
+
+1. An extension URL typed into the omnibox opens the global window and leaves the tab as it was.
+2. Global windows are ordinary popup windows, so session restore brings them back.
+3. A reopened stray tab keeps its current URL only, not its history or its group.
+4. In the horizontal tab layout, new tabs still get the container of the active tab's space.
+
+Left open by M5:
+
+- No per-extension choice between "current space" and "global window". An extension that signs
+  in by opening its site in a tab gets that tab in the visible space, where its background does
+  not see the login (study experiment E10). The overlay (M9) or that choice fixes it.
+- `tabs.create` on an extension page returns a tab that can report the browser window's id
+  instead of the global window's.
+- A window whose only tab is an extension page at startup closes when the page moves out.
+- The M5 changes to files of older Neon patches sit in the M5 patches, not in the patches that
+  created those files. Fold them at the next upstream sync, when every patch is refreshed
+  anyway.
+- The series has never been applied to a freshly unpacked Chromium tree since M0. The
+  orchestrator checks instead that the Neon patches apply in order with no fuzz and reproduce
+  every file they touch in the built tree.
+- Window centring was only seen under Xvfb with no window manager.
+
+### M6 to M11
+
+M6 covers that document's "Clear browsing data", "Site
 data settings" and "DevTools" rows. M8 is its patches X1 and X2, M9 is X4. M7 waits for study
 R4 (`neon/docs/pinned-tabs-design.md`).
 
