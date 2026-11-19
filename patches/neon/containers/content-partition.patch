@@ -1,0 +1,821 @@
+Neon containers port (M1), part 2 of 7: content partition.
+
+Partition helpers from brave-core v1.100.58 (bd6d26d1) and the content hooks
+the later patches rely on: a storage partition key on NavigationEntry for
+session restore, and ShouldInheritStoragePartition so noopener windows stay
+in their container. Replaces Brave chromium_src overrides with plain hunks.
+
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at https://mozilla.org/MPL/2.0/.
+
+Copyright (c) 2025-2026, The Brave Authors
+Copyright (c) 2026, The Neon Authors
+
+Alternatively, the contents of this file may be used under the terms
+of the GNU General Public License Version 3, as described below:
+
+Copyright (C) 2026 The Neon Authors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+--- /dev/null
++++ b/components/containers/content/browser/BUILD.gn
+@@ -0,0 +1,54 @@
++# Copyright (c) 2025 The Brave Authors. All rights reserved.
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this file,
++# You can obtain one at https://mozilla.org/MPL/2.0/.
++
++import("//components/containers/buildflags/buildflags.gni")
++
++assert(enable_containers)
++
++# Storage partition and session serialization utilities for Containers. This
++# target does NOT depend on //components/sessions and is safe to use from
++# sessions code (e.g. content_serialized_navigation_driver.cc).
++component("browser") {
++  defines = [ "IS_CONTAINERS_CONTENT_BROWSER_IMPL" ]
++
++  sources = [
++    "containers_web_contents_user_data.cc",
++    "containers_web_contents_user_data.h",
++    "session_utils.cc",
++    "session_utils.h",
++    "storage_partition_utils.cc",
++    "storage_partition_utils.h",
++  ]
++
++  public_deps = [ "//components/containers/buildflags" ]
++
++  deps = [
++    "//base",
++    "//components/containers/core/common",
++    "//content/public/browser",
++    "//url",
++  ]
++}
++
++# Tab restore utilities that depend on //components/sessions. Separated from
++# :browser to avoid a circular dependency (sessions -> :browser -> sessions).
++component("tab_restore") {
++  defines = [ "IS_CONTAINERS_CONTENT_BROWSER_TAB_RESTORE_IMPL" ]
++
++  sources = [
++    "tab_restore_utils.cc",
++    "tab_restore_utils.h",
++  ]
++
++  public_deps = [ "//components/containers/buildflags" ]
++
++  deps = [
++    ":browser",
++    "//base",
++    "//components/containers/core/common",
++    "//components/sessions",
++    "//content/public/browser",
++  ]
++}
+--- /dev/null
++++ b/components/containers/content/browser/DEPS
+@@ -0,0 +1,9 @@
++include_rules = [
++    "+content/public/browser",
++]
++
++specific_include_rules = {
++    "tab_restore_utils.*": [
++        "+components/sessions/core",
++    ],
++}
+--- /dev/null
++++ b/components/containers/content/browser/containers_web_contents_user_data.cc
+@@ -0,0 +1,54 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/content/browser/containers_web_contents_user_data.h"
++
++#include <utility>
++
++#include "components/containers/content/browser/storage_partition_utils.h"
++#include "content/public/browser/security_principal.h"
++#include "content/public/browser/site_instance.h"
++#include "content/public/browser/web_contents.h"
++
++namespace containers {
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(ContainersWebContentsUserData);
++
++ContainersWebContentsUserData::ContainersWebContentsUserData(
++    content::WebContents* web_contents,
++    std::string container_id)
++    : content::WebContentsUserData<ContainersWebContentsUserData>(
++          *web_contents),
++      container_id_(std::move(container_id)) {}
++
++ContainersWebContentsUserData::~ContainersWebContentsUserData() = default;
++
++// static
++void ContainersWebContentsUserData::CopyContainerStateForDiscardedContents(
++    content::WebContents* old_contents,
++    content::WebContents* new_contents) {
++  if (!old_contents || !new_contents) {
++    return;
++  }
++
++  std::string container_id;
++  const auto& config = old_contents->GetSiteInstance()
++                           ->GetSecurityPrincipal()
++                           .GetStoragePartitionConfig();
++  if (IsContainersStoragePartition(config)) {
++    container_id = config.partition_name();
++  } else if (const ContainersWebContentsUserData* const old_user_data =
++                 ContainersWebContentsUserData::FromWebContents(old_contents)) {
++    container_id = old_user_data->container_id();
++  }
++
++  if (container_id.empty()) {
++    return;
++  }
++
++  CreateForWebContents(new_contents, std::move(container_id));
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/content/browser/containers_web_contents_user_data.h
+@@ -0,0 +1,48 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CONTENT_BROWSER_CONTAINERS_WEB_CONTENTS_USER_DATA_H_
++#define COMPONENTS_CONTAINERS_CONTENT_BROWSER_CONTAINERS_WEB_CONTENTS_USER_DATA_H_
++
++#include <string>
++
++#include "base/component_export.h"
++#include "content/public/browser/web_contents_user_data.h"
++
++namespace content {
++class WebContents;
++}  // namespace content
++
++namespace containers {
++
++// Persists the container id on a WebContents when SiteInstance does not yet
++// reflect the Containers storage partition (e.g. stub contents after discard).
++class COMPONENT_EXPORT(CONTAINERS_CONTENT_BROWSER) ContainersWebContentsUserData
++    : public content::WebContentsUserData<ContainersWebContentsUserData> {
++ public:
++  ~ContainersWebContentsUserData() override;
++
++  const std::string& container_id() const { return container_id_; }
++
++  // Copies resolved container state from |old_contents| onto |new_contents|
++  // when the tab's WebContents was replaced (e.g. memory-saver discard).
++  static void CopyContainerStateForDiscardedContents(
++      content::WebContents* old_contents,
++      content::WebContents* new_contents);
++
++ private:
++  friend content::WebContentsUserData<ContainersWebContentsUserData>;
++
++  explicit ContainersWebContentsUserData(content::WebContents* web_contents,
++                                         std::string container_id);
++
++  std::string container_id_;
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CONTENT_BROWSER_CONTAINERS_WEB_CONTENTS_USER_DATA_H_
+--- /dev/null
++++ b/components/containers/content/browser/session_utils.cc
+@@ -0,0 +1,91 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/content/browser/session_utils.h"
++
++#include "base/strings/strcat.h"
++#include "base/strings/string_split.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
++#include "components/containers/core/common/features.h"
++
++namespace containers {
++
++namespace {
++
++// The separator between the container-encoded scheme and a URL.
++constexpr std::string_view kUrlSchemeSeparator = ":";
++
++// The separator between the partition domain and the partition name in the
++// container-encoded scheme of a URL.
++constexpr std::string_view kStoragePartitionKeySeparator = "+";
++
++}  // namespace
++
++RestoreStoragePartitionKeyResult::RestoreStoragePartitionKeyResult(
++    const GURL& url,
++    const std::pair<std::string, std::string>& storage_partition_key,
++    size_t url_prefix_length)
++    : url(url),
++      storage_partition_key(storage_partition_key),
++      url_prefix_length(url_prefix_length) {}
++RestoreStoragePartitionKeyResult::~RestoreStoragePartitionKeyResult() = default;
++RestoreStoragePartitionKeyResult::RestoreStoragePartitionKeyResult(
++    const RestoreStoragePartitionKeyResult&) = default;
++RestoreStoragePartitionKeyResult::RestoreStoragePartitionKeyResult(
++    RestoreStoragePartitionKeyResult&&) noexcept = default;
++RestoreStoragePartitionKeyResult& RestoreStoragePartitionKeyResult::operator=(
++    const RestoreStoragePartitionKeyResult&) = default;
++RestoreStoragePartitionKeyResult& RestoreStoragePartitionKeyResult::operator=(
++    RestoreStoragePartitionKeyResult&&) noexcept = default;
++
++std::optional<std::string> StoragePartitionKeyToUrlPrefix(
++    const std::pair<std::string, std::string>& storage_partition_key) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++
++  // Only generate the prefix for container storage partitions.
++  if (!IsContainersStoragePartitionKey(storage_partition_key.first,
++                                       storage_partition_key.second)) {
++    return std::nullopt;
++  }
++
++  return base::StrCat({
++      storage_partition_key.first,
++      kStoragePartitionKeySeparator,
++      storage_partition_key.second,
++      kUrlSchemeSeparator,
++  });
++}
++
++std::optional<RestoreStoragePartitionKeyResult>
++RestoreStoragePartitionKeyFromUrl(const GURL& url) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++
++  // Parse the URL scheme to check if it's an encoded container URL. We split on
++  // '+' to separate the partition domain and partition name (UUID).
++  const auto parts =
++      base::SplitStringPiece(url.scheme(), kStoragePartitionKeySeparator,
++                             base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL);
++
++  // The container scheme must have exactly 2 parts: "containers" + UUID.
++  if (parts.size() != 2) {
++    return std::nullopt;
++  }
++
++  // Check that this is a container storage partition key.
++  if (!IsContainersStoragePartitionKey(parts[0], parts[1])) {
++    return std::nullopt;
++  }
++
++  // Calculate the exact length of the prefix.
++  const size_t url_prefix_length =
++      parts[0].length() + kStoragePartitionKeySeparator.length() +
++      parts[1].length() + kUrlSchemeSeparator.length();
++
++  return RestoreStoragePartitionKeyResult(
++      GURL(url.spec().substr(url_prefix_length)),
++      {std::string(parts[0]), std::string(parts[1])}, url_prefix_length);
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/content/browser/session_utils.h
+@@ -0,0 +1,107 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CONTENT_BROWSER_SESSION_UTILS_H_
++#define COMPONENTS_CONTAINERS_CONTENT_BROWSER_SESSION_UTILS_H_
++
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/component_export.h"
++#include "url/gurl.h"
++
++namespace containers {
++
++// This file provides utilities for serializing and deserializing
++// StoragePartitionConfig information as part of session/tab restoration.
++//
++// Containers use custom StoragePartitionConfigs to isolate storage (cookies,
++// localStorage, etc.) per container. When a container tab is closed and later
++// restored (via browser restart, "Reopen closed tab", or Sync), we need to
++// restore it to the same container storage partition. However, the standard
++// Chromium session serialization doesn't preserve StoragePartitionConfig data.
++//
++// We encode the container's storage partition key (partition_domain +
++// partition_name) into a virtual URL scheme prefix during serialization:
++//
++//     Real URL:    https://example.com
++//     Encoded URL: containers+<uuid>:https://example.com
++//                  (where <uuid> is the container's unique identifier)
++//
++// This encoding is applied to:
++// 1. The virtual_url in SerializedNavigationEntry.
++// 2. The PageState struct.
++//
++// During deserialization, we detect this special scheme, extract the container
++// information, remove the prefix, and restore the original URL while setting
++// the correct StoragePartitionConfig.
++//
++// Why URL encoding?
++// - The special scheme ensures old browsers or browsers with Containers
++//   disabled cannot navigate to these URLs (they're treated as unhandleable).
++// - If the feature is disabled, tabs restore to a blank page with a
++//   "containers+<uuid>:" URL, preventing accidental mixing of container storage
++//   with default storage.
++// - PageState manipulation is necessary because even if NavigationEntry has a
++//   modified URL, the browser would still open the URL stored in PageState,
++//   bypassing the "unsupported scheme" protection.
++//
++// Serialization flow:
++// 1. Tab is saved (closing, browser exit, or sync).
++// 2. `StoragePartitionKeyToUrlPrefix()` creates prefix (e.g.,
++//    "containers+<uuid>:").
++// 3. Prefix is prepended to URLs in SerializedNavigationEntry and PageState.
++// 4. SerializedNavigationEntry is written to disk/sync.
++//
++// Deserialization flow:
++// 1. Session/tab is restored (browser start, reopen tab, or sync).
++// 2. RestoreStoragePartitionKeyFromUrl() detects special scheme.
++// 3. Extracts container storage partition key and original URL.
++// 4. Sets StoragePartitionConfig on the restored SerializedNavigationEntry.
++// 5. Removes prefix from URLs in SerializedNavigationEntry and PageState.
++
++// Result of RestoreStoragePartitionKeyFromUrl(). Contains the decoded original
++// URL, the extracted storage partition key, and the byte length of the prefix
++// that was stripped from the encoded URL.
++
++struct COMPONENT_EXPORT(CONTAINERS_CONTENT_BROWSER)
++    RestoreStoragePartitionKeyResult {
++  RestoreStoragePartitionKeyResult(
++      const GURL& url,
++      const std::pair<std::string, std::string>& storage_partition_key,
++      size_t url_prefix_length);
++
++  ~RestoreStoragePartitionKeyResult();
++  RestoreStoragePartitionKeyResult(const RestoreStoragePartitionKeyResult&);
++  RestoreStoragePartitionKeyResult& operator=(
++      const RestoreStoragePartitionKeyResult&);
++  RestoreStoragePartitionKeyResult(RestoreStoragePartitionKeyResult&&) noexcept;
++  RestoreStoragePartitionKeyResult& operator=(
++      RestoreStoragePartitionKeyResult&&) noexcept;
++
++  GURL url;
++  std::pair<std::string, std::string> storage_partition_key;
++  size_t url_prefix_length = 0;
++};
++
++// Generates a URL prefix for encoding container storage partition info. Given a
++// storage partition key, returns a URL prefix that can be prepended to URLs in
++// SerializedNavigationEntry and PageState during session serialization.
++COMPONENT_EXPORT(CONTAINERS_CONTENT_BROWSER)
++std::optional<std::string> StoragePartitionKeyToUrlPrefix(
++    const std::pair<std::string, std::string>& storage_partition_key);
++
++// Extracts container storage partition info from an encoded URL. This is the
++// inverse of `StoragePartitionKeyToUrlPrefix()`. Given a URL with an encoded
++// container prefix, extracts the storage partition key (partition_domain,
++// partition_name) and the original URL (https://example.com).
++COMPONENT_EXPORT(CONTAINERS_CONTENT_BROWSER)
++std::optional<RestoreStoragePartitionKeyResult>
++RestoreStoragePartitionKeyFromUrl(const GURL& url);
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CONTENT_BROWSER_SESSION_UTILS_H_
+--- /dev/null
++++ b/components/containers/content/browser/storage_partition_utils.cc
+@@ -0,0 +1,86 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/content/browser/storage_partition_utils.h"
++
++#include <algorithm>
++
++#include "base/strings/string_util.h"
++#include "components/containers/content/browser/containers_web_contents_user_data.h"
++#include "components/containers/core/common/features.h"
++#include "content/public/browser/security_principal.h"
++#include "content/public/browser/site_instance.h"
++#include "content/public/browser/storage_partition_config.h"
++#include "content/public/browser/web_contents.h"
++
++namespace containers {
++
++bool IsContainersStoragePartition(
++    const content::StoragePartitionConfig& partition_config) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  return IsContainersStoragePartitionKey(partition_config.partition_domain(),
++                                         partition_config.partition_name());
++}
++
++bool IsContainersStoragePartitionKey(std::string_view partition_domain,
++                                     std::string_view partition_name) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  return partition_domain == kContainersStoragePartitionDomain &&
++         IsValidStoragePartitionKeyComponent(partition_name);
++}
++
++bool IsValidStoragePartitionKeyComponent(std::string_view component) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  return !component.empty() && std::ranges::all_of(component, [](char c) {
++    return base::IsAsciiAlphaNumeric(c) || c == '-';
++  });
++}
++
++std::optional<content::StoragePartitionConfig> MaybeInheritStoragePartition(
++    base::optional_ref<const content::StoragePartitionConfig>
++        storage_partition_config) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  if (storage_partition_config &&
++      IsContainersStoragePartition(*storage_partition_config)) {
++    return *storage_partition_config;
++  }
++
++  return std::nullopt;
++}
++
++std::string_view GetContainerIdFromStoragePartitionConfig(
++    const content::StoragePartitionConfig& partition_config) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  if (!IsContainersStoragePartition(partition_config)) {
++    return std::string_view();
++  }
++  return partition_config.partition_name();
++}
++
++std::string GetContainerIdForWebContents(content::WebContents* web_contents) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  if (!web_contents) {
++    return std::string();
++  }
++
++  const auto& config = web_contents->GetSiteInstance()
++                           ->GetSecurityPrincipal()
++                           .GetStoragePartitionConfig();
++  if (std::string_view id = GetContainerIdFromStoragePartitionConfig(config);
++      !id.empty()) {
++    return std::string(id);
++  }
++
++  const ContainersWebContentsUserData* user_data =
++      ContainersWebContentsUserData::FromWebContents(web_contents);
++  if (user_data &&
++      IsValidStoragePartitionKeyComponent(user_data->container_id())) {
++    return user_data->container_id();
++  }
++
++  return std::string();
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/content/browser/storage_partition_utils.h
+@@ -0,0 +1,69 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CONTENT_BROWSER_STORAGE_PARTITION_UTILS_H_
++#define COMPONENTS_CONTAINERS_CONTENT_BROWSER_STORAGE_PARTITION_UTILS_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "base/compiler_specific.h"
++#include "base/component_export.h"
++#include "base/types/optional_ref.h"
++
++namespace content {
++class StoragePartitionConfig;
++class WebContents;
++}  // namespace content
++
++namespace containers {
++
++// The partition domain identifier used for all containers storage partitions.
++inline constexpr char kContainersStoragePartitionDomain[] = "containers";
++
++// Checks whether a given StoragePartitionConfig belongs to Containers.
++COMPONENT_EXPORT(CONTAINERS_CONTENT_BROWSER)
++bool IsContainersStoragePartition(
++    const content::StoragePartitionConfig& partition_config);
++
++// Checks whether a given StoragePartitionConfig partition domain and name
++// belongs to Containers.
++COMPONENT_EXPORT(CONTAINERS_CONTENT_BROWSER)
++bool IsContainersStoragePartitionKey(std::string_view partition_domain,
++                                     std::string_view partition_name);
++
++// Checks whether a storage partition key component is not empty and contains
++// only valid characters for Containers storage partitions. Valid characters are
++// ASCII alphanumeric characters and '-'.
++COMPONENT_EXPORT(CONTAINERS_CONTENT_BROWSER)
++bool IsValidStoragePartitionKeyComponent(std::string_view component);
++
++// Returns the StoragePartitionConfig if it is a Containers storage partition,
++// otherwise returns std::nullopt. Used to conditionally inherit
++// StoragePartitionConfig when creating a new SiteInstance.
++COMPONENT_EXPORT(CONTAINERS_CONTENT_BROWSER)
++std::optional<content::StoragePartitionConfig> MaybeInheritStoragePartition(
++    base::optional_ref<const content::StoragePartitionConfig>
++        storage_partition_config);
++
++// Returns partition_name() when |partition_config| is a Containers storage
++// partition; otherwise an empty view. The view is only valid for the lifetime
++// of data owned by |partition_config|.
++COMPONENT_EXPORT(CONTAINERS_CONTENT_BROWSER)
++std::string_view GetContainerIdFromStoragePartitionConfig(
++    const content::StoragePartitionConfig& partition_config LIFETIME_BOUND);
++
++// Returns the container ID for |web_contents|: first from SiteInstance when it
++// identifies a Containers storage partition; otherwise from WebContentsUserData
++// attached after tab discard when the stub WebContents does not yet have the
++// correct SiteInstance. Returns an empty string if |web_contents| is null, or
++// if neither source yields a valid Containers partition.
++COMPONENT_EXPORT(CONTAINERS_CONTENT_BROWSER)
++std::string GetContainerIdForWebContents(content::WebContents* web_contents);
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CONTENT_BROWSER_STORAGE_PARTITION_UTILS_H_
+--- /dev/null
++++ b/components/containers/content/browser/tab_restore_utils.cc
+@@ -0,0 +1,47 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/content/browser/tab_restore_utils.h"
++
++#include "components/containers/content/browser/storage_partition_utils.h"
++#include "components/containers/core/common/features.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/storage_partition_config.h"
++
++namespace containers {
++
++std::optional<content::StoragePartitionConfig>
++GetStoragePartitionConfigToRestore(
++    content::BrowserContext* browser_context,
++    base::span<const sessions::SerializedNavigationEntry> navigations,
++    int selected_navigation) {
++  if (!base::FeatureList::IsEnabled(features::kContainers)) {
++    return std::nullopt;
++  }
++
++  if (navigations.empty()) {
++    return std::nullopt;
++  }
++
++  if (selected_navigation < 0 ||
++      static_cast<size_t>(selected_navigation) >= navigations.size()) {
++    return std::nullopt;
++  }
++
++  if (const auto& storage_partition_key =
++          navigations[selected_navigation].storage_partition_key();
++      storage_partition_key &&
++      IsContainersStoragePartitionKey(storage_partition_key->first,
++                                      storage_partition_key->second)) {
++    return content::StoragePartitionConfig::Create(
++        browser_context, storage_partition_key->first,
++        storage_partition_key->second, browser_context->IsOffTheRecord());
++  }
++
++  return std::nullopt;
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/content/browser/tab_restore_utils.h
+@@ -0,0 +1,40 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CONTENT_BROWSER_TAB_RESTORE_UTILS_H_
++#define COMPONENTS_CONTAINERS_CONTENT_BROWSER_TAB_RESTORE_UTILS_H_
++
++#include <optional>
++
++#include "base/component_export.h"
++#include "base/containers/span.h"
++
++namespace content {
++class BrowserContext;
++class StoragePartitionConfig;
++}  // namespace content
++
++namespace sessions {
++class SerializedNavigationEntry;
++}  // namespace sessions
++
++namespace containers {
++
++// Returns the StoragePartitionConfig to use when restoring a tab from session
++// data. Examines the selected navigation entry for container storage partition
++// info and, if found, creates the corresponding StoragePartitionConfig.
++// Returns std::nullopt if the Containers feature is disabled, navigations are
++// empty, the selected index is out of range, or the navigation doesn't belong
++// to a container.
++COMPONENT_EXPORT(CONTAINERS_CONTENT_BROWSER_TAB_RESTORE)
++std::optional<content::StoragePartitionConfig>
++GetStoragePartitionConfigToRestore(
++    content::BrowserContext* browser_context,
++    base::span<const sessions::SerializedNavigationEntry> navigations,
++    int selected_navigation);
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CONTENT_BROWSER_TAB_RESTORE_UTILS_H_
+--- a/content/browser/renderer_host/navigation_entry_impl.cc
++++ b/content/browser/renderer_host/navigation_entry_impl.cc
+@@ -771,6 +771,52 @@ SSLStatus& NavigationEntryImpl::GetSSL()
+   return ssl_;
+ }
+ 
++// SetStoragePartitionKeyToRestore and GetStoragePartitionKeyToRestore are
++// added to content::NavigationEntry to persist and restore the storage
++// partition key (partition_domain, partition_name) that should be used when
++// this navigation entry is restored.
++//
++// NavigationEntry has a reference to a SiteInstance, which has a
++// StoragePartitionConfig. However, when restoring from a serialized session:
++// 1. The NavigationEntry is created before the SiteInstance.
++// 2. We need to pass the correct StoragePartitionConfig when creating the
++//    SiteInstance.
++// 3. Standard Chromium doesn't serialize this information.
++//
++// These methods bridge that gap by storing the "intended" storage partition
++// key for serialization and restoration.
++void NavigationEntryImpl::SetStoragePartitionKeyToRestore(
++    std::pair<std::string, std::string> storage_partition_key) {
++  storage_partition_key_to_restore_ = std::move(storage_partition_key);
++}
++
++// Called during session serialization (FromNavigationEntry). If the entry has
++// no SiteInstance yet (being restored or not yet navigated), returns the key
++// it was restored with.
++base::optional_ref<const std::pair<std::string, std::string>>
++NavigationEntryImpl::GetStoragePartitionKeyToRestore() {
++  // frame_tree_->frame_entry->site_instance() is null during initial
++  // restoration and populated after the navigation completes.
++  if (auto* site_instance = (frame_tree_ && frame_tree_->frame_entry)
++                                ? frame_tree_->frame_entry->site_instance()
++                                : nullptr) {
++    const auto& storage_partition_config =
++        site_instance->GetSecurityPrincipal().GetStoragePartitionConfig();
++    if (!storage_partition_key_to_restore_) {
++      storage_partition_key_to_restore_ = {
++          storage_partition_config.partition_domain(),
++          storage_partition_config.partition_name(),
++      };
++    } else {
++      DUMP_WILL_BE_CHECK_EQ(storage_partition_key_to_restore_->first,
++                            storage_partition_config.partition_domain());
++      DUMP_WILL_BE_CHECK_EQ(storage_partition_key_to_restore_->second,
++                            storage_partition_config.partition_name());
++    }
++  }
++  return storage_partition_key_to_restore_;
++}
++
+ void NavigationEntryImpl::SetOriginalRequestURL(const GURL& original_url) {
+   original_request_url_ = original_url;
+ }
+--- a/content/browser/renderer_host/navigation_entry_impl.h
++++ b/content/browser/renderer_host/navigation_entry_impl.h
+@@ -165,6 +165,10 @@ class CONTENT_EXPORT NavigationEntryImpl
+       const override;
+   FaviconStatus& GetFavicon() override;
+   SSLStatus& GetSSL() override;
++  void SetStoragePartitionKeyToRestore(
++      std::pair<std::string, std::string> storage_partition_key) override;
++  base::optional_ref<const std::pair<std::string, std::string>>
++  GetStoragePartitionKeyToRestore() override;
+   void SetOriginalRequestURL(const GURL& original_url) override;
+   const GURL& GetOriginalRequestURL() const override;
+   void SetIsOverridingUserAgent(bool override_ua) override;
+@@ -724,6 +728,11 @@ class CONTENT_EXPORT NavigationEntryImpl
+   // Information about a navigation transition. See the comments on the class
+   // for details.
+   NavigationTransitionData navigation_transition_data_;
++
++  // Storage partition key to use when restoring this entry. Used by
++  // containers, see GetStoragePartitionKeyToRestore().
++  std::optional<std::pair<std::string, std::string>>
++      storage_partition_key_to_restore_;
+ };
+ 
+ }  // namespace content
+--- a/content/browser/web_contents/web_contents_impl.cc
++++ b/content/browser/web_contents/web_contents_impl.cc
+@@ -5802,7 +5802,12 @@ FrameTree* WebContentsImpl::CreateNewWin
+   // SiteInstance is created in a new BrowsingInstance.
+   scoped_refptr<SiteInstance> site_instance;
+   if (params.opener_suppressed) {
+-    if (is_guest) {
++    if (!is_guest &&
++        GetContentClient()->browser()->ShouldInheritStoragePartition(
++            partition_config)) {
++      site_instance = SiteInstance::CreateForFixedStoragePartition(
++          GetBrowserContext(), GURL(), partition_config);
++    } else if (is_guest) {
+       // For guests, noopener windows can be created in a new BrowsingInstance
+       // as long as they preserve the guest's StoragePartition.
+       site_instance =
+--- a/content/public/browser/content_browser_client.cc
++++ b/content/public/browser/content_browser_client.cc
+@@ -801,6 +801,11 @@ StoragePartitionConfig ContentBrowserCli
+   return StoragePartitionConfig::CreateDefault(browser_context);
+ }
+ 
++bool ContentBrowserClient::ShouldInheritStoragePartition(
++    const StoragePartitionConfig& partition_config) const {
++  return false;
++}
++
+ MediaObserver* ContentBrowserClient::GetMediaObserver() {
+   return nullptr;
+ }
+--- a/content/public/browser/content_browser_client.h
++++ b/content/public/browser/content_browser_client.h
+@@ -1193,6 +1193,12 @@ class CONTENT_EXPORT ContentBrowserClien
+       BrowserContext* browser_context,
+       const GURL& site);
+ 
++  // Allows the embedder to keep |partition_config| for windows opened with
++  // noopener, which otherwise start in the default storage partition. Used by
++  // containers.
++  virtual bool ShouldInheritStoragePartition(
++      const StoragePartitionConfig& partition_config) const;
++
+   // Allows the embedder to provide settings that determine if generated code
+   // can be cached and the amount of disk space used for caching generated code.
+   virtual GeneratedCodeCacheSettings GetGeneratedCodeCacheSettings(
+--- a/content/public/browser/navigation_entry.h
++++ b/content/public/browser/navigation_entry.h
+@@ -10,10 +10,12 @@
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <utility>
+ 
+ #include "base/memory/ref_counted_memory.h"
+ #include "base/supports_user_data.h"
+ #include "base/time/time.h"
++#include "base/types/optional_ref.h"
+ #include "build/build_config.h"
+ #include "content/common/content_export.h"
+ #include "content/public/common/page_type.h"
+@@ -198,6 +200,13 @@ class NavigationEntry : public base::Sup
+   // All the SSL flags and state. See content::SSLStatus.
+   virtual SSLStatus& GetSSL() = 0;
+ 
++  // The (partition_domain, partition_name) storage partition key to use when
++  // this entry is restored from a serialized session. Used by containers.
++  virtual void SetStoragePartitionKeyToRestore(
++      std::pair<std::string, std::string> storage_partition_key) = 0;
++  virtual base::optional_ref<const std::pair<std::string, std::string>>
++  GetStoragePartitionKeyToRestore() = 0;
++
+   // Store the URL that caused this NavigationEntry to be created.
+   virtual void SetOriginalRequestURL(const GURL& original_url) = 0;
+   virtual const GURL& GetOriginalRequestURL() const = 0;

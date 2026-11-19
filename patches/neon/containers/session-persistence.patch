@@ -1,0 +1,356 @@
+Neon containers port (M1), part 3 of 7: session persistence.
+
+Keeps a tab in its container across session restore and reopen closed tab,
+as brave-core v1.100.58 (bd6d26d1) does: the container id is encoded into
+the saved URL as "containers+<id>:<url>" (virtual URL and PageState) and
+decoded on load. Replaces Brave chromium_src overrides with plain hunks.
+Also makes ChromeSerializedNavigationDriver::Sanitize call the base class,
+which Brave patches the same way.
+
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at https://mozilla.org/MPL/2.0/.
+
+Copyright (c) 2025-2026, The Brave Authors
+Copyright (c) 2026, The Neon Authors
+
+Alternatively, the contents of this file may be used under the terms
+of the GNU General Public License Version 3, as described below:
+
+Copyright (C) 2026 The Neon Authors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+--- a/chrome/browser/sessions/chrome_serialized_navigation_driver.cc
++++ b/chrome/browser/sessions/chrome_serialized_navigation_driver.cc
+@@ -50,6 +50,8 @@ ChromeSerializedNavigationDriver::GetIns
+ 
+ void ChromeSerializedNavigationDriver::Sanitize(
+     sessions::SerializedNavigationEntry* navigation) const {
++  // Containers: the base class strips the container prefix from the URL.
++  ContentSerializedNavigationDriver::Sanitize(navigation);
+   content::Referrer old_referrer(
+       navigation->referrer_url(),
+       content::Referrer::ConvertToPolicy(navigation->referrer_policy()));
+--- a/components/sessions/BUILD.gn
++++ b/components/sessions/BUILD.gn
+@@ -43,6 +43,8 @@ if (use_blink && !(is_ios && target_plat
+ 
+     deps = [
+       "//base",
++      "//components/containers/content/browser",
++      "//components/containers/core/common",
+       "//content/public/common",
+       "//ui/base",
+       "//url",
+--- a/components/sessions/content/content_serialized_navigation_builder.cc
++++ b/components/sessions/content/content_serialized_navigation_builder.cc
+@@ -8,6 +8,9 @@
+ 
+ #include "base/check_op.h"
+ #include "base/containers/span.h"
++#include "base/feature_list.h"
++#include "components/containers/content/browser/session_utils.h"
++#include "components/containers/core/common/features.h"
+ #include "components/sessions/content/content_record_password_state.h"
+ #include "components/sessions/content/content_serialized_navigation_driver.h"
+ #include "components/sessions/content/extended_info_handler.h"
+@@ -24,6 +27,48 @@
+ 
+ namespace sessions {
+ 
++namespace {
++
++// Containers: copies the storage partition key parsed from the
++// SerializedNavigationEntry by ContentSerializedNavigationDriver::Sanitize()
++// into the NavigationEntry, so the restored tab gets a SiteInstance in the
++// right storage partition.
++void MaybeRestoreStoragePartitionKey(
++    const SerializedNavigationEntry* navigation,
++    content::NavigationEntry* entry) {
++  if (base::FeatureList::IsEnabled(containers::features::kContainers) &&
++      navigation->storage_partition_key().has_value()) {
++    entry->SetStoragePartitionKeyToRestore(
++        navigation->storage_partition_key().value());
++  }
++}
++
++// Containers: stores the NavigationEntry's storage partition key and its URL
++// prefix ("containers+<id>:") on the SerializedNavigationEntry when saving a
++// session. The prefix is added to the PageState by
++// ContentSerializedNavigationDriver::GetSanitizedPageStateForPickle() and to
++// the virtual URL by SerializedNavigationEntry::WriteToPickle().
++void MaybeSaveStoragePartitionKey(content::NavigationEntry* entry,
++                                  SerializedNavigationEntry* navigation) {
++  if (!base::FeatureList::IsEnabled(containers::features::kContainers)) {
++    return;
++  }
++  auto storage_partition_key_to_restore =
++      entry->GetStoragePartitionKeyToRestore();
++  if (!storage_partition_key_to_restore) {
++    return;
++  }
++  auto url_prefix = containers::StoragePartitionKeyToUrlPrefix(
++      *storage_partition_key_to_restore);
++  if (!url_prefix) {
++    return;
++  }
++  navigation->set_virtual_url_prefix(*url_prefix);
++  navigation->set_storage_partition_key(*storage_partition_key_to_restore);
++}
++
++}  // namespace
++
+ // static
+ SerializedNavigationEntry
+ ContentSerializedNavigationBuilder::FromNavigationEntry(
+@@ -65,6 +110,7 @@ ContentSerializedNavigationBuilder::From
+       navigation.extended_info_map_[handler_entry.first] = value;
+   }
+ 
++  MaybeSaveStoragePartitionKey(entry, &navigation);
+   return navigation;
+ }
+ 
+@@ -208,6 +254,7 @@ ContentSerializedNavigationBuilder::ToNa
+   DCHECK_EQ(SerializedNavigationEntry::STATE_INVALID,
+             navigation->blocked_state_);
+ 
++  MaybeRestoreStoragePartitionKey(navigation, entry.get());
+   return entry;
+ }
+ 
+--- a/components/sessions/content/content_serialized_navigation_driver.cc
++++ b/components/sessions/content/content_serialized_navigation_driver.cc
+@@ -6,7 +6,10 @@
+ 
+ #include <utility>
+ 
++#include "base/feature_list.h"
+ #include "base/memory/singleton.h"
++#include "components/containers/content/browser/session_utils.h"
++#include "components/containers/core/common/features.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "services/network/public/mojom/referrer_policy.mojom.h"
+ #include "third_party/blink/public/common/page_state/page_state.h"
+@@ -17,6 +20,20 @@ namespace {
+ 
+ ContentSerializedNavigationDriver* g_instance = nullptr;
+ 
++// Containers: adds the virtual URL prefix of a container tab to its PageState,
++// so that a session restored with containers disabled cannot load the page in
++// the default storage partition (the prefixed URL has an unhandleable scheme).
++std::string MaybePrefixPageState(const SerializedNavigationEntry* navigation,
++                                 std::string page_state) {
++  if (base::FeatureList::IsEnabled(containers::features::kContainers) &&
++      !navigation->virtual_url_prefix().empty() && !page_state.empty()) {
++    page_state = blink::PageState::CreateFromEncodedData(page_state)
++                     .PrefixTopURL(navigation->virtual_url_prefix())
++                     .ToEncodedData();
++  }
++  return page_state;
++}
++
+ }  // namespace
+ 
+ // static
+@@ -58,15 +75,41 @@ std::string
+ ContentSerializedNavigationDriver::GetSanitizedPageStateForPickle(
+     const SerializedNavigationEntry* navigation) const {
+   if (!navigation->has_post_data())
+-    return navigation->encoded_page_state();
++    return MaybePrefixPageState(navigation, navigation->encoded_page_state());
+ 
+   blink::PageState page_state =
+       blink::PageState::CreateFromEncodedData(navigation->encoded_page_state());
+-  return page_state.RemovePasswordData().ToEncodedData();
++  return MaybePrefixPageState(navigation,
++                              page_state.RemovePasswordData().ToEncodedData());
+ }
+ 
+ void ContentSerializedNavigationDriver::Sanitize(
+     SerializedNavigationEntry* navigation) const {
++  // Containers: called when loading a SerializedNavigationEntry from disk or
++  // sync, before it is converted to a NavigationEntry. If the virtual URL has
++  // the form "containers+<id>:https://...", strip the prefix from the virtual
++  // URL and the PageState and keep the storage partition key, which
++  // ContentSerializedNavigationBuilder::ToNavigationEntry() copies onto the
++  // NavigationEntry. With containers disabled the URL stays unhandleable.
++  if (!base::FeatureList::IsEnabled(containers::features::kContainers)) {
++    return;
++  }
++  auto result =
++      containers::RestoreStoragePartitionKeyFromUrl(navigation->virtual_url());
++  if (!result) {
++    return;
++  }
++  navigation->set_virtual_url_prefix(
++      navigation->virtual_url().spec().substr(0, result->url_prefix_length));
++  navigation->set_virtual_url(result->url);
++  navigation->set_storage_partition_key(result->storage_partition_key);
++  if (!navigation->encoded_page_state().empty()) {
++    navigation->set_encoded_page_state(
++        blink::PageState::CreateFromEncodedData(
++            navigation->encoded_page_state())
++            .RemoveTopURLPrefix(result->url_prefix_length)
++            .ToEncodedData());
++  }
+ }
+ 
+ std::string ContentSerializedNavigationDriver::StripReferrerFromPageState(
+--- a/components/sessions/core/serialized_navigation_entry.cc
++++ b/components/sessions/core/serialized_navigation_entry.cc
+@@ -120,7 +120,7 @@ void SerializedNavigationEntry::WriteToP
+   int bytes_written = 0;
+ 
+   WriteStringToPickle(pickle, &bytes_written, max_size,
+-                      virtual_url_.spec());
++                      maybe_prefixed_virtual_url_spec());
+ 
+   WriteString16ToPickle(pickle, &bytes_written, max_size, title_);
+ 
+--- a/components/sessions/core/serialized_navigation_entry.h
++++ b/components/sessions/core/serialized_navigation_entry.h
+@@ -9,7 +9,9 @@
+ 
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/time/time.h"
+@@ -101,6 +103,27 @@ class SESSIONS_EXPORT SerializedNavigati
+   const GURL& virtual_url() const { return virtual_url_; }
+   void set_virtual_url(const GURL& virtual_url) { virtual_url_ = virtual_url; }
+ 
++  // Containers: the storage partition key of this navigation and the
++  // "containers+<id>:" prefix that encodes it into the saved virtual URL. Set
++  // by ContentSerializedNavigationBuilder when saving and by
++  // ContentSerializedNavigationDriver::Sanitize() when restoring. Not written
++  // to the pickle as fields of their own.
++  const std::optional<std::pair<std::string, std::string>>&
++  storage_partition_key() const {
++    return storage_partition_key_;
++  }
++  void set_storage_partition_key(
++      const std::pair<std::string, std::string>& key) {
++    storage_partition_key_ = key;
++  }
++  const std::string& virtual_url_prefix() const { return virtual_url_prefix_; }
++  void set_virtual_url_prefix(const std::string& url_prefix) {
++    virtual_url_prefix_ = url_prefix;
++  }
++  std::string maybe_prefixed_virtual_url_spec() const {
++    return virtual_url_prefix_ + virtual_url_.spec();
++  }
++
+   const std::string& encoded_page_state() const { return encoded_page_state_; }
+   void set_encoded_page_state(const std::string& encoded_page_state) {
+     encoded_page_state_ = encoded_page_state;
+@@ -159,6 +182,8 @@ class SESSIONS_EXPORT SerializedNavigati
+   GURL referrer_url_;
+   int referrer_policy_;
+   GURL virtual_url_;
++  std::optional<std::pair<std::string, std::string>> storage_partition_key_;
++  std::string virtual_url_prefix_;
+   std::u16string title_;
+   std::string encoded_page_state_;
+   ui::PageTransition transition_type_ = ui::PAGE_TRANSITION_TYPED;
+--- a/third_party/blink/common/page_state/page_state.cc
++++ b/third_party/blink/common/page_state/page_state.cc
+@@ -11,6 +11,7 @@
+ #include <utility>
+ 
+ #include "base/files/file_path.h"
++#include "base/strings/strcat.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "services/network/public/cpp/resource_request_body.h"
+ #include "services/network/public/mojom/referrer_policy.mojom.h"
+@@ -162,6 +163,62 @@ PageState PageState::RemoveScrollOffset(
+ 
+   return ToPageState(state);
+ }
++
++// Prepends |prefix| to the top-level URL stored in PageState. Used by
++// containers to encode the storage partition into a saved session: if the
++// session is restored with containers disabled, Blink would navigate to the
++// prefixed URL, which has an unhandleable scheme, and load a blank page instead
++// of loading the site in the default storage partition.
++//
++// Returns a new PageState with the modified URL, or the original PageState if
++// the operation fails or the PageState is empty.
++PageState PageState::PrefixTopURL(const std::string& prefix) const {
++  if (data_.empty()) {
++    return *this;
++  }
++
++  ExplodedPageState state;
++  if (!DecodePageState(data_, &state)) {
++    return *this;
++  }
++
++  if (!state.top.url_string) {
++    return *this;
++  }
++
++  state.top.url_string =
++      base::StrCat({base::UTF8ToUTF16(prefix), *state.top.url_string});
++
++  return ToPageState(state);
++}
++
++// Removes a prefix of |prefix_length| from the top-level URL in PageState. This
++// is the inverse of PrefixTopURL().
++//
++// Returns a new PageState with the prefix removed, or the original PageState if
++// the operation fails or the PageState is empty.
++PageState PageState::RemoveTopURLPrefix(size_t prefix_length) const {
++  if (data_.empty()) {
++    return *this;
++  }
++
++  ExplodedPageState state;
++  if (!DecodePageState(data_, &state)) {
++    return *this;
++  }
++
++  if (!state.top.url_string) {
++    return *this;
++  }
++
++  if (prefix_length > state.top.url_string->size()) {
++    return *this;
++  }
++
++  state.top.url_string = state.top.url_string->substr(prefix_length);
++
++  return ToPageState(state);
++}
+ 
+ PageState PageState::RemoveReferrer() const {
+   if (data_.empty())
+--- a/third_party/blink/public/common/page_state/page_state.h
++++ b/third_party/blink/public/common/page_state/page_state.h
+@@ -59,6 +59,9 @@ class BLINK_COMMON_EXPORT PageState {
+   PageState RemovePasswordData() const;
+   PageState RemoveScrollOffset() const;
+   PageState RemoveReferrer() const;
++  // Used by containers to encode the storage partition into a saved session.
++  PageState PrefixTopURL(const std::string& prefix) const;
++  PageState RemoveTopURLPrefix(size_t prefix_length) const;
+ 
+   // Support DCHECK_EQ(a, b), etc.
+   bool operator==(const PageState& other) const { return this->Equals(other); }

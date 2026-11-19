@@ -1,0 +1,1667 @@
+Neon containers port (M1), part 1 of 7: core.
+
+Brave containers core from brave-core v1.100.58 (bd6d26d1): the containers
+service, prefs (brave.containers.*), mojom, feature and the CRUD handler.
+See neon/docs/containers-port.md and neon/THIRD_PARTY.md.
+
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at https://mozilla.org/MPL/2.0/.
+
+Copyright (c) 2025-2026, The Brave Authors
+Copyright (c) 2026, The Neon Authors
+
+Alternatively, the contents of this file may be used under the terms
+of the GNU General Public License Version 3, as described below:
+
+Copyright (C) 2026 The Neon Authors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+--- /dev/null
++++ b/components/containers/buildflags/BUILD.gn
+@@ -0,0 +1,13 @@
++# Copyright (c) 2025 The Brave Authors. All rights reserved.
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this file,
++# You can obtain one at https://mozilla.org/MPL/2.0/.
++
++import("//components/containers/buildflags/buildflags.gni")
++import("//build/buildflag_header.gni")
++
++buildflag_header("buildflags") {
++  header = "buildflags.h"
++
++  flags = [ "ENABLE_CONTAINERS=$enable_containers" ]
++}
+--- /dev/null
++++ b/components/containers/buildflags/buildflags.gni
+@@ -0,0 +1,8 @@
++# Copyright (c) 2025 The Brave Authors. All rights reserved.
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this file,
++# You can obtain one at https://mozilla.org/MPL/2.0/.
++
++declare_args() {
++  enable_containers = is_linux || is_mac || is_win
++}
+--- /dev/null
++++ b/components/containers/core/browser/BUILD.gn
+@@ -0,0 +1,52 @@
++# Copyright (c) 2025 The Brave Authors. All rights reserved.
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this file,
++# You can obtain one at https://mozilla.org/MPL/2.0/.
++
++import("//components/containers/buildflags/buildflags.gni")
++
++assert(enable_containers)
++
++static_library("browser") {
++  public = [
++    "command_line_container.h",
++    "container_specifier.h",
++    "containers_service.h",
++    "containers_service_observer.h",
++    "containers_settings_handler.h",
++    "pref_names.h",
++    "prefs_registration.h",
++    "temporary_container.h",
++    "unknown_container.h",
++  ]
++
++  sources = [
++    "command_line_container.cc",
++    "containers_service.cc",
++    "containers_settings_handler.cc",
++    "prefs.cc",
++    "prefs.h",
++    "prefs_registration.cc",
++    "temporary_container.cc",
++    "unknown_container.cc",
++  ]
++
++  public_deps = [ "//components/containers/core/mojom" ]
++
++  deps = [
++    "//base",
++    "//base/version_info",
++    "//components/containers/core/common",
++    "//components/keyed_service/core",
++    "//components/pref_registry",
++    "//components/prefs",
++    "//components/user_prefs",
++    "//net/base/registry_controlled_domains",
++    "//services/network/public/cpp",
++    "//skia",
++    "//third_party/re2",
++    "//ui/base",
++    "//ui/color",
++    "//url",
++  ]
++}
+--- /dev/null
++++ b/components/containers/core/browser/DEPS
+@@ -0,0 +1,11 @@
++include_rules = [
++    "+components/keyed_service/core",
++    "+components/pref_registry",
++    "+components/prefs",
++    "+components/sync_preferences",
++    "+components/user_prefs",
++    "+third_party/re2",
++    "+third_party/skia/include",
++    "+ui/base",
++    "+ui/color",
++]
+--- /dev/null
++++ b/components/containers/core/browser/command_line_container.cc
+@@ -0,0 +1,45 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/core/browser/command_line_container.h"
++
++#include <string>
++#include <utility>
++
++#include "base/check.h"
++#include "base/command_line.h"
++#include "components/containers/core/browser/containers_service.h"
++#include "components/containers/core/common/switches.h"
++#include "components/containers/core/mojom/containers.mojom.h"
++
++namespace containers {
++
++ContainerSpecifier GetContainerSpecifierForCommandLineTabs(
++    const base::CommandLine& command_line,
++    ContainersService* containers_service) {
++  CHECK(containers_service);
++
++  const std::string container_name =
++      command_line.GetSwitchValueUTF8(switches::kContainer);
++
++  if (command_line.HasSwitch(switches::kTemporaryContainer)) {
++    auto container =
++        container_name.empty()
++            ? containers_service->CreateAndPersistTemporaryContainer()
++            : containers_service->GetOrCreateTemporaryContainerByName(
++                  container_name);
++    // Address the temporary container by id: names are not guaranteed to be
++    // unique, and a generated one is random.
++    return ContainerId(std::move(container->id));
++  }
++
++  if (!container_name.empty()) {
++    return ContainerName(container_name);
++  }
++
++  return {};
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/core/browser/command_line_container.h
+@@ -0,0 +1,37 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_BROWSER_COMMAND_LINE_CONTAINER_H_
++#define COMPONENTS_CONTAINERS_CORE_BROWSER_COMMAND_LINE_CONTAINER_H_
++
++#include "components/containers/core/browser/container_specifier.h"
++
++namespace base {
++class CommandLine;
++}  // namespace base
++
++namespace containers {
++
++class ContainersService;
++
++// Returns the container to use for the tabs passed via the command line. All
++// command line tabs share the same container, matching the "open in new
++// temporary container" UI.
++//
++// `--temporary-container` opens the tabs in a temporary container: a new one,
++// or, when `--container` also gives a name, the temporary container with that
++// name, created on first use so that a later launch can open more tabs in it.
++// `--container` on its own resolves an existing container by name.
++//
++// Creating a temporary container persists it, so this must not be called more
++// than once per launch. Returns an empty specifier (no container) when neither
++// switch is given.
++ContainerSpecifier GetContainerSpecifierForCommandLineTabs(
++    const base::CommandLine& command_line,
++    ContainersService* containers_service);
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CORE_BROWSER_COMMAND_LINE_CONTAINER_H_
+--- /dev/null
++++ b/components/containers/core/browser/container_specifier.h
+@@ -0,0 +1,27 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_BROWSER_CONTAINER_SPECIFIER_H_
++#define COMPONENTS_CONTAINERS_CORE_BROWSER_CONTAINER_SPECIFIER_H_
++
++#include <string>
++#include <variant>
++
++#include "base/types/strong_alias.h"
++
++namespace containers {
++
++// Strong alias for container id.
++using ContainerId = base::StrongAlias<class ContainerIdTag, std::string>;
++// Strong alias for container name.
++using ContainerName = base::StrongAlias<class ContainerNameTag, std::string>;
++
++// A variant of container id or name used to represent a container.
++using ContainerSpecifier =
++    std::variant<std::monostate, ContainerId, ContainerName>;
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CORE_BROWSER_CONTAINER_SPECIFIER_H_
+--- /dev/null
++++ b/components/containers/core/browser/containers_service.cc
+@@ -0,0 +1,276 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/core/browser/containers_service.h"
++
++#include <utility>
++#include <variant>
++#include <vector>
++
++#include "base/check.h"
++#include "base/check_deref.h"
++#include "base/containers/to_vector.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/types/to_address.h"
++#include "components/containers/core/browser/containers_service_observer.h"
++#include "components/containers/core/browser/pref_names.h"
++#include "components/containers/core/browser/prefs.h"
++#include "components/containers/core/browser/temporary_container.h"
++#include "components/containers/core/browser/unknown_container.h"
++#include "components/containers/core/mojom/containers.mojom.h"
++#include "components/prefs/pref_service.h"
++
++namespace containers {
++
++ContainersService::ContainersService(PrefService* prefs,
++                                     bool is_off_the_record,
++                                     std::unique_ptr<Delegate> delegate)
++    : prefs_(CHECK_DEREF(prefs)),
++      is_off_the_record_(is_off_the_record),
++      delegate_(std::move(delegate)) {
++  CHECK(delegate_);
++
++  pref_change_registrar_.Init(base::to_address(prefs_));
++  pref_change_registrar_.Add(
++      prefs::kContainersList,
++      base::BindRepeating(&ContainersService::OnSyncedContainersChanged,
++                          base::Unretained(this)));
++
++  ScheduleOrphanedContainersCleanup();
++}
++
++ContainersService::~ContainersService() = default;
++
++void ContainersService::Shutdown() {
++  weak_factory_.InvalidateWeakPtrs();
++  pref_change_registrar_.RemoveAll();
++  delegate_.reset();
++}
++
++void ContainersService::AddObserver(ContainersServiceObserver* observer) {
++  observers_.AddObserver(observer);
++}
++
++void ContainersService::RemoveObserver(ContainersServiceObserver* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++void ContainersService::MarkContainerUsed(std::string_view container_id) {
++  CHECK(!container_id.empty());
++
++  if (HasLocallyUsedContainerInPrefs(*prefs_, container_id)) {
++    return;
++  }
++
++  auto container = GetContainerFromPrefs(*prefs_, container_id);
++  if (!container) {
++    container = CreateUnknownContainer(container_id);
++  }
++
++  SetLocallyUsedContainerToPrefs(container, *prefs_);
++}
++
++mojom::ContainerPtr ContainersService::CreateAndPersistTemporaryContainer() {
++  auto container = CreateTemporaryContainer();
++  SetLocallyUsedContainerToPrefs(container, *prefs_);
++  return container;
++}
++
++mojom::ContainerPtr ContainersService::GetOrCreateTemporaryContainerByName(
++    std::string_view name) {
++  CHECK(!name.empty());
++
++  // Temporary containers are never synced, so only the locally used list is
++  // searched.
++  for (auto& container : GetLocallyUsedContainersFromPrefs(*prefs_)) {
++    if (container->name == name && IsTemporaryContainerId(container->id)) {
++      return std::move(container);
++    }
++  }
++
++  auto container = CreateTemporaryContainer(name);
++  SetLocallyUsedContainerToPrefs(container, *prefs_);
++  return container;
++}
++
++mojom::ContainerPtr ContainersService::GetRuntimeContainerById(
++    std::string_view id) const {
++  if (auto container = GetContainerFromPrefs(*prefs_, id)) {
++    return container;
++  }
++  if (auto container = GetLocallyUsedContainerFromPrefs(*prefs_, id)) {
++    return container;
++  }
++  return nullptr;
++}
++
++mojom::ContainerPtr ContainersService::GetRuntimeContainerByName(
++    std::string_view name) const {
++  for (auto& container : GetContainersFromPrefs(*prefs_)) {
++    if (container->name == name) {
++      return std::move(container);
++    }
++  }
++  for (auto& container : GetLocallyUsedContainersFromPrefs(*prefs_)) {
++    if (container->name == name) {
++      return std::move(container);
++    }
++  }
++  return nullptr;
++}
++
++std::vector<mojom::ContainerPtr> ContainersService::GetContainers() const {
++  return GetContainersFromPrefs(*prefs_);
++}
++
++std::vector<std::string> ContainersService::GetUsedContainerIds() const {
++  if (orphaned_cleanup_state_ ==
++      OrphanedContainersCleanupState::kDiscoveringOrphans) {
++    return {};
++  }
++
++  auto used_ids = base::ToVector(GetLocallyUsedContainersFromPrefs(*prefs_),
++                                 [](const auto& c) { return c->id; });
++  if (orphaned_cleanup_state_ ==
++      OrphanedContainersCleanupState::kRemovingOrphans) {
++    std::erase_if(used_ids, [&](const std::string& id) {
++      return orphaned_containers_pending_removal_.contains(id);
++    });
++  }
++  return used_ids;
++}
++
++bool ContainersService::ShouldShowContainerControls() const {
++  return prefs_->GetBoolean(prefs::kContainersEnabled);
++}
++
++void ContainersService::ScheduleOrphanedContainersCleanupForTesting() {
++  ScheduleOrphanedContainersCleanup();
++}
++
++void ContainersService::OnSyncedContainersChanged() {
++  RefreshLocallyUsedContainersFromSyncedList();
++  observers_.Notify(&ContainersServiceObserver::OnContainersListChanged);
++}
++
++void ContainersService::RefreshLocallyUsedContainersFromSyncedList() {
++  for (const auto& used_container :
++       GetLocallyUsedContainersFromPrefs(*prefs_)) {
++    if (auto container = GetContainerFromPrefs(*prefs_, used_container->id)) {
++      SetLocallyUsedContainerToPrefs(container, *prefs_);
++    } else {
++      // A container may be absent from the synced list if it was deleted. We
++      // don't remove the used-container snapshot in this case here. It will be
++      // removed with a separate cleanup logic later.
++    }
++  }
++}
++
++std::optional<std::string>
++ContainersService::GetContainerIdFromContainerSpecifier(
++    const ContainerSpecifier& container_specifier) const {
++  if (auto* container_id = std::get_if<ContainerId>(&container_specifier)) {
++    if (auto runtime_container =
++            GetRuntimeContainerById(container_id->value())) {
++      return runtime_container->id;
++    }
++    LOG(WARNING) << "Container with id " << container_id->value()
++                 << " not found";
++  } else if (auto* container_name =
++                 std::get_if<ContainerName>(&container_specifier)) {
++    if (auto runtime_container =
++            GetRuntimeContainerByName(container_name->value())) {
++      return runtime_container->id;
++    }
++    LOG(WARNING) << "Container with name " << container_name->value()
++                 << " not found";
++  }
++  return std::nullopt;
++}
++
++void ContainersService::ScheduleOrphanedContainersCleanup() {
++  if (is_off_the_record_) {
++    return;
++  }
++
++  if (orphaned_cleanup_state_ != OrphanedContainersCleanupState::kIdle) {
++    return;
++  }
++
++  bool should_cleanup = false;
++
++  // Check if any locally used container is not referenced by the synced
++  // containers list. If so, schedule the cleanup.
++  const auto& synced_containers = GetContainersFromPrefs(*prefs_);
++  for (const auto& locally_used_container :
++       GetLocallyUsedContainersFromPrefs(*prefs_)) {
++    const std::string& id = locally_used_container->id;
++    if (std::ranges::any_of(synced_containers,
++                            [&](const auto& c) { return c->id == id; })) {
++      continue;
++    }
++
++    should_cleanup = true;
++    break;
++  }
++
++  // If any locally used container is not referenced by the synced containers
++  // list, schedule the cleanup.
++  if (should_cleanup) {
++    orphaned_cleanup_state_ =
++        OrphanedContainersCleanupState::kDiscoveringOrphans;
++    delegate_->GetReferencedContainerIds(
++        base::BindOnce(&ContainersService::OnReferencedContainerIdsReady,
++                       weak_factory_.GetWeakPtr()));
++  }
++}
++
++void ContainersService::OnReferencedContainerIdsReady(
++    const base::flat_set<std::string>& referenced_container_ids) {
++  const auto& synced_containers = GetContainersFromPrefs(*prefs_);
++  for (const auto& locally_used_container :
++       GetLocallyUsedContainersFromPrefs(*prefs_)) {
++    const std::string& id = locally_used_container->id;
++    if (std::ranges::any_of(synced_containers,
++                            [&](const auto& c) { return c->id == id; }) ||
++        referenced_container_ids.contains(id)) {
++      continue;
++    }
++
++    orphaned_containers_pending_removal_.insert(id);
++    delegate_->DeleteContainerStorage(
++        id, base::BindOnce(&ContainersService::OnContainerStorageDeleted,
++                           weak_factory_.GetWeakPtr(), id));
++  }
++
++  if (orphaned_containers_pending_removal_.empty()) {
++    orphaned_cleanup_state_ = OrphanedContainersCleanupState::kIdle;
++  } else {
++    orphaned_cleanup_state_ = OrphanedContainersCleanupState::kRemovingOrphans;
++  }
++}
++
++void ContainersService::OnContainerStorageDeleted(const std::string& id,
++                                                  bool success) {
++  orphaned_containers_pending_removal_.erase(id);
++  if (orphaned_containers_pending_removal_.empty()) {
++    orphaned_cleanup_state_ = OrphanedContainersCleanupState::kIdle;
++  }
++
++  if (!success) {
++    LOG(WARNING) << "Failed to delete container storage for " << id
++                 << " will retry on next launch";
++    return;
++  }
++
++  // If the container did not reappear in the synced containers list, remove the
++  // used-container snapshot from the prefs to forget about it forever.
++  if (!GetContainerFromPrefs(*prefs_, id)) {
++    RemoveLocallyUsedContainerFromPrefs(id, *prefs_);
++  }
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/core/browser/containers_service.h
+@@ -0,0 +1,141 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_BROWSER_CONTAINERS_SERVICE_H_
++#define COMPONENTS_CONTAINERS_CORE_BROWSER_CONTAINERS_SERVICE_H_
++
++#include <memory>
++#include <string>
++#include <string_view>
++
++#include "base/containers/flat_set.h"
++#include "base/functional/callback.h"
++#include "base/memory/raw_ref.h"
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "components/containers/core/browser/container_specifier.h"
++#include "components/containers/core/browser/containers_service_observer.h"
++#include "components/containers/core/mojom/containers.mojom-forward.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "components/prefs/pref_change_registrar.h"
++
++class PrefService;
++
++namespace containers {
++
++// Handles container-related operations.
++class ContainersService : public KeyedService {
++ public:
++  class Delegate {
++   public:
++    virtual ~Delegate() = default;
++
++    using OnReferencedContainerIdsReadyCallback =
++        base::OnceCallback<void(const base::flat_set<std::string>&)>;
++    using DeleteContainerStorageCallback =
++        base::OnceCallback<void(bool success)>;
++
++    // Returns the container ids referenced by tab restore, session service and
++    // currently opened tabs.
++    virtual void GetReferencedContainerIds(
++        OnReferencedContainerIdsReadyCallback callback) = 0;
++
++    // Deletes the storage for the container with the given id.
++    virtual void DeleteContainerStorage(
++        const std::string& id,
++        DeleteContainerStorageCallback callback) = 0;
++  };
++
++  ContainersService(PrefService* prefs,
++                    bool is_off_the_record,
++                    std::unique_ptr<Delegate> delegate);
++  ~ContainersService() override;
++
++  ContainersService(const ContainersService&) = delete;
++  ContainersService& operator=(const ContainersService&) = delete;
++
++  void Shutdown() override;
++
++  void AddObserver(ContainersServiceObserver* observer);
++  void RemoveObserver(ContainersServiceObserver* observer);
++
++  // Caches a used-container snapshot: synced metadata when the id exists in
++  // the synced list, otherwise a placeholder from `CreateUnknownContainer`.
++  void MarkContainerUsed(std::string_view container_id);
++
++  // Creates a temporary container and persists it locally.
++  mojom::ContainerPtr CreateAndPersistTemporaryContainer();
++
++  // Returns the temporary container named `name`, creating and persisting it
++  // if there isn't one yet. Containers that aren't temporary are never
++  // returned, so a synced container sharing the name doesn't turn a request
++  // for a temporary container into a regular one. `name` must not be empty;
++  // use `CreateAndPersistTemporaryContainer` to get a generated name.
++  mojom::ContainerPtr GetOrCreateTemporaryContainerByName(
++      std::string_view name);
++
++  // Returns the runtime container with the given `id`. Runtime containers are
++  // containers that are currently in use by the user. This can be a synced
++  // container or a removed, but still used container.
++  mojom::ContainerPtr GetRuntimeContainerById(std::string_view id) const;
++
++  // Returns the runtime container with the given `name`.
++  mojom::ContainerPtr GetRuntimeContainerByName(std::string_view name) const;
++
++  // Returns the list of user-editable containers.
++  std::vector<mojom::ContainerPtr> GetContainers() const;
++
++  // Returns ids of containers that have been used in this profile. Empty while
++  // orphaned-container cleanup is discovering candidates.
++  std::vector<std::string> GetUsedContainerIds() const;
++
++  // Whether the Containers controls (menus, management UI) should be shown.
++  bool ShouldShowContainerControls() const;
++
++  // Returns the container id for the given container specifier.
++  std::optional<std::string> GetContainerIdFromContainerSpecifier(
++      const ContainerSpecifier& container_specifier) const;
++
++  void ScheduleOrphanedContainersCleanupForTesting();
++
++ private:
++  // Called when the synced containers list changes.
++  void OnSyncedContainersChanged();
++
++  // Refreshes used-container snapshots from the synced containers list so they
++  // do not stay stale (names, icons, etc.). This is called when the synced
++  // containers list changes.
++  void RefreshLocallyUsedContainersFromSyncedList();
++
++  // Schedules the cleanup of orphaned containers. Orphaned containers are
++  // containers that are not referenced by any tab restore or session service.
++  void ScheduleOrphanedContainersCleanup();
++
++  // Called when the container ids referenced by the current profile are ready.
++  void OnReferencedContainerIdsReady(const base::flat_set<std::string>& ids);
++
++  // Called when the storage for the container with the given id is deleted.
++  void OnContainerStorageDeleted(const std::string& id, bool success);
++
++  enum class OrphanedContainersCleanupState {
++    kIdle,
++    kDiscoveringOrphans,
++    kRemovingOrphans,
++  };
++
++  raw_ref<PrefService> prefs_;
++  const bool is_off_the_record_;
++  std::unique_ptr<Delegate> delegate_;
++  PrefChangeRegistrar pref_change_registrar_;
++  base::ObserverList<ContainersServiceObserver> observers_;
++  OrphanedContainersCleanupState orphaned_cleanup_state_ =
++      OrphanedContainersCleanupState::kIdle;
++  base::flat_set<std::string> orphaned_containers_pending_removal_;
++  base::WeakPtrFactory<ContainersService> weak_factory_{this};
++};
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CORE_BROWSER_CONTAINERS_SERVICE_H_
+--- /dev/null
++++ b/components/containers/core/browser/containers_service_observer.h
+@@ -0,0 +1,23 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_BROWSER_CONTAINERS_SERVICE_OBSERVER_H_
++#define COMPONENTS_CONTAINERS_CORE_BROWSER_CONTAINERS_SERVICE_OBSERVER_H_
++
++#include "base/observer_list_types.h"
++
++namespace containers {
++
++// Observes `ContainersService` for changes to the user-editable containers list
++// (backed by prefs).
++class ContainersServiceObserver : public base::CheckedObserver {
++ public:
++  // Called when the synced containers list pref changes.
++  virtual void OnContainersListChanged() {}
++};
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CORE_BROWSER_CONTAINERS_SERVICE_OBSERVER_H_
+--- /dev/null
++++ b/components/containers/core/browser/containers_settings_handler.cc
+@@ -0,0 +1,187 @@
++// Copyright (c) 2025 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/core/browser/containers_settings_handler.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/uuid.h"
++#include "components/containers/core/browser/pref_names.h"
++#include "components/containers/core/browser/prefs.h"
++#include "components/prefs/pref_service.h"
++#include "third_party/abseil-cpp/absl/container/flat_hash_map.h"
++#include "third_party/re2/src/re2/re2.h"
++
++namespace containers {
++
++namespace {
++
++// Returns true if the container name is valid.
++bool IsContainerNameValid(std::string_view name) {
++  // A string that is not empty and does not contain only whitespace.
++  return re2::RE2::FullMatch(name, re2::RE2("^.*\\S.*$"));
++}
++
++bool IsIconValid(mojom::Icon icon) {
++  // Valid icons are in the range of defined mojom::Icon values.
++  return icon >= mojom::Icon::kMinValue && icon <= mojom::Icon::kMaxValue;
++}
++
++bool IsBackgroundColorValid(SkColor color) {
++  return SkColorGetA(color) == SK_AlphaOPAQUE;
++}
++
++}  // namespace
++
++ContainersSettingsHandler::ContainersSettingsHandler(PrefService* prefs)
++    : prefs_(prefs) {
++  DCHECK(prefs_);
++  pref_change_registrar_.Init(prefs);
++  // Watch for external changes to containers list (e.g. sync, other windows)
++  pref_change_registrar_.Add(
++      prefs::kContainersList,
++      base::BindRepeating(&ContainersSettingsHandler::OnContainersChanged,
++                          base::Unretained(this)));
++}
++
++ContainersSettingsHandler::~ContainersSettingsHandler() {}
++
++void ContainersSettingsHandler::BindUI(
++    mojo::PendingRemote<mojom::ContainersSettingsUI> ui) {
++  DCHECK(!ui_);
++  ui_.Bind(std::move(ui));
++}
++
++void ContainersSettingsHandler::GetContainers(GetContainersCallback callback) {
++  std::move(callback).Run(GetContainersFromPrefs(*prefs_));
++}
++
++void ContainersSettingsHandler::AddContainer(mojom::ContainerPtr container,
++                                             AddContainerCallback callback) {
++  if (!container->id.empty()) {
++    std::move(callback).Run(mojom::ContainerOperationError::kIdShouldBeEmpty);
++    return;
++  }
++
++  if (auto error = ValidateEditableContainerProperties(container)) {
++    std::move(callback).Run(*error);
++    return;
++  }
++
++  auto containers = GetContainersFromPrefs(*prefs_);
++  container->id = base::Uuid::GenerateRandomV4().AsLowercaseString();
++  containers.push_back(std::move(container));
++  SetContainersToPrefs(std::move(containers), *prefs_);
++  std::move(callback).Run(std::nullopt);
++}
++
++void ContainersSettingsHandler::UpdateContainer(
++    mojom::ContainerPtr container,
++    UpdateContainerCallback callback) {
++  if (container->id.empty()) {
++    std::move(callback).Run(mojom::ContainerOperationError::kIdShouldBeSet);
++    return;
++  }
++
++  if (auto error = ValidateEditableContainerProperties(container)) {
++    std::move(callback).Run(*error);
++    return;
++  }
++
++  auto containers = GetContainersFromPrefs(*prefs_);
++  auto it = std::ranges::find(containers, container->id, &mojom::Container::id);
++  if (it == containers.end()) {
++    std::move(callback).Run(mojom::ContainerOperationError::kNotFound);
++    return;
++  }
++  *it = std::move(container);
++  SetContainersToPrefs(std::move(containers), *prefs_);
++  std::move(callback).Run(std::nullopt);
++}
++
++void ContainersSettingsHandler::RemoveContainer(
++    const std::string& id,
++    RemoveContainerCallback callback) {
++  if (id.empty()) {
++    std::move(callback).Run(mojom::ContainerOperationError::kIdShouldBeSet);
++    return;
++  }
++
++  auto containers = GetContainersFromPrefs(*prefs_);
++  auto it = std::ranges::find(containers, id, &mojom::Container::id);
++  if (it == containers.end()) {
++    std::move(callback).Run(mojom::ContainerOperationError::kNotFound);
++    return;
++  }
++
++  containers.erase(it);
++  SetContainersToPrefs(std::move(containers), *prefs_);
++
++  std::move(callback).Run(std::nullopt);
++}
++
++void ContainersSettingsHandler::ReorderContainers(
++    const std::vector<std::string>& ordered_ids,
++    ReorderContainersCallback callback) {
++  auto containers = GetContainersFromPrefs(*prefs_);
++  if (ordered_ids.size() != containers.size()) {
++    std::move(callback).Run(mojom::ContainerOperationError::kNotFound);
++    return;
++  }
++
++  absl::flat_hash_map<std::string, size_t> order_map;
++  order_map.reserve(ordered_ids.size());
++  for (size_t i = 0; i < ordered_ids.size(); ++i) {
++    order_map.emplace(ordered_ids[i], i);
++  }
++
++  if (order_map.size() != ordered_ids.size()) {
++    std::move(callback).Run(mojom::ContainerOperationError::kNotFound);
++    return;
++  }
++
++  for (const auto& container : containers) {
++    if (!order_map.contains(container->id)) {
++      std::move(callback).Run(mojom::ContainerOperationError::kNotFound);
++      return;
++    }
++  }
++
++  std::ranges::sort(containers, [&order_map](const auto& lhs, const auto& rhs) {
++    return order_map.at(lhs->id) < order_map.at(rhs->id);
++  });
++
++  SetContainersToPrefs(std::move(containers), *prefs_);
++  std::move(callback).Run(std::nullopt);
++}
++
++// static
++std::optional<mojom::ContainerOperationError>
++ContainersSettingsHandler::ValidateEditableContainerProperties(
++    const mojom::ContainerPtr& container) {
++  if (!IsContainerNameValid(container->name)) {
++    return mojom::ContainerOperationError::kInvalidName;
++  }
++
++  if (!IsIconValid(container->icon)) {
++    return mojom::ContainerOperationError::kInvalidIcon;
++  }
++
++  if (!IsBackgroundColorValid(container->background_color)) {
++    return mojom::ContainerOperationError::kInvalidBackgroundColor;
++  }
++
++  return std::nullopt;
++}
++
++void ContainersSettingsHandler::OnContainersChanged() {
++  // Notify UI about container list changes (from this window or others).
++  if (ui_) {
++    ui_->OnContainersChanged(GetContainersFromPrefs(*prefs_));
++  }
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/core/browser/containers_settings_handler.h
+@@ -0,0 +1,75 @@
++// Copyright (c) 2025 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_BROWSER_CONTAINERS_SETTINGS_HANDLER_H_
++#define COMPONENTS_CONTAINERS_CORE_BROWSER_CONTAINERS_SETTINGS_HANDLER_H_
++
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "components/containers/core/mojom/containers.mojom.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "mojo/public/cpp/bindings/remote.h"
++
++namespace containers {
++
++// Handles container management operations from the settings UI. This class
++// implements the mojom::ContainersSettingsHandler interface to process requests
++// from settings UI and manages container data persistence through prefs.
++class ContainersSettingsHandler : public mojom::ContainersSettingsHandler {
++ public:
++  explicit ContainersSettingsHandler(PrefService* prefs);
++  ~ContainersSettingsHandler() override;
++
++  ContainersSettingsHandler(const ContainersSettingsHandler&) = delete;
++  ContainersSettingsHandler& operator=(const ContainersSettingsHandler&) =
++      delete;
++
++  // mojom::SettingsPageHandler:
++  //
++  // Establishes a connection with the UI for browser -> UI notifications.
++  void BindUI(mojo::PendingRemote<mojom::ContainersSettingsUI> ui) override;
++  // Retrieves the current list of containers from preferences.
++  void GetContainers(GetContainersCallback callback) override;
++  // Creates a new container or updates an existing one.
++  void AddContainer(mojom::ContainerPtr container,
++                    AddContainerCallback callback) override;
++  // Updates an existing container.
++  void UpdateContainer(mojom::ContainerPtr container,
++                       UpdateContainerCallback callback) override;
++  // Removes a container and all its associated data. Returns async response
++  // after data cleanup is complete.
++  void RemoveContainer(const std::string& id,
++                       RemoveContainerCallback callback) override;
++  // Reorders containers to match the order of `ordered_ids`.
++  void ReorderContainers(const std::vector<std::string>& ordered_ids,
++                         ReorderContainersCallback callback) override;
++
++  // Returns an error if the given container properties are invalid.
++  static std::optional<mojom::ContainerOperationError>
++  ValidateEditableContainerProperties(const mojom::ContainerPtr& container);
++
++ private:
++  // Called when the containers list in preferences changes.
++  void OnContainersChanged();
++
++  // Interface to communicate with the settings page in the renderer.
++  mojo::Remote<mojom::ContainersSettingsUI> ui_;
++
++  // Profile preferences service for container data persistence.
++  raw_ptr<PrefService> prefs_ = nullptr;
++
++  // Watches for changes to container-related preferences.
++  PrefChangeRegistrar pref_change_registrar_;
++
++  base::WeakPtrFactory<ContainersSettingsHandler> weak_ptr_factory_{this};
++};
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CORE_BROWSER_CONTAINERS_SETTINGS_HANDLER_H_
+--- /dev/null
++++ b/components/containers/core/browser/pref_names.h
+@@ -0,0 +1,24 @@
++// Copyright (c) 2025 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_BROWSER_PREF_NAMES_H_
++#define COMPONENTS_CONTAINERS_CORE_BROWSER_PREF_NAMES_H_
++
++namespace containers::prefs {
++
++// Controls whether Containers feature (menus, management UI) is available;
++// existing container tabs are not affected when the pref is disabled.
++inline constexpr char kContainersEnabled[] = "brave.containers.enabled";
++
++// Syncable list of containers.
++inline constexpr char kContainersList[] = "brave.containers.list";
++
++// Local-only dictionary of container snapshots that are still referenced by
++// this profile even if they disappear from the synced containers list.
++inline constexpr char kLocallyUsedContainers[] = "brave.containers.used";
++
++}  // namespace containers::prefs
++
++#endif  // COMPONENTS_CONTAINERS_CORE_BROWSER_PREF_NAMES_H_
+--- /dev/null
++++ b/components/containers/core/browser/prefs.cc
+@@ -0,0 +1,147 @@
++// Copyright (c) 2025 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/core/browser/prefs.h"
++
++#include <string_view>
++#include <utility>
++
++#include "base/logging.h"
++#include "components/containers/core/browser/pref_names.h"
++#include "components/containers/core/common/features.h"
++#include "components/containers/core/mojom/containers.mojom.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++
++namespace containers {
++
++namespace {
++
++mojom::ContainerPtr ContainerFromDict(const base::DictValue& dict) {
++  auto* id = dict.FindString("id");
++  auto* name = dict.FindString("name");
++  auto icon = dict.FindInt("icon");
++  auto background_color = dict.FindInt("background_color");
++  if (!id || !name || !icon.has_value() || !background_color.has_value()) {
++    LOG(ERROR) << "Container is missing id, name, icon, or background_color";
++    return nullptr;
++  }
++
++  return mojom::Container::New(*id, *name, static_cast<mojom::Icon>(*icon),
++                               *background_color);
++}
++
++base::DictValue ContainerToDict(const mojom::ContainerPtr& container) {
++  return base::DictValue()
++      .Set("id", container->id)
++      .Set("name", container->name)
++      .Set("icon", std::to_underlying(container->icon))
++      .Set("background_color", static_cast<int>(container->background_color));
++}
++
++std::vector<mojom::ContainerPtr> GetContainersFromList(
++    const base::ListValue& list) {
++  std::vector<mojom::ContainerPtr> containers;
++  for (const auto& container : list) {
++    if (!container.is_dict()) {
++      LOG(ERROR) << "Container is not a dictionary";
++      continue;
++    }
++
++    if (auto parsed = ContainerFromDict(container.GetDict())) {
++      containers.push_back(std::move(parsed));
++    }
++  }
++  return containers;
++}
++
++}  // namespace
++
++std::vector<mojom::ContainerPtr> GetContainersFromPrefs(
++    const PrefService& prefs) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  return GetContainersFromList(prefs.GetList(prefs::kContainersList));
++}
++
++mojom::ContainerPtr GetContainerFromPrefs(const PrefService& prefs,
++                                          std::string_view id) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  for (auto& container : GetContainersFromPrefs(prefs)) {
++    if (container->id == id) {
++      return std::move(container);
++    }
++  }
++  return nullptr;
++}
++
++void SetContainersToPrefs(const std::vector<mojom::ContainerPtr>& containers,
++                          PrefService& prefs) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  prefs.SetList(prefs::kContainersList,
++                ConvertContainersToListValue(containers));
++}
++
++std::vector<mojom::ContainerPtr> GetLocallyUsedContainersFromPrefs(
++    const PrefService& prefs) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  std::vector<mojom::ContainerPtr> containers;
++  for (const auto item : prefs.GetDict(prefs::kLocallyUsedContainers)) {
++    if (!item.second.is_dict()) {
++      LOG(ERROR) << "Used container snapshot is not a dictionary";
++      continue;
++    }
++
++    if (auto parsed = ContainerFromDict(item.second.GetDict())) {
++      containers.push_back(std::move(parsed));
++    }
++  }
++  return containers;
++}
++
++mojom::ContainerPtr GetLocallyUsedContainerFromPrefs(const PrefService& prefs,
++                                                     std::string_view id) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  if (const auto* value =
++          prefs.GetDict(prefs::kLocallyUsedContainers).FindDict(id)) {
++    return ContainerFromDict(*value);
++  }
++  return nullptr;
++}
++
++void SetLocallyUsedContainerToPrefs(const mojom::ContainerPtr& container,
++                                    PrefService& prefs) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  CHECK(container);
++  ScopedDictPrefUpdate update(&prefs, prefs::kLocallyUsedContainers);
++  update->Set(container->id, ContainerToDict(container));
++}
++
++bool HasLocallyUsedContainerInPrefs(const PrefService& prefs,
++                                    std::string_view id) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  return prefs.GetDict(prefs::kLocallyUsedContainers).contains(id);
++}
++
++void RemoveLocallyUsedContainerFromPrefs(std::string_view id,
++                                         PrefService& prefs) {
++  CHECK(base::FeatureList::IsEnabled(features::kContainers));
++  if (!prefs.GetDict(prefs::kLocallyUsedContainers).contains(id)) {
++    return;
++  }
++
++  ScopedDictPrefUpdate update(&prefs, prefs::kLocallyUsedContainers);
++  update->Remove(id);
++}
++
++base::ListValue ConvertContainersToListValue(
++    const std::vector<mojom::ContainerPtr>& containers) {
++  base::ListValue list;
++  for (const auto& container : containers) {
++    list.Append(ContainerToDict(container));
++  }
++  return list;
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/core/browser/prefs.h
+@@ -0,0 +1,59 @@
++// Copyright (c) 2025 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_BROWSER_PREFS_H_
++#define COMPONENTS_CONTAINERS_CORE_BROWSER_PREFS_H_
++
++#include <string_view>
++#include <vector>
++
++#include "base/values.h"
++#include "components/containers/core/mojom/containers.mojom-forward.h"
++
++class PrefService;
++
++namespace containers {
++
++// Returns the list of containers stored in preferences.
++std::vector<mojom::ContainerPtr> GetContainersFromPrefs(
++    const PrefService& prefs);
++
++// Returns the container with `id` from the synced containers preferences, or a
++// null mojom::ContainerPtr if it is not present.
++mojom::ContainerPtr GetContainerFromPrefs(const PrefService& prefs,
++                                          std::string_view id);
++
++// Stores the provided list of containers in preferences.
++void SetContainersToPrefs(const std::vector<mojom::ContainerPtr>& containers,
++                          PrefService& prefs);
++
++// Returns the list of locally used containers.
++std::vector<mojom::ContainerPtr> GetLocallyUsedContainersFromPrefs(
++    const PrefService& prefs);
++
++// Returns the locally used container snapshot with `id`, or a null
++// mojom::ContainerPtr if it is not present.
++mojom::ContainerPtr GetLocallyUsedContainerFromPrefs(const PrefService& prefs,
++                                                     std::string_view id);
++
++// Upserts a locally used container snapshot.
++void SetLocallyUsedContainerToPrefs(const mojom::ContainerPtr& container,
++                                    PrefService& prefs);
++
++// Returns true if a locally used container snapshot is present.
++bool HasLocallyUsedContainerInPrefs(const PrefService& prefs,
++                                    std::string_view id);
++
++// Removes a locally used container snapshot.
++void RemoveLocallyUsedContainerFromPrefs(std::string_view id,
++                                         PrefService& prefs);
++
++// Converts a list of containers to a base::ListValue.
++base::ListValue ConvertContainersToListValue(
++    const std::vector<mojom::ContainerPtr>& containers);
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CORE_BROWSER_PREFS_H_
+--- /dev/null
++++ b/components/containers/core/browser/prefs_registration.cc
+@@ -0,0 +1,38 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/core/browser/prefs_registration.h"
++
++#include "base/metrics/field_trial_params.h"
++#include "base/version_info/channel.h"
++#include "components/containers/core/browser/pref_names.h"
++#include "components/containers/core/browser/prefs.h"
++#include "components/containers/core/common/features.h"
++#include "components/pref_registry/pref_registry_syncable.h"
++
++namespace containers {
++
++namespace {
++
++bool GetContainersEnabledPrefDefault(version_info::Channel channel) {
++  // Neon: the controls are on by default on every channel.
++  const bool enabled_by_default = true;
++  return base::GetFieldTrialParamByFeatureAsBool(
++      features::kContainers, "enabled_by_default", enabled_by_default);
++}
++
++}  // namespace
++
++void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry,
++                          version_info::Channel channel) {
++  registry->RegisterBooleanPref(prefs::kContainersEnabled,
++                                GetContainersEnabledPrefDefault(channel));
++  // Neon: no default containers (spaces creates its own), and the list is a
++  // local pref until Neon decides how containers sync.
++  registry->RegisterListPref(prefs::kContainersList);
++  registry->RegisterDictionaryPref(prefs::kLocallyUsedContainers);
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/core/browser/prefs_registration.h
+@@ -0,0 +1,24 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_BROWSER_PREFS_REGISTRATION_H_
++#define COMPONENTS_CONTAINERS_CORE_BROWSER_PREFS_REGISTRATION_H_
++
++#include "base/version_info/channel.h"
++
++namespace user_prefs {
++class PrefRegistrySyncable;
++}
++
++namespace containers {
++
++// Registers container-related preferences with the profile's preference system.
++void RegisterProfilePrefs(
++    user_prefs::PrefRegistrySyncable* registry,
++    version_info::Channel channel = version_info::Channel::UNKNOWN);
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CORE_BROWSER_PREFS_REGISTRATION_H_
+--- /dev/null
++++ b/components/containers/core/browser/temporary_container.cc
+@@ -0,0 +1,87 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/core/browser/temporary_container.h"
++
++#include <array>
++#include <optional>
++#include <string>
++
++#include "base/check.h"
++#include "base/rand_util.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/uuid.h"
++#include "components/containers/core/mojom/containers.mojom-shared.h"
++#include "components/containers/core/mojom/containers.mojom.h"
++#include "third_party/skia/include/core/SkColor.h"
++
++namespace containers {
++namespace {
++
++// Generates a random temporary container name. Neon: Brave builds the name from
++// two BIP39 mnemonic words; Neon does not ship the BIP39 word list and uses a
++// short random hex suffix instead.
++std::string GenerateTemporaryContainerName() {
++  std::array<uint8_t, 2> entropy;
++  base::RandBytes(entropy);
++  return base::StrCat({"Temporary ", base::HexEncodeLower(entropy)});
++}
++
++// Picks a random container icon from the available icons.
++mojom::Icon PickTemporaryContainerIcon() {
++  static constexpr auto kIconIds = std::to_array({
++      mojom::Icon::kPersonal,
++      mojom::Icon::kWork,
++      mojom::Icon::kShopping,
++      mojom::Icon::kSocial,
++      mojom::Icon::kEvents,
++      mojom::Icon::kBanking,
++      mojom::Icon::kStar,
++      mojom::Icon::kTravel,
++      mojom::Icon::kSchool,
++      mojom::Icon::kPrivate,
++      mojom::Icon::kMessaging,
++  });
++  return base::RandomChoice(kIconIds);
++}
++
++// Picks a random container background color from the available colors.
++SkColor PickTemporaryContainerBackground() {
++  // Neon: Brave picks from its Nala palette (red, orange, yellow, green, teal,
++  // blue, purple, pink at the 60 level). Neon does not ship Nala and uses fixed
++  // approximations of the same hues.
++  static constexpr auto kBackgroundColors = std::to_array<SkColor>({
++      SkColorSetRGB(0xD9, 0x30, 0x25),
++      SkColorSetRGB(0xE3, 0x74, 0x1F),
++      SkColorSetRGB(0xC9, 0x9A, 0x06),
++      SkColorSetRGB(0x2E, 0x9E, 0x4F),
++      SkColorSetRGB(0x14, 0x95, 0x8E),
++      SkColorSetRGB(0x2F, 0x6B, 0xE0),
++      SkColorSetRGB(0x8A, 0x4F, 0xD6),
++      SkColorSetRGB(0xD9, 0x3F, 0x8C),
++  });
++  return base::RandomChoice(kBackgroundColors);
++}
++
++}  // namespace
++
++bool IsTemporaryContainerId(std::string_view container_id) {
++  // Temporary container ids are prefixed with "t-" and should have the actual
++  // id after the prefix.
++  return container_id.size() > kTemporaryContainerIdPrefix.size() &&
++         container_id.starts_with(kTemporaryContainerIdPrefix);
++}
++
++mojom::ContainerPtr CreateTemporaryContainer(
++    std::optional<std::string_view> name) {
++  return mojom::Container::New(
++      base::StrCat({kTemporaryContainerIdPrefix,
++                    base::Uuid::GenerateRandomV4().AsLowercaseString()}),
++      name ? std::string(*name) : GenerateTemporaryContainerName(),
++      PickTemporaryContainerIcon(), PickTemporaryContainerBackground());
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/core/browser/temporary_container.h
+@@ -0,0 +1,30 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_BROWSER_TEMPORARY_CONTAINER_H_
++#define COMPONENTS_CONTAINERS_CORE_BROWSER_TEMPORARY_CONTAINER_H_
++
++#include <optional>
++#include <string_view>
++
++#include "components/containers/core/mojom/containers.mojom-forward.h"
++
++namespace containers {
++
++// Prefix for temporary container ids.
++inline constexpr std::string_view kTemporaryContainerIdPrefix = "t-";
++
++// Checks if a given container id is a temporary container id.
++bool IsTemporaryContainerId(std::string_view container_id);
++
++// Builds a temporary container (`t-` prefixed container id, random icon,
++// random background color). Uses `name` when given, otherwise generates a
++// BIP-39 two-word name.
++mojom::ContainerPtr CreateTemporaryContainer(
++    std::optional<std::string_view> name = std::nullopt);
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CORE_BROWSER_TEMPORARY_CONTAINER_H_
+--- /dev/null
++++ b/components/containers/core/browser/unknown_container.cc
+@@ -0,0 +1,22 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/core/browser/unknown_container.h"
++
++#include <string>
++
++#include "components/containers/core/mojom/containers.mojom.h"
++
++namespace containers {
++
++mojom::ContainerPtr CreateUnknownContainer(std::string_view container_id) {
++  // Use first 8 characters of the container ID as the name.
++  std::string_view name = container_id.substr(0, 8);
++  return mojom::Container::New(std::string(container_id), std::string(name),
++                               mojom::Icon::kDefault,
++                               kUnknownContainerBackgroundColor);
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/core/browser/unknown_container.h
+@@ -0,0 +1,28 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_BROWSER_UNKNOWN_CONTAINER_H_
++#define COMPONENTS_CONTAINERS_CORE_BROWSER_UNKNOWN_CONTAINER_H_
++
++#include <string_view>
++
++#include "components/containers/core/mojom/containers.mojom-forward.h"
++#include "third_party/skia/include/core/SkColor.h"
++
++namespace containers {
++
++// Background color to represent an unknown container.
++inline constexpr SkColor kUnknownContainerBackgroundColor =
++    SkColorSetRGB(0xb7, 0x4d, 0x49);
++
++// Builds an "unknown" Container for the given `container_id`. The unknown
++// container is a placeholder for a container that is not present in the synced
++// and locally used lists. This exists to handle unknown containers gracefully
++// at runtime.
++mojom::ContainerPtr CreateUnknownContainer(std::string_view container_id);
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CORE_BROWSER_UNKNOWN_CONTAINER_H_
+--- /dev/null
++++ b/components/containers/core/common/BUILD.gn
+@@ -0,0 +1,30 @@
++# Copyright (c) 2025 The Brave Authors. All rights reserved.
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this file,
++# You can obtain one at https://mozilla.org/MPL/2.0/.
++
++import("//components/containers/buildflags/buildflags.gni")
++
++assert(enable_containers)
++
++component("features") {
++  defines = [ "IS_CONTAINERS_FEATURES_IMPL" ]
++
++  sources = [
++    "features.cc",
++    "features.h",
++  ]
++
++  deps = [ "//base" ]
++}
++
++source_set("switches") {
++  sources = [ "switches.h" ]
++}
++
++group("common") {
++  public_deps = [
++    ":features",
++    ":switches",
++  ]
++}
+--- /dev/null
++++ b/components/containers/core/common/features.cc
+@@ -0,0 +1,14 @@
++// Copyright (c) 2025 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/core/common/features.h"
++
++namespace containers::features {
++
++// Enable Container Tabs. Allows users to open websites in contained tabs,
++// keeping different identities separate within the same browser profile.
++BASE_FEATURE(kContainers, base::FEATURE_ENABLED_BY_DEFAULT);
++
++}  // namespace containers::features
+--- /dev/null
++++ b/components/containers/core/common/features.h
+@@ -0,0 +1,18 @@
++// Copyright (c) 2025 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_COMMON_FEATURES_H_
++#define COMPONENTS_CONTAINERS_CORE_COMMON_FEATURES_H_
++
++#include "base/component_export.h"
++#include "base/feature_list.h"
++
++namespace containers::features {
++
++COMPONENT_EXPORT(CONTAINERS_FEATURES) BASE_DECLARE_FEATURE(kContainers);
++
++}  // namespace containers::features
++
++#endif  // COMPONENTS_CONTAINERS_CORE_COMMON_FEATURES_H_
+--- /dev/null
++++ b/components/containers/core/common/switches.h
+@@ -0,0 +1,21 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CORE_COMMON_SWITCHES_H_
++#define COMPONENTS_CONTAINERS_CORE_COMMON_SWITCHES_H_
++
++namespace containers::switches {
++
++// Specifies the container to use for the tabs passed on the command line. On
++// its own it resolves an existing container by name; with `kTemporaryContainer`
++// it names the temporary container instead.
++inline constexpr char kContainer[] = "container";
++
++// Opens the tabs passed on the command line in a temporary container.
++inline constexpr char kTemporaryContainer[] = "temporary-container";
++
++}  // namespace containers::switches
++
++#endif  // COMPONENTS_CONTAINERS_CORE_COMMON_SWITCHES_H_
+--- /dev/null
++++ b/components/containers/core/mojom/BUILD.gn
+@@ -0,0 +1,19 @@
++# Copyright (c) 2025 The Brave Authors. All rights reserved.
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this file,
++# You can obtain one at https://mozilla.org/MPL/2.0/.
++
++import("//components/containers/buildflags/buildflags.gni")
++import("//mojo/public/tools/bindings/mojom.gni")
++
++assert(enable_containers)
++
++mojom("mojom") {
++  sources = [ "containers.mojom" ]
++
++  deps = [ "//mojo/public/mojom/base" ]
++
++  public_deps = [ "//skia/public/mojom" ]
++
++  webui_module_path = "/"
++}
+--- /dev/null
++++ b/components/containers/core/mojom/containers.mojom
+@@ -0,0 +1,99 @@
++// Copyright (c) 2025 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++module containers.mojom;
++
++import "skia/public/mojom/skcolor.mojom";
++
++// Represents the icons that can be used for containers. These icons are
++// used to visually distinguish different containers in the user interface.
++//
++// IMPORTANT: The values of these icons are stored in preferences, so they
++// should not be changed or reordered. If a new icon is added, it should be
++// appended to the end of the enum. When removing an icon, it should be
++// suffixed with "_DEPRECATED" to maintain compatibility with existing preferences.
++enum Icon {
++  kPersonal = 0,
++  kWork = 1,
++  kShopping = 2,
++  kSocial = 3,
++  kEvents = 4,
++  kBanking = 5,
++  kStar = 6,
++  kTravel = 7,
++  kSchool = 8,
++  kPrivate = 9,
++  kMessaging = 10,
++
++  kDefault = kPersonal,  // Default icon used when no specific icon is set.
++};
++
++// Represents a container that holds a separate browsing context/identity.
++// Containers allow users to maintain different identities within the same
++// browser profile, keeping cookies, storage, and other site data separate
++// between containers.
++struct Container {
++  // Unique identifier for the container.
++  string id;
++  // User-friendly name for the container.
++  string name;
++  // User-friendly icon for the container.
++  Icon icon;
++  // Background color for the container icon.
++  skia.mojom.SkColor background_color;
++};
++
++// Represents an error that occurred during a container CRUD operation.
++enum ContainerOperationError {
++  // The container ID is set, but the operation expects it to be empty.
++  kIdShouldBeEmpty = 1,
++  // The container ID is not set, but the operation expects it to be non-empty.
++  kIdShouldBeSet,
++  // The container name is invalid.
++  kInvalidName,
++  // The container icon is invalid.
++  kInvalidIcon,
++  // The container background color is invalid.
++  kInvalidBackgroundColor,
++  // The container was not found.
++  kNotFound,
++};
++
++// Interface for settings UI -> browser communication. This interface allows the
++// settings UI to perform CRUD operations on containers, with all operations
++// being handled in the browser process.
++interface ContainersSettingsHandler {
++  // Establishes a connection with the UI for browser -> UI notifications. This
++  // creates a 1-to-1 connection between the handler and the settings UI.
++  BindUI(pending_remote<ContainersSettingsUI> ui);
++
++  // Retrieves the current list of containers. Returns: Array of all configured
++  // containers
++  GetContainers() => (array<Container> containers);
++
++  // Creates a new container.
++  AddContainer(Container container) => (ContainerOperationError? error);
++
++  // Updates an existing container.
++  UpdateContainer(Container container) => (ContainerOperationError? error);
++
++  // Removes a container by its ID.
++  RemoveContainer(string id) => (ContainerOperationError? error);
++
++  // Reorders containers to match the order of `ordered_ids`. `ordered_ids`
++  // must contain exactly the same set of ids as the current containers list.
++  ReorderContainers(array<string> ordered_ids) =>
++      (ContainerOperationError? error);
++};
++
++// Interface for browser -> settings UI communication. This interface allows the
++// browser process to notify the settings UI about changes to the containers
++// list.
++interface ContainersSettingsUI {
++  // Notifies the settings UI when the containers list is modified. This ensures
++  // the UI stays in sync with the browser-side container state.
++  // - `containers`: Updated list of all containers.
++  OnContainersChanged(array<Container> containers);
++};
