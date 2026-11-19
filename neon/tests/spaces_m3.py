@@ -24,7 +24,7 @@ Keys and clicks go through XTEST with xdotool.
 
 What is observed, without test hooks in the browser:
 
-- Every test page has a solid 16x16 favicon in its space's colour (default green, A red, B blue).
+- Every test page has a solid 16x16 favicon in its space's colour (the first space D green, A red, B blue).
   Frames of the sidebar are grabbed every half millisecond or so while a move runs; the favicons
   of each colour give each page's position: all tabs of a page share one x, the two pages are one
   page width apart, and each tab sits at its row's height.
@@ -45,7 +45,7 @@ Phases:
    expand on hover, and a resized sidebar, each with an animated switch.
 4. drag: dragging a tab within the visible space reorders it, and dropping it past the end of the
    space keeps it in the space. Shift-click range selection and Ctrl+Shift+PgDn stay in the space.
-5. stock: with only the default space the sidebar is pixel for pixel M2's stock sidebar.
+5. stock: with a single space the sidebar is pixel for pixel M2's stock sidebar.
 
 Needs python3-websocket, python3-pil, xdotool, Xorg with the dummy and inputtest drivers (all in
 the dev image).
@@ -77,7 +77,7 @@ DEFAULT, SPACE_A, SPACE_B = m2.DEFAULT, m2.SPACE_A, m2.SPACE_B
 COLORS = dict(m2.COLORS)
 COLORS['Y'] = (230, 200, 0)   # a marked tab for the drag checks
 HEX = {k: '%02x%02x%02x' % v for k, v in COLORS.items()}
-SPACE_COLOR = {'default': 'D', SPACE_A['id']: 'A', SPACE_B['id']: 'B'}
+SPACE_COLOR = {DEFAULT['id']: 'D', SPACE_A['id']: 'A', SPACE_B['id']: 'B'}
 ORDER = ['D', 'A', 'B']
 
 SCREEN = (1280, 900)
@@ -1082,10 +1082,12 @@ def phase_drag(ctx):
 
 def phase_stock(ctx):
     print('== stock', flush=True)
-    b = start(ctx, 'stock', prefs_for([DEFAULT]), '--container=Alpha', url(ctx, 'a1', 'A'))
+    # One space. (Since M5 a tab opened in a container that no space uses is reopened in the
+    # space, see spaces_m2.py; the pages here only differ by their favicon colour.)
+    b = start(ctx, 'stock', prefs_for([DEFAULT]), url(ctx, 'a1', 'A'))
     m1.find_page(b, 'n=a1').wait_loaded('n=a1')
     ctx.window = find_window(ctx, 'a1')
-    b.remote('--container=Beta', url(ctx, 'b1', 'B'))
+    b.remote(url(ctx, 'b1', 'B'))
     m1.find_page(b, 'n=b1').wait_loaded('n=b1')
     b.remote(url(ctx, 'd1', 'D'))
     m1.find_page(b, 'n=d1').wait_loaded('n=d1')
