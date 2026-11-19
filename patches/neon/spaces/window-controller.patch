@@ -14,6 +14,8 @@ Neon code, GPL-3.0.
 
 M1b: the spaces commands start at 39500. They used Chromium's focus command
 ids, so Ctrl+L, Alt+D and F6 switched space instead of focusing the omnibox.
+A popup window without an opener (an extension's chrome.windows.create popup)
+opens on the space of the last active window, as a new window does.
 
 --- a/chrome/browser/BUILD.gn
 +++ b/chrome/browser/BUILD.gn
@@ -317,7 +319,7 @@ ids, so Ctrl+L, Alt+D and F6 switched space instead of focusing the omnibox.
 +#endif  // CHROME_BROWSER_UI_NEON_SPACES_SPACE_TAB_FILTER_H_
 --- /dev/null
 +++ b/chrome/browser/ui/neon/spaces/spaces_window_controller.cc
-@@ -0,0 +1,441 @@
+@@ -0,0 +1,466 @@
 +// Copyright 2026 The Neon Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -431,7 +433,32 @@ ids, so Ctrl+L, Alt+D and F6 switched space instead of focusing the omnibox.
 +std::string GetContainerForNewTabIn(BrowserWindowInterface* browser) {
 +  SpacesWindowController* controller =
 +      SpacesWindowController::FromBrowser(browser);
-+  return controller ? controller->GetContainerForNewTab() : std::string();
++  if (controller) {
++    return controller->GetContainerForNewTab();
++  }
++  // A popup window opened without an opener (an extension's
++  // chrome.windows.create with type "popup", which is an app popup, often a
++  // sign-in flow) has no space of its own. It opens on the space of the last
++  // active window, as a new window does.
++  if (browser->GetType() != BrowserWindowInterface::TYPE_POPUP &&
++      browser->GetType() != BrowserWindowInterface::TYPE_APP_POPUP) {
++    return std::string();
++  }
++  std::string container_id;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [&](BrowserWindowInterface* other) {
++        SpacesWindowController* other_controller =
++            SpacesWindowController::FromBrowser(other);
++        if (!other_controller ||
++            other->GetProfile() != browser->GetProfile() ||
++            !other->GetTabStripModel() || other->GetTabStripModel()->empty()) {
++          return true;
++        }
++        container_id = other_controller->GetContainerForNewTab();
++        return false;
++      },
++      BrowserCollection::Order::kActivation);
++  return container_id;
 +}
 +
 +}  // namespace
