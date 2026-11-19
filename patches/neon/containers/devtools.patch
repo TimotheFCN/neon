@@ -1,0 +1,166 @@
+Neon containers (M6): DevTools act on the inspected tab's storage partition.
+
+- Network.clearBrowserCache clears the target's partition, not every
+  partition (content/browser/devtools/protocol/network_handler.cc).
+- Storage.getCookies, setCookies and clearCookies on a page or worker target
+  use that target's partition like the other Storage methods; the browser
+  target keeps the default one (storage_handler.cc).
+- A frame's DevTools auto-attach only to service workers of the frame's own
+  partition. The same scope can have a worker in every container, and DevTools
+  on one tab attached to all of them, so "Clear browser cookies" and "Clear
+  browser cache" in the Network panel reached other spaces
+  (frame_auto_attacher.cc).
+- "Empty cache and hard reload" (IDC_RELOAD_CLEARING_CACHE) clears the active
+  tab's partition only (chrome/browser/ui/browser_commands.cc).
+
+The three content/ hooks have no chrome/ alternative: the handlers and the
+auto-attacher are content's own, and the protocol definition is untouched.
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -199,6 +199,7 @@
+ #include "components/webapps/common/web_app_id.h"
+ #include "components/zoom/page_zoom.h"
+ #include "components/zoom/zoom_controller.h"
++#include "content/public/browser/browsing_data_filter_builder.h"
+ #include "content/public/browser/browsing_data_remover.h"
+ #include "content/public/browser/child_process_security_policy.h"
+ #include "content/public/browser/clipboard_types.h"
+@@ -207,8 +208,10 @@
+ #include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/page_navigator.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_process_host.h"
+ #include "content/public/browser/render_view_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
++#include "content/public/browser/storage_partition.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/content_switches.h"
+ #include "content/public/common/url_constants.h"
+@@ -2978,9 +2981,21 @@ void ToggleFullscreenMode(BrowserWindowI
+ void ClearCache(BrowserWindowInterface* browser) {
+   content::BrowsingDataRemover* remover =
+       browser->GetProfile()->GetBrowsingDataRemover();
+-  remover->Remove(base::Time(), base::Time::Max(),
+-                  content::BrowsingDataRemover::DATA_TYPE_CACHE,
+-                  content::BrowsingDataRemover::ORIGIN_TYPE_UNPROTECTED_WEB);
++  // Neon: only the cache of the active tab's storage partition (its space).
++  auto filter = content::BrowsingDataFilterBuilder::Create(
++      content::BrowsingDataFilterBuilder::Mode::kPreserve);
++  if (WebContents* contents =
++          browser->GetTabStripModel()->GetActiveWebContents()) {
++    filter->SetStoragePartitionConfig(contents->GetPrimaryMainFrame()
++                                          ->GetProcess()
++                                          ->GetStoragePartition()
++                                          ->GetConfig());
++  }
++  remover->RemoveWithFilter(
++      base::Time(), base::Time::Max(),
++      content::BrowsingDataRemover::DATA_TYPE_CACHE,
++      content::BrowsingDataRemover::ORIGIN_TYPE_UNPROTECTED_WEB,
++      std::move(filter));
+   // BrowsingDataRemover takes care of deleting itself when done.
+ }
+ 
+--- a/content/browser/devtools/protocol/network_handler.cc
++++ b/content/browser/devtools/protocol/network_handler.cc
+@@ -62,6 +62,7 @@
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
++#include "content/public/browser/browsing_data_filter_builder.h"
+ #include "content/public/browser/browsing_data_remover.h"
+ #include "content/public/browser/content_browser_client.h"
+ #include "content/public/browser/devtools_agent_host_client.h"
+@@ -2330,10 +2331,18 @@ void NetworkHandler::ClearBrowserCache(
+   }
+   content::BrowsingDataRemover* remover =
+       browser_context_->GetBrowsingDataRemover();
+-  remover->RemoveAndReply(
++  // Neon: clear the target's own storage partition (a container tab's), not
++  // the default one or every partition.
++  auto filter = BrowsingDataFilterBuilder::Create(
++      BrowsingDataFilterBuilder::Mode::kPreserve);
++  if (storage_partition_) {
++    filter->SetStoragePartitionConfig(storage_partition_->GetConfig());
++  }
++  remover->RemoveWithFilterAndReply(
+       base::Time(), base::Time::Max(),
+       content::BrowsingDataRemover::DATA_TYPE_CACHE,
+       content::BrowsingDataRemover::ORIGIN_TYPE_UNPROTECTED_WEB,
++      std::move(filter),
+       new DevtoolsClearCacheObserver(remover, std::move(callback)));
+ }
+ 
+--- a/content/browser/devtools/protocol/storage_handler.cc
++++ b/content/browser/devtools/protocol/storage_handler.cc
+@@ -954,6 +954,12 @@ Response StorageHandler::FindStoragePart
+     return Response::InvalidParams(
+         "browserContextId is only allowed for Browser target");
+   }
++  // Neon: a page or worker target uses its own storage partition (a container
++  // tab's), like the other Storage methods, not the default one.
++  if (!browser_context_id.has_value() && storage_partition_) {
++    *storage_partition = storage_partition_;
++    return Response::Success();
++  }
+ 
+   BrowserContext* browser_context = nullptr;
+   Response response =
+--- a/content/browser/devtools/frame_auto_attacher.cc
++++ b/content/browser/devtools/frame_auto_attacher.cc
+@@ -10,6 +10,8 @@
+ #include "content/browser/devtools/service_worker_devtools_agent_host.h"
+ #include "content/browser/renderer_host/frame_tree.h"
+ #include "content/browser/renderer_host/navigation_request.h"
++#include "content/browser/service_worker/service_worker_context_wrapper.h"
++#include "content/browser/storage_partition_impl.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/public/common/content_features.h"
+ 
+@@ -66,7 +68,8 @@ void AddEligibleHosts(const ServiceWorke
+ 
+ ServiceWorkerDevToolsAgentHost::Map GetMatchingServiceWorkers(
+     BrowserContext* browser_context,
+-    const base::flat_set<GURL>& urls) {
++    const base::flat_set<GURL>& urls,
++    StoragePartition* storage_partition) {
+   ServiceWorkerDevToolsAgentHost::Map result;
+   if (!browser_context)
+     return result;
+@@ -74,6 +77,12 @@ ServiceWorkerDevToolsAgentHost::Map GetM
+   ServiceWorkerDevToolsAgentHost::List agent_hosts;
+   ServiceWorkerDevToolsManager::GetInstance()
+       ->AddAllAgentHostsForBrowserContext(browser_context, &agent_hosts);
++  // Neon: only the workers of the frame's own storage partition. The same
++  // scope can have a worker in each partition (a container per space).
++  std::erase_if(agent_hosts, [storage_partition](const auto& host) {
++    return host->context_wrapper() &&
++           host->context_wrapper()->storage_partition() != storage_partition;
++  });
+ 
+   ScopeAgentsMap scope_agents_map;
+   GetMatchingHostsByScopeMap(agent_hosts, urls, &scope_agents_map);
+@@ -199,8 +208,9 @@ void FrameAutoAttacher::WorkerCreated(Se
+     return;
+   BrowserContext* browser_context =
+       render_frame_host_->GetProcess()->GetBrowserContext();
+-  auto hosts = GetMatchingServiceWorkers(browser_context,
+-                                         GetFrameUrls(render_frame_host_));
++  auto hosts = GetMatchingServiceWorkers(
++      browser_context, GetFrameUrls(render_frame_host_),
++      render_frame_host_->GetStoragePartition());
+   if (!hosts.contains(host->GetId())) {
+     return;
+   }
+@@ -220,8 +230,9 @@ void FrameAutoAttacher::ReattachServiceW
+   }
+   BrowserContext* browser_context =
+       render_frame_host_->GetProcess()->GetBrowserContext();
+-  auto matching = GetMatchingServiceWorkers(browser_context,
+-                                            GetFrameUrls(render_frame_host_));
++  auto matching = GetMatchingServiceWorkers(
++      browser_context, GetFrameUrls(render_frame_host_),
++      render_frame_host_->GetStoragePartition());
+   Hosts new_hosts;
+   for (const auto& pair : matching)
+     new_hosts.insert(pair.second);
