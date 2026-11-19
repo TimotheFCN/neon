@@ -30,6 +30,10 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+Neon (M1b) also keeps view source in the frame's container partition.
+Chromium, and Brave, open it in the default one, so it fetched the page with
+the default partition's cookies.
+
 --- /dev/null
 +++ b/components/containers/content/browser/BUILD.gn
 @@ -0,0 +1,54 @@
@@ -761,6 +765,28 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
        // For guests, noopener windows can be created in a new BrowsingInstance
        // as long as they preserve the guest's StoragePartition.
        site_instance =
+@@ -8925,8 +8930,20 @@ void WebContentsImpl::ViewSource(RenderF
+   new_frame_entry->SetPageState(new_page_state);
+ 
+   // Create a new WebContents, which is used to display the source code.
++  CreateParams view_source_params(GetBrowserContext());
++  // Containers: view source stays in the frame's container partition, the
++  // one that holds the page's cookies and cache.
++  const StoragePartitionConfig frame_partition_config =
++      weak_frame->GetSiteInstance()->GetSiteInfo().GetStoragePartitionConfig();
++  if (!IsGuest() &&
++      GetContentClient()->browser()->ShouldInheritStoragePartition(
++          frame_partition_config)) {
++    view_source_params.site_instance =
++        SiteInstance::CreateForFixedStoragePartition(
++            GetBrowserContext(), GURL(), frame_partition_config);
++  }
+   std::unique_ptr<WebContents> view_source_contents =
+-      Create(CreateParams(GetBrowserContext()));
++      Create(view_source_params);
+ 
+   // Restore the previously created NavigationEntry.
+   std::vector<std::unique_ptr<NavigationEntry>> navigation_entries;
 --- a/content/public/browser/content_browser_client.cc
 +++ b/content/public/browser/content_browser_client.cc
 @@ -801,6 +801,11 @@ StoragePartitionConfig ContentBrowserCli

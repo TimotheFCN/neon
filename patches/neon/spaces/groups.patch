@@ -1,0 +1,603 @@
+Neon spaces (M1b): tab groups and splits belong to one space.
+
+A tab group belongs to the space of the first tab that joined it; a tab of
+another space that ends up in it (an extension's chrome.tabs.group, for
+instance) is taken out again. A split whose tabs are in two spaces is
+unsplit, and the split view's tab picker offers only tabs of the split's
+space. Keeping a space's tabs together now moves groups and splits as whole
+blocks instead of skipping any range that holds one.
+
+A closed saved tab group reopens by URL alone, from the bookmarks bar, the
+menu or tab restore. Each window remembers, in the profile, the container of
+every open saved group, and the group's tabs reopen there instead of in the
+visible space.
+
+Neon code, GPL-3.0.
+
+--- a/chrome/browser/neon/spaces/spaces_service.cc
++++ b/chrome/browser/neon/spaces/spaces_service.cc
+@@ -55,6 +55,7 @@ void SpacesService::Shutdown() {
+ void SpacesService::RegisterProfilePrefs(
+     user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterListPref(kSpacesListPref);
++  registry->RegisterDictionaryPref(kSavedGroupContainersPref);
+ }
+ 
+ const Space* SpacesService::GetSpace(std::string_view id) const {
+--- a/chrome/browser/neon/spaces/spaces_service.h
++++ b/chrome/browser/neon/spaces/spaces_service.h
+@@ -29,6 +29,11 @@ namespace neon::spaces {
+ // Profile pref: the ordered space list, a list of Space dicts. The first entry
+ // is the default space. Local to the device, not synced.
+ inline constexpr char kSpacesListPref[] = "neon.spaces.list";
++// The container each saved tab group's tabs were in when it was last open, by
++// saved group id: a container id, or "" for the default partition. A closed
++// saved group reopens there.
++inline constexpr char kSavedGroupContainersPref[] =
++    "neon.spaces.saved_group_containers";
+ 
+ // The ordered list of spaces of a profile. Each space but the default one owns
+ // a container. A tab belongs to the space of its container, see
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -1828,7 +1828,7 @@ void NewSplitTab(BrowserWindowInterface*
+   // View NTP so default to the regular NTP which renders special content.
+   const GURL new_tab_url =
+       !browser->GetProfile()->IsPrimaryOTRProfileWithRegularParent() &&
+-              tab_strip_model->count() > 1
++              neon::spaces::CountShownTabs(tab_strip_model) > 1
+           ? GURL(chrome::kChromeUISplitViewNewTabPageURL)
+           : chrome::ChromeUINewTabURLAsGURL();
+   // Containers: the new half of the split opens in the active tab's container.
+--- a/chrome/browser/ui/neon/spaces/BUILD.gn
++++ b/chrome/browser/ui/neon/spaces/BUILD.gn
+@@ -37,9 +37,11 @@ source_set("spaces") {
+ 
+   deps = [
+     "//chrome/browser/neon:containers_api",
++    "//chrome/browser/tab_group_sync:factories",
+     "//chrome/browser/ui:browser_tabstrip",
+     "//chrome/browser/ui/helium:helium_layout_state_controller",
+     "//chrome/common",
++    "//components/saved_tab_groups/public",
+     "//components/tabs:public",
+     "//content/public/browser",
+     "//content/public/common",
+--- a/chrome/browser/ui/neon/spaces/space_tab_filter.cc
++++ b/chrome/browser/ui/neon/spaces/space_tab_filter.cc
+@@ -78,6 +78,21 @@ void SetHooksDelegate(HooksDelegate* del
+   g_delegate = delegate;
+ }
+ 
++ScopedSavedGroupOpening::ScopedSavedGroupOpening(
++    BrowserWindowInterface* browser,
++    const base::Uuid& saved_group)
++    : browser_(browser) {
++  if (g_delegate) {
++    g_delegate->SetOpeningSavedGroup(browser_, saved_group);
++  }
++}
++
++ScopedSavedGroupOpening::~ScopedSavedGroupOpening() {
++  if (g_delegate) {
++    g_delegate->SetOpeningSavedGroup(browser_, std::nullopt);
++  }
++}
++
+ bool IsTabHidden(const TabStripModel* model, const tabs::TabInterface* tab) {
+   return g_delegate && tab && g_delegate->IsTabHidden(model, tab);
+ }
+--- a/chrome/browser/ui/neon/spaces/space_tab_filter.h
++++ b/chrome/browser/ui/neon/spaces/space_tab_filter.h
+@@ -10,6 +10,8 @@
+ #include <variant>
+ 
+ #include "base/containers/span.h"
++#include "base/memory/raw_ptr.h"
++#include "base/uuid.h"
+ #include "components/tabs/public/tab_collection_types.h"
+ #include "components/tabs/public/tab_interface.h"
+ 
+@@ -62,10 +64,31 @@ class HooksDelegate {
+   // Whether |tab| is hidden in a page that shows space |space_id|.
+   virtual bool IsTabHiddenInSpace(const tabs::TabInterface* tab,
+                                   const std::string& space_id) = 0;
++  // Saved tab group |saved_group| starts (a value) or stops (std::nullopt)
++  // opening its tabs in |browser|.
++  virtual void SetOpeningSavedGroup(
++      BrowserWindowInterface* browser,
++      const std::optional<base::Uuid>& saved_group) = 0;
+ };
+ 
+ void SetHooksDelegate(HooksDelegate* delegate);
+ 
++// While alive, the tabs that Chromium opens by URL for saved tab group
++// |saved_group| in |browser| open in the container the group's tabs were in
++// when it was last open, instead of the visible space. Wraps the reopening of
++// a closed saved group (from tab restore, the bookmarks bar or the menu).
++class ScopedSavedGroupOpening {
++ public:
++  ScopedSavedGroupOpening(BrowserWindowInterface* browser,
++                          const base::Uuid& saved_group);
++  ScopedSavedGroupOpening(const ScopedSavedGroupOpening&) = delete;
++  ScopedSavedGroupOpening& operator=(const ScopedSavedGroupOpening&) = delete;
++  ~ScopedSavedGroupOpening();
++
++ private:
++  const raw_ptr<BrowserWindowInterface> browser_;
++};
++
+ // Whether |tab| of |model| belongs to a space other than the visible one.
+ bool IsTabHidden(const TabStripModel* model, const tabs::TabInterface* tab);
+ 
+@@ -98,6 +121,19 @@ bool IsTabActiveInPage(const void* page,
+                        const tabs::TabInterface* tab,
+                        bool active_in_model);
+ 
++// The number of tabs of |model| that are not hidden: the tabs of the visible
++// space, or every tab when spaces do not apply. |Model| is a TabStripModel.
++template <typename Model>
++int CountShownTabs(const Model* model) {
++  int count = 0;
++  for (int i = 0; i < model->count(); ++i) {
++    if (!IsTabHidden(model, model->GetTabAtIndex(i))) {
++      ++count;
++    }
++  }
++  return count;
++}
++
+ // Tab strip views helpers. |Node| is a TabCollectionNode; templates keep this
+ // target free of a dependency on the views.
+ 
+--- a/chrome/browser/ui/neon/spaces/spaces_window_controller.cc
++++ b/chrome/browser/ui/neon/spaces/spaces_window_controller.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <map>
++#include <set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -13,22 +14,31 @@
+ #include "base/functional/bind.h"
+ #include "base/no_destructor.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "base/values.h"
+ #include "chrome/browser/neon/containers_api.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/helium/helium_layout_state_controller.h"
+ #include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "components/prefs/pref_service.h"
++#include "components/saved_tab_groups/public/saved_tab_group.h"
++#include "components/saved_tab_groups/public/tab_group_sync_service.h"
++#include "components/tabs/public/split_tab_data.h"
++#include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/url_constants.h"
++#include "ui/gfx/range/range.h"
+ #include "url/gurl.h"
+ 
+ namespace neon::spaces {
+@@ -117,6 +127,15 @@ class HooksDelegateImpl : public HooksDe
+            controller->GetSpaceIdOf(tab) != space_id;
+   }
+ 
++  void SetOpeningSavedGroup(
++      BrowserWindowInterface* browser,
++      const std::optional<base::Uuid>& saved_group) override {
++    if (SpacesWindowController* controller =
++            SpacesWindowController::FromBrowser(browser)) {
++      controller->SetOpeningSavedGroup(saved_group);
++    }
++  }
++
+  private:
+   // The visible space each tab strip last showed, by tab strip.
+   std::map<const void*, std::string> last_spaces_;
+@@ -345,7 +364,67 @@ void SpacesWindowController::SwitchToRel
+   SwitchToSpaceAt(target);
+ }
+ 
++void SpacesWindowController::SetOpeningSavedGroup(
++    const std::optional<base::Uuid>& saved_group) {
++  opening_group_container_.reset();
++  if (!saved_group) {
++    return;
++  }
++  const base::DictValue& containers =
++      browser_->GetProfile()->GetPrefs()->GetDict(kSavedGroupContainersPref);
++  const std::string* container_id =
++      containers.FindString(saved_group->AsLowercaseString());
++  // A container that no longer exists would create a new, empty partition.
++  if (container_id &&
++      (container_id->empty() ||
++       containers_api::GetContainer(browser_->GetProfile(), *container_id))) {
++    opening_group_container_ = *container_id;
++  }
++}
++
++void SpacesWindowController::RecordSavedGroupContainers() {
++  tab_groups::TabGroupSyncService* sync_service =
++      tab_groups::TabGroupSyncServiceFactory::GetForProfile(
++          browser_->GetProfile());
++  TabGroupModel* groups = model_->group_model();
++  if (!sync_service || !groups) {
++    return;
++  }
++  PrefService* prefs = browser_->GetProfile()->GetPrefs();
++  base::DictValue containers = prefs->GetDict(kSavedGroupContainersPref).Clone();
++  for (const tab_groups::TabGroupId& group : groups->ListTabGroups()) {
++    std::optional<tab_groups::SavedTabGroup> saved = sync_service->GetGroup(group);
++    if (!saved) {
++      continue;
++    }
++    const gfx::Range range = groups->GetTabGroup(group)->ListTabs();
++    containers.Set(saved->saved_guid().AsLowercaseString(),
++                   containers_api::GetTabContainerId(
++                       model_->GetWebContentsAt(range.start())));
++  }
++  // Forget groups that are no longer saved.
++  std::set<std::string> saved_ids;
++  for (const tab_groups::SavedTabGroup& saved : sync_service->GetAllGroups()) {
++    saved_ids.insert(saved.saved_guid().AsLowercaseString());
++  }
++  std::vector<std::string> stale;
++  for (const auto [id, value] : containers) {
++    if (!saved_ids.contains(id)) {
++      stale.push_back(id);
++    }
++  }
++  for (const std::string& id : stale) {
++    containers.Remove(id);
++  }
++  if (containers != prefs->GetDict(kSavedGroupContainersPref)) {
++    prefs->SetDict(kSavedGroupContainersPref, std::move(containers));
++  }
++}
++
+ std::string SpacesWindowController::GetContainerForNewTab() const {
++  if (opening_group_container_) {
++    return *opening_group_container_;
++  }
+   if (pending_new_tab_space_) {
+     const Space* space = service_->GetSpace(*pending_new_tab_space_);
+     return space ? space->container_id : std::string();
+@@ -410,6 +489,29 @@ void SpacesWindowController::OnTabPinned
+   ScheduleRepair();
+ }
+ 
++void SpacesWindowController::TabGroupedStateChanged(
++    TabStripModel* tab_strip_model,
++    std::optional<tab_groups::TabGroupId> old_group,
++    std::optional<tab_groups::TabGroupId> new_group,
++    tabs::TabInterface* tab,
++    int index) {
++  // The first tab that joins a group gives it its space.
++  if (new_group && !group_spaces_.contains(*new_group)) {
++    group_spaces_[*new_group] = GetSpaceIdOf(tab);
++  }
++  ScheduleRepair();
++}
++
++void SpacesWindowController::OnTabGroupChanged(const TabGroupChange& change) {
++  if (change.type == TabGroupChange::kClosed) {
++    group_spaces_.erase(change.group);
++  }
++}
++
++void SpacesWindowController::OnSplitTabChanged(const SplitTabChange& change) {
++  ScheduleRepair();
++}
++
+ void SpacesWindowController::OnTabStripModelDestroyed(
+     TabStripModel* tab_strip_model) {
+   model_ = nullptr;
+@@ -479,42 +581,120 @@ void SpacesWindowController::ScheduleRep
+ 
+ void SpacesWindowController::RepairContiguity() {
+   repair_scheduled_ = false;
+-  if (!model_ || model_->empty() || model_->closing_all() || !IsActive()) {
++  if (!model_ || model_->empty() || model_->closing_all()) {
++    return;
++  }
++  // Also with spaces off: a saved group reopens in its container either way.
++  RecordSavedGroupContainers();
++  if (!IsActive()) {
+     return;
+   }
++  RepairGroupsAndSplits();
+   RepairRange(0, model_->IndexOfFirstNonPinnedTab());
+   RepairRange(model_->IndexOfFirstNonPinnedTab(), model_->count());
+   // The moves above scheduled another pass; it finds nothing to do.
+ }
+ 
++void SpacesWindowController::RepairGroupsAndSplits() {
++  if (TabGroupModel* groups = model_->group_model()) {
++    for (const tab_groups::TabGroupId& group : groups->ListTabGroups()) {
++      const std::string space_id = GetSpaceIdOfGroup(group);
++      const gfx::Range range = groups->GetTabGroup(group)->ListTabs();
++      std::vector<int> foreign;
++      for (size_t i = range.start(); i < range.end(); ++i) {
++        if (GetSpaceIdOf(model_->GetTabAtIndex(i)) != space_id) {
++          foreign.push_back(static_cast<int>(i));
++        }
++      }
++      if (!foreign.empty()) {
++        model_->RemoveFromGroup(foreign);
++      }
++    }
++  }
++  for (const split_tabs::SplitTabId& split : model_->ListSplits()) {
++    const std::vector<tabs::TabInterface*> tabs =
++        model_->GetSplitData(split)->ListTabs();
++    if (std::ranges::any_of(tabs, [&](const tabs::TabInterface* tab) {
++          return GetSpaceIdOf(tab) != GetSpaceIdOf(tabs.front());
++        })) {
++      model_->RemoveSplit(split);
++    }
++  }
++}
++
++const std::string& SpacesWindowController::GetSpaceIdOfGroup(
++    const tab_groups::TabGroupId& group) {
++  auto it = group_spaces_.find(group);
++  if (it == group_spaces_.end()) {
++    // A group this controller did not see form, for instance one restored
++    // before it existed: the space of its first tab.
++    const gfx::Range range =
++        model_->group_model()->GetTabGroup(group)->ListTabs();
++    it = group_spaces_
++             .emplace(group, GetSpaceIdOf(model_->GetTabAtIndex(range.start())))
++             .first;
++  }
++  return it->second;
++}
++
+ void SpacesWindowController::RepairRange(int start, int end) {
+-  // Order the tabs by the first appearance of their space, keeping their
+-  // relative order within a space. A tab added at the end of the strip thus
+-  // joins the end of its space's run.
++  // Order the blocks of the range by the first appearance of their space,
++  // keeping their relative order within a space. A block is a tab, a group
++  // or a split outside a group, and moves as a whole, so groups and splits
++  // stay intact. A tab added at the end of the strip thus joins the end of its
++  // space's run.
++  struct Block {
++    size_t order;
++    tabs::TabInterface* first;
++    int size;
++    std::optional<tab_groups::TabGroupId> group;
++    std::optional<split_tabs::SplitTabId> split;
++  };
+   std::vector<std::string> space_order;
+-  std::vector<std::pair<size_t, tabs::TabInterface*>> tabs;
+-  for (int i = start; i < end; ++i) {
++  std::vector<Block> blocks;
++  for (int i = start; i < end;) {
+     tabs::TabInterface* tab = model_->GetTabAtIndex(i);
+-    // Moving single tabs could break up a group or a split. Leave those
+-    // ranges alone.
+-    if (tab->GetGroup().has_value() || tab->IsSplit()) {
+-      return;
++    Block block{0, tab, 1, tab->GetGroup(), std::nullopt};
++    std::string space_id;
++    if (block.group) {
++      const gfx::Range range =
++          model_->group_model()->GetTabGroup(*block.group)->ListTabs();
++      block.size = static_cast<int>(range.end()) - i;
++      space_id = GetSpaceIdOfGroup(*block.group);
++    } else {
++      if (tab->IsSplit()) {
++        block.split = tab->GetSplit();
++        block.size = static_cast<int>(
++            model_->GetSplitData(*block.split)->ListTabs().size());
++      }
++      space_id = GetSpaceIdOf(tab);
+     }
+-    const std::string& space_id = GetSpaceIdOf(tab);
+     auto it = std::ranges::find(space_order, space_id);
+     if (it == space_order.end()) {
+       it = space_order.insert(space_order.end(), space_id);
+     }
+-    tabs.emplace_back(it - space_order.begin(), tab);
++    block.order = it - space_order.begin();
++    blocks.push_back(block);
++    i += block.size;
+   }
+-  std::ranges::stable_sort(tabs, {}, &std::pair<size_t, tabs::TabInterface*>::first);
++  std::ranges::stable_sort(blocks, {}, &Block::order);
++  const bool pinned = start < model_->IndexOfFirstNonPinnedTab();
+   int position = start;
+-  for (const auto& [order, tab] : tabs) {
+-    const int index = model_->GetIndexOfTab(tab);
++  for (const Block& block : blocks) {
++    // Every block before |position| is in place, so a block only ever moves
++    // to the left, onto a block boundary.
++    const int index = model_->GetIndexOfTab(block.first);
+     if (index != position) {
+-      model_->MoveWebContentsAt(index, position, /*select_after_move=*/false);
++      if (block.group) {
++        model_->MoveGroupTo(*block.group, position);
++      } else if (block.split) {
++        model_->MoveSplitTo(*block.split, position, pinned, std::nullopt);
++      } else {
++        model_->MoveWebContentsAt(index, position,
++                                  /*select_after_move=*/false, std::nullopt);
++      }
+     }
+-    ++position;
++    position += block.size;
+   }
+ }
+ 
+--- a/chrome/browser/ui/neon/spaces/spaces_window_controller.h
++++ b/chrome/browser/ui/neon/spaces/spaces_window_controller.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_NEON_SPACES_SPACES_WINDOW_CONTROLLER_H_
+ #define CHROME_BROWSER_UI_NEON_SPACES_SPACES_WINDOW_CONTROLLER_H_
+ 
++#include <map>
+ #include <optional>
+ #include <string>
+ 
+@@ -12,9 +13,11 @@
+ #include "base/callback_list.h"
+ #include "base/functional/callback.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/uuid.h"
+ #include "chrome/browser/neon/spaces/spaces_service.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "components/prefs/pref_change_registrar.h"
++#include "components/tab_groups/tab_group_id.h"
+ 
+ class BrowserWindowInterface;
+ class TabStripModel;
+@@ -134,9 +137,14 @@ class SpacesWindowController : public Ta
+ 
+   // The container a new tab of this window opens in when it has no source
+   // page: the visible space's, or for a window without tabs yet the visible
+-  // space of the last active window. Empty for the default partition.
++  // space of the last active window. Empty for the default partition. While
++  // a saved tab group reopens, the container its tabs were in.
+   std::string GetContainerForNewTab() const;
+ 
++  // Saved tab group |saved_group| starts (a value) or stops (std::nullopt)
++  // opening its tabs in this window.
++  void SetOpeningSavedGroup(const std::optional<base::Uuid>& saved_group);
++
+  private:
+   // TabStripModelObserver:
+   void OnTabStripModelChanged(
+@@ -144,6 +152,13 @@ class SpacesWindowController : public Ta
+       const TabStripModelChange& change,
+       const TabStripSelectionChange& selection) override;
+   void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
++  void TabGroupedStateChanged(TabStripModel* tab_strip_model,
++                              std::optional<tab_groups::TabGroupId> old_group,
++                              std::optional<tab_groups::TabGroupId> new_group,
++                              tabs::TabInterface* tab,
++                              int index) override;
++  void OnTabGroupChanged(const TabGroupChange& change) override;
++  void OnSplitTabChanged(const SplitTabChange& change) override;
+   void OnTabStripModelDestroyed(TabStripModel* tab_strip_model) override;
+ 
+   // SpacesService::Observer:
+@@ -162,8 +177,16 @@ class SpacesWindowController : public Ta
+ 
+   void ScheduleRepair();
+   void RepairContiguity();
+-  // Moves tabs in [start, end) so each space's tabs are adjacent. Ranges with
+-  // groups or splits are left alone.
++  // Remembers, in the profile, the container of each open saved tab group.
++  void RecordSavedGroupContainers();
++  // A tab group and a split each belong to one space. Takes the tabs of other
++  // spaces out of each group, and unsplits a split whose tabs are in two
++  // spaces.
++  void RepairGroupsAndSplits();
++  // The space of |group|: the space of the first tab that joined it.
++  const std::string& GetSpaceIdOfGroup(const tab_groups::TabGroupId& group);
++  // Moves tabs in [start, end) so each space's tabs are adjacent. A group or
++  // a split moves as one block.
+   void RepairRange(int start, int end);
+ 
+   raw_ptr<BrowserWindowInterface> browser_;
+@@ -172,9 +195,14 @@ class SpacesWindowController : public Ta
+   raw_ptr<Presenter> presenter_ = nullptr;
+   // Set while this controller opens a tab in a given space.
+   std::optional<std::string> pending_new_tab_space_;
++  // Set while a saved tab group reopens its tabs in this window: the
++  // container they were in.
++  std::optional<std::string> opening_group_container_;
+   // The visible space as of the last model change.
+   std::string last_visible_space_;
+   bool repair_scheduled_ = false;
++  // The space each tab group belongs to.
++  std::map<tab_groups::TabGroupId, std::string> group_spaces_;
+   PrefChangeRegistrar pref_change_registrar_;
+   base::WeakPtrFactory<SpacesWindowController> weak_factory_{this};
+ };
+--- a/chrome/browser/ui/tabs/saved_tab_groups/BUILD.gn
++++ b/chrome/browser/ui/tabs/saved_tab_groups/BUILD.gn
+@@ -111,6 +111,7 @@ source_set("impl") {
+     "//chrome/browser/ui/actions:actions_headers",
+     "//chrome/browser/ui/bookmarks",
+     "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/neon/spaces:hooks",
+     "//chrome/browser/ui/page_action:icon_type",
+     "//chrome/browser/ui/tabs:tab_group",
+     "//chrome/browser/ui/tabs:tab_strip",
+--- a/chrome/browser/ui/tabs/saved_tab_groups/tab_group_sync_delegate_desktop.cc
++++ b/chrome/browser/ui/tabs/saved_tab_groups/tab_group_sync_delegate_desktop.cc
+@@ -12,6 +12,7 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_model_listener.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/saved_tab_group_utils.h"
+ #include "chrome/browser/ui/tabs/saved_tab_groups/tab_group_action_context_desktop.h"
+@@ -186,8 +187,13 @@ TabGroupSyncDelegateDesktop::HandleOpenT
+   }
+ 
+   // Open the tabs in the saved group.
+-  std::map<tabs::TabInterface*, base::Uuid> tab_guid_mapping =
+-      OpenTabsAndMapToUuids(browser, group.value());
++  std::map<tabs::TabInterface*, base::Uuid> tab_guid_mapping;
++  {
++    // Neon: in the container the group's tabs were in.
++    const neon::spaces::ScopedSavedGroupOpening container(browser,
++                                                          sync_tab_group_id);
++    tab_guid_mapping = OpenTabsAndMapToUuids(browser, group.value());
++  }
+ 
+   if (tab_guid_mapping.empty()) {
+     // If no tabs were opened, do nothing.
+--- a/chrome/browser/ui/webui/tab_search/BUILD.gn
++++ b/chrome/browser/ui/webui/tab_search/BUILD.gn
+@@ -53,6 +53,7 @@ source_set("tab_search") {
+     "//chrome/browser/ui:ui_features",
+     "//chrome/browser/ui/interaction",
+     "//chrome/browser/ui/navigator",
++    "//chrome/browser/ui/neon/spaces:hooks",
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/tabs/alert:tab_alert",
+     "//chrome/browser/ui/tabs/tab_strip_api",
+--- a/chrome/browser/ui/webui/tab_search/tab_search_page_handler.cc
++++ b/chrome/browser/ui/webui/tab_search/tab_search_page_handler.cc
+@@ -34,6 +34,7 @@
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/interaction/browser_elements.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/alert/tab_alert_controller.h"
+ #include "chrome/browser/ui/tabs/features.h"
+@@ -483,6 +484,14 @@ tab_search::mojom::ProfileDataPtr TabSea
+ 
+         WalkContainer(get_tabs_result.value(), window.get(), profile_data.get(),
+                       tab_dedup_keys, tab_group_ids);
++        // Neon: the split view's tab picker offers only tabs of its space.
++        if (web_ui_->GetWebContents()->GetLastCommittedURL().path() ==
++            "/split_new_tab_page.html") {
++          std::erase_if(window->tabs, [](const auto& tab) {
++            return neon::spaces::IsTabHidden(
++                nullptr, tabs::TabHandle(tab->tab_id).Get());
++          });
++        }
+ 
+         profile_data->windows.push_back(std::move(window));
+ 

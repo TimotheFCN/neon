@@ -38,6 +38,7 @@ names (`brave.containers.*`) are Brave's.
 | `chrome/browser/containers/containers_navigator_utils` | `chromium_src/chrome/browser/ui/navigator/browser_navigator.cc` and `chromium_src/chrome/browser/ui/browser_tabrestore.cc` (helpers moved into a file of their own, as Brave `master` does) | `tab-partition` |
 | `chrome/browser/containers/container_specifier_utils` | `browser/containers/` | `command-line` |
 | Hunks in Chromium files | Brave `chromium_src/` overrides and `patches/*.patch` for the same files, rewritten as plain hunks | `content-partition`, `session-persistence`, `browser-service`, `tab-partition`, `command-line` |
+| `components/containers/content/browser/platform_auth_helper` | `browser/enterprise/platform_auth_helper.cc` (moved into the containers component, namespace `containers`), with the hunk from `rewrite/chrome/browser/enterprise/platform_auth/platform_auth_navigation_throttle.cc.yaml` | `platform-auth` (M1b) |
 
 ### Changes from Brave
 
@@ -51,4 +52,4 @@ names (`brave.containers.*`) are Brave's.
 
 Not imported: settings UI, tab and hover card indicators, page action, context menus, Traffic
 Control, sync, clear browsing data, shared zoom, Shields and AI chat hooks, PWA `--container`,
-split view.
+Brave's split view helper (Neon's M1b inherits the container for new split tabs its own way).

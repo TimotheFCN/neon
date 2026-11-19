@@ -1,0 +1,164 @@
+Neon containers port (M1b): no platform single sign-on in container tabs.
+
+Platform SSO (Cloud AP on Windows, Extensible Enterprise SSO on macOS) attaches
+the device account's identity to navigations of a regular profile. Container
+tabs share that profile, so without this every container would be signed in
+to the device's work account. Ported from brave-core v1.100.58 (bd6d26d1):
+rewrite/chrome/browser/enterprise/platform_auth/platform_auth_navigation_throttle.cc.yaml
+and browser/enterprise/platform_auth_helper.cc. The helper moves into the
+containers component so the enterprise target needs no chrome/browser
+dependency. The hook only compiles on Windows, macOS and Android, and is
+unverified at runtime.
+
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at https://mozilla.org/MPL/2.0/.
+
+Copyright (c) 2026, The Brave Authors
+Copyright (c) 2026, The Neon Authors
+
+Alternatively, the contents of this file may be used under the terms
+of the GNU General Public License Version 3, as described below:
+
+Copyright (C) 2026 The Neon Authors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+--- a/components/containers/content/browser/BUILD.gn
++++ b/components/containers/content/browser/BUILD.gn
+@@ -16,6 +16,8 @@ component("browser") {
+   sources = [
+     "containers_web_contents_user_data.cc",
+     "containers_web_contents_user_data.h",
++    "platform_auth_helper.cc",
++    "platform_auth_helper.h",
+     "session_utils.cc",
+     "session_utils.h",
+     "storage_partition_utils.cc",
+--- a/chrome/browser/enterprise/BUILD.gn
++++ b/chrome/browser/enterprise/BUILD.gn
+@@ -2,6 +2,7 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
++import("//components/containers/buildflags/buildflags.gni")
+ import("//components/enterprise/buildflags/buildflags.gni")
+ import("//components/safe_browsing/buildflags.gni")
+ import("//extensions/buildflags/buildflags.gni")
+@@ -664,6 +665,10 @@ source_set("impl") {
+       "platform_auth/platform_auth_policy_observer.cc",
+       "platform_auth/platform_auth_provider_manager.cc",
+     ]
++    deps += [ "//components/containers/buildflags" ]
++    if (enable_containers) {
++      deps += [ "//components/containers/content/browser" ]
++    }
+   }
+ 
+   if (is_win) {
+--- a/chrome/browser/enterprise/platform_auth/platform_auth_navigation_throttle.cc
++++ b/chrome/browser/enterprise/platform_auth/platform_auth_navigation_throttle.cc
+@@ -5,15 +5,26 @@
+ #include "chrome/browser/enterprise/platform_auth/platform_auth_navigation_throttle.h"
+ 
+ #include "chrome/browser/enterprise/platform_auth/platform_auth_provider_manager.h"
++#include "components/containers/buildflags/buildflags.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/navigation_throttle.h"
+ #include "net/cookies/cookie_util.h"
+ #include "net/http/http_request_headers.h"
+ 
++#if BUILDFLAG(ENABLE_CONTAINERS)
++#include "components/containers/content/browser/platform_auth_helper.h"
++#endif
++
+ namespace enterprise_auth {
+ // static
+ void PlatformAuthNavigationThrottle::MaybeCreateAndAdd(
+     content::NavigationThrottleRegistry& registry) {
++#if BUILDFLAG(ENABLE_CONTAINERS)
++  // Containers: no platform single sign-on in container tabs.
++  if (containers::ShouldSkipPlatformAuth(registry)) {
++    return;
++  }
++#endif
+   // The manager is enabled when both the feature and policy are enabled.
+   // If the manager is not enabled, there is no point in creating a throttle
+   // since no auth data can be fetched.
+--- /dev/null
++++ b/components/containers/content/browser/platform_auth_helper.cc
+@@ -0,0 +1,29 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "components/containers/content/browser/platform_auth_helper.h"
++
++#include "base/feature_list.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
++#include "components/containers/core/common/features.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/navigation_throttle_registry.h"
++#include "content/public/browser/web_contents.h"
++
++namespace containers {
++
++bool ShouldSkipPlatformAuth(content::NavigationThrottleRegistry& registry) {
++  // Container tabs share a normal profile (not OTR), so without this guard
++  // PlatformAuthNavigationThrottle would inject device-account identity across
++  // isolated container storage partitions.
++  if (base::FeatureList::IsEnabled(features::kContainers)) {
++    content::WebContents* web_contents =
++        registry.GetNavigationHandle().GetWebContents();
++    return !GetContainerIdForWebContents(web_contents).empty();
++  }
++  return false;
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/components/containers/content/browser/platform_auth_helper.h
+@@ -0,0 +1,31 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef COMPONENTS_CONTAINERS_CONTENT_BROWSER_PLATFORM_AUTH_HELPER_H_
++#define COMPONENTS_CONTAINERS_CONTENT_BROWSER_PLATFORM_AUTH_HELPER_H_
++
++#include "base/component_export.h"
++
++namespace content {
++class NavigationThrottleRegistry;
++}  // namespace content
++
++namespace containers {
++
++// Whether platform single sign-on (Cloud AP on Windows, Extensible Enterprise
++// SSO on macOS) must be skipped for the navigation of |registry|: true in a
++// container tab. Container tabs share a regular profile, so without this the
++// platform auth throttle would attach the device account's identity to every
++// container, with no way for the user to prevent it.
++//
++// Neon: moved from brave/browser/enterprise/platform_auth_helper.cc
++// (brave::ShouldSkipPlatformAuth) into the containers component, so the
++// enterprise target can call it without depending on chrome/browser code.
++COMPONENT_EXPORT(CONTAINERS_CONTENT_BROWSER)
++bool ShouldSkipPlatformAuth(content::NavigationThrottleRegistry& registry);
++
++}  // namespace containers
++
++#endif  // COMPONENTS_CONTAINERS_CONTENT_BROWSER_PLATFORM_AUTH_HELPER_H_

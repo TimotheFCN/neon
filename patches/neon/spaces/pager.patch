@@ -17,6 +17,11 @@ without becoming its tab strip UI; TabView asks which tab a page draws as
 active; the spaces filter gains per-page spaces, and the window controller a
 presenter that the pager implements. Neon code, GPL-3.0.
 
+M1b: the hidden-tab checks of the tab strip views read a group's or split's
+first tab through its child nodes. A split's own collection is destroyed before
+its tab views move out, and reading it crashed the browser when a split was
+removed, for instance when a window with a split closed.
+
 --- a/chrome/browser/ui/neon/spaces/space_tab_filter.cc
 +++ b/chrome/browser/ui/neon/spaces/space_tab_filter.cc
 @@ -5,8 +5,10 @@
@@ -112,7 +117,11 @@ presenter that the pager implements. Neon code, GPL-3.0.
  bool TakeVisibleSpaceChange(const void* key,
 --- a/chrome/browser/ui/neon/spaces/space_tab_filter.h
 +++ b/chrome/browser/ui/neon/spaces/space_tab_filter.h
-@@ -10,14 +10,11 @@
+@@ -7,17 +7,15 @@
+ 
+ #include <optional>
+ #include <string>
++#include <variant>
  
  #include "base/containers/span.h"
  #include "components/tabs/public/tab_collection_types.h"
@@ -128,7 +137,7 @@ presenter that the pager implements. Neon code, GPL-3.0.
  // The calls that Chromium's tab strip model, browser commands and tab strip
  // views make into Neon spaces. Each hook is one line in an existing file. This
  // target only depends on //base and //components/tabs, so the hooked targets
-@@ -61,6 +58,9 @@ class HooksDelegate {
+@@ -61,6 +59,9 @@ class HooksDelegate {
    // Runs a spaces command. Returns false if |command_id| is not one.
    virtual bool ExecuteCommand(BrowserWindowInterface* browser,
                                int command_id) = 0;
@@ -138,7 +147,7 @@ presenter that the pager implements. Neon code, GPL-3.0.
  };
  
  void SetHooksDelegate(HooksDelegate* delegate);
-@@ -78,6 +78,25 @@ bool TakeVisibleSpaceChange(const void*
+@@ -78,9 +79,48 @@ bool TakeVisibleSpaceChange(const void*
  // returns false.
  bool ExecuteCommand(BrowserWindowInterface* browser, int command_id);
  
@@ -164,13 +173,37 @@ presenter that the pager implements. Neon code, GPL-3.0.
  // Tab strip views helpers. |Node| is a TabCollectionNode; templates keep this
  // target free of a dependency on the views.
  
-@@ -89,7 +108,8 @@ bool IsChildViewHidden(const Node* paren
++// The node data of the first tab at or under |node|: |node|'s own for a tab,
++// the first tab child's for a group or split. A group's or split's own node
++// data must not be read: when a split is removed, its collection is destroyed
++// before its tab views are moved out, and laying out in between would read
++// freed memory. Child nodes hold tabs, which outlive the move.
++template <typename Node>
++std::optional<tabs::ConstChildPtr> GetFirstTabNodeData(const Node* node) {
++  tabs::ConstChildPtr data = node->GetNodeData();
++  if (std::holds_alternative<tabs::ConstDanglingUntriagedTabInterface>(data)) {
++    return data;
++  }
++  for (const auto& child : node->children()) {
++    if (std::optional<tabs::ConstChildPtr> first =
++            GetFirstTabNodeData(child.get())) {
++      return first;
++    }
++  }
++  return std::nullopt;
++}
++
+ // Whether child view |child| of collection node |parent| is hidden.
+ template <typename Node, typename View>
+ bool IsChildViewHidden(const Node* parent, const View* child) {
+@@ -89,7 +129,9 @@ bool IsChildViewHidden(const Node* paren
    }
    for (const auto& node : parent->children()) {
      if (node->view() == child) {
 -      return IsChildHidden(node->GetNodeData());
-+      return IsChildHiddenInPage(parent->GetController(),
-+                                 node->GetNodeData());
++      std::optional<tabs::ConstChildPtr> first =
++          GetFirstTabNodeData(node.get());
++      return first && IsChildHiddenInPage(parent->GetController(), *first);
      }
    }
    return false;
@@ -204,7 +237,7 @@ presenter that the pager implements. Neon code, GPL-3.0.
   private:
    // The visible space each tab strip last showed, by tab strip.
    std::map<const void*, std::string> last_spaces_;
-@@ -131,9 +145,19 @@ SpacesWindowController::SpacesWindowCont
+@@ -156,9 +170,19 @@ SpacesWindowController::SpacesWindowCont
        base::BindRepeating(&SpacesWindowController::ScheduleRepair,
                            base::Unretained(this)));
    last_visible_space_ = GetVisibleSpaceId();
@@ -224,7 +257,7 @@ presenter that the pager implements. Neon code, GPL-3.0.
    std::erase(Registry(), this);
    service_->RemoveObserver(this);
    if (model_) {
-@@ -221,30 +245,57 @@ bool SpacesWindowController::IsTabHidden
+@@ -246,30 +270,57 @@ bool SpacesWindowController::IsTabHidden
  }
  
  void SpacesWindowController::SwitchToSpace(const std::string& space_id) {
@@ -295,7 +328,7 @@ presenter that the pager implements. Neon code, GPL-3.0.
  }
  
  void SpacesWindowController::SwitchToSpaceAt(size_t index) {
-@@ -254,7 +305,11 @@ void SpacesWindowController::SwitchToSpa
+@@ -279,7 +330,11 @@ void SpacesWindowController::SwitchToSpa
  }
  
  void SpacesWindowController::SwitchToRelativeSpace(int delta) {
