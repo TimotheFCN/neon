@@ -1,0 +1,449 @@
+Neon spaces (M3), part 2 of 4: space switcher row.
+
+A row of space icons at the bottom of the pager, above Helium's new tab
+button, one per space in order. The visible space's icon sits on a highlight
+that moves with the pages during a swipe or an animated switch; a click shows
+that space. When the icons do not fit (the collapsed sidebar) the row shows
+the visible space's icon, which opens a menu of the spaces. The trailing end
+is left free for the new space button of space management. No hooks.
+Neon code, GPL-3.0.
+
+--- a/chrome/browser/ui/views/neon/spaces/BUILD.gn
++++ b/chrome/browser/ui/views/neon/spaces/BUILD.gn
+@@ -9,6 +9,8 @@ source_set("spaces") {
+     "space_icon_view.h",
+     "space_page_view.cc",
+     "space_page_view.h",
++    "space_switcher_row.cc",
++    "space_switcher_row.h",
+     "spaces_pager_view.cc",
+     "spaces_pager_view.h",
+     "tab_strip_wrapper.cc",
+@@ -25,6 +27,7 @@ source_set("spaces") {
+     "//ui/base/metadata",
+     "//ui/compositor",
+     "//ui/gfx",
++    "//ui/menus",
+     "//ui/views",
+   ]
+ 
+--- a/chrome/browser/ui/views/neon/spaces/tab_strip_wrapper.cc
++++ b/chrome/browser/ui/views/neon/spaces/tab_strip_wrapper.cc
+@@ -10,6 +10,7 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
++#include "chrome/browser/ui/views/neon/spaces/space_switcher_row.h"
+ #include "chrome/browser/ui/views/neon/spaces/spaces_pager_view.h"
+ #include "ui/views/view.h"
+ #include "ui/views/view_class_properties.h"
+@@ -31,8 +32,10 @@ std::unique_ptr<views::View> WrapTabStri
+       !SpacesServiceFactory::GetForProfile(browser->GetProfile())) {
+     return tab_strip_view;
+   }
+-  return std::make_unique<SpacesPagerView>(region, browser_view,
+-                                           std::move(tab_strip_view));
++  auto pager = std::make_unique<SpacesPagerView>(region, browser_view,
++                                                 std::move(tab_strip_view));
++  pager->SetBottomView(std::make_unique<SpaceSwitcherRow>(pager.get()));
++  return pager;
+ }
+ 
+ void UnwrapTabStripView(views::View* tab_strip_view) {
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/space_switcher_row.h
+@@ -0,0 +1,96 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_SWITCHER_ROW_H_
++#define CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_SWITCHER_ROW_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/ui/views/neon/spaces/spaces_pager_view.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/gfx/geometry/rect_f.h"
++#include "ui/menus/simple_menu_model.h"
++#include "ui/views/view.h"
++
++namespace views {
++class Button;
++class MenuRunner;
++}  // namespace views
++
++namespace neon::spaces {
++
++class SpaceIconView;
++
++// The row of space icons at the bottom of the sidebar pager, one button per
++// space in order. The visible space's icon sits on a highlight that slides
++// with the pages, so during a swipe or an animated switch it moves between
++// icons as the pages move. A click shows that space.
++//
++// When the icons do not fit (the collapsed sidebar), the row shows only the
++// visible space's icon, which opens a menu of the spaces. The trailing end is
++// kept free for the "new space" button of space management (M4).
++class SpaceSwitcherRow : public views::View,
++                         public SpacesPagerView::Observer,
++                         public ui::SimpleMenuModel::Delegate {
++  METADATA_HEADER(SpaceSwitcherRow, views::View)
++
++ public:
++  explicit SpaceSwitcherRow(SpacesPagerView* pager);
++  SpaceSwitcherRow(const SpaceSwitcherRow&) = delete;
++  SpaceSwitcherRow& operator=(const SpaceSwitcherRow&) = delete;
++  ~SpaceSwitcherRow() override;
++
++  // Whether only the visible space's icon shows (the icons do not fit).
++  bool IsCompact() const;
++
++  // views::View:
++  void Layout(PassKey) override;
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++  void OnPaint(gfx::Canvas* canvas) override;
++
++  // SpacesPagerView::Observer:
++  void OnPagerPositionChanged(const std::vector<std::string>& strip,
++                              double position) override;
++  void OnPagerSpacesChanged() override;
++
++  // ui::SimpleMenuModel::Delegate:
++  void ExecuteCommand(int command_id, int event_flags) override;
++  bool IsCommandIdChecked(int command_id) const override;
++
++ private:
++  class SpaceButton;
++
++  void Rebuild();
++  void OnButtonPressed(const std::string& space_id);
++  void ShowMenu();
++  // The space the row shows as current at the pager's position.
++  std::string GetShownSpaceId() const;
++  // The highlight's bounds at the pager's position, or nullopt when hidden.
++  std::optional<gfx::RectF> GetHighlightBounds() const;
++  SpaceButton* GetButton(const std::string& space_id) const;
++  int GetIconsWidth() const;
++
++  const raw_ptr<SpacesPagerView> pager_;
++  std::vector<raw_ptr<SpaceButton>> buttons_;
++  // Compact mode: the visible space's icon, which opens the menu.
++  raw_ptr<SpaceButton> compact_button_ = nullptr;
++  std::vector<std::string> strip_;
++  double position_ = 0;
++
++  std::unique_ptr<ui::SimpleMenuModel> menu_model_;
++  std::unique_ptr<views::MenuRunner> menu_runner_;
++
++  base::ScopedObservation<SpacesPagerView, SpacesPagerView::Observer>
++      pager_observation_{this};
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_SWITCHER_ROW_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/space_switcher_row.cc
+@@ -0,0 +1,295 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/neon/spaces/space_switcher_row.h"
++
++#include <algorithm>
++#include <cmath>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/strings/utf_string_conversions.h"
++#include "cc/paint/paint_flags.h"
++#include "chrome/browser/neon/spaces/space.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/neon/spaces/spaces_window_controller.h"
++#include "chrome/browser/ui/views/neon/spaces/space_icon_view.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/mojom/menu_source_type.mojom.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/animation/ink_drop.h"
++#include "ui/views/animation/ink_drop_host.h"
++#include "ui/views/controls/button/button.h"
++#include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/controls/menu/menu_runner.h"
++#include "ui/views/widget/widget.h"
++
++namespace neon::spaces {
++
++namespace {
++
++constexpr int kRowHeight = 36;
++constexpr int kButtonSize = 28;
++constexpr int kIconSize = 18;
++constexpr int kButtonSpacing = 4;
++constexpr int kCornerRadius = 8;
++constexpr int kMenuIconSize = 16;
++// Kept free at the trailing end for the "new space" button (M4), and the
++// same at the leading end so the icons stay centred.
++constexpr int kReservedWidth = kButtonSize + kButtonSpacing;
++
++}  // namespace
++
++class SpaceSwitcherRow::SpaceButton : public views::Button {
++  METADATA_HEADER(SpaceButton, views::Button)
++
++ public:
++  SpaceButton(PressedCallback callback, std::string space_id)
++      : views::Button(std::move(callback)), space_id_(std::move(space_id)) {
++    icon_ = AddChildView(std::make_unique<SpaceIconView>(kIconSize));
++    views::InstallRoundRectHighlightPathGenerator(this, gfx::Insets(),
++                                                  kCornerRadius);
++    views::InkDrop::Get(this)->SetMode(views::InkDropHost::InkDropMode::ON);
++    views::InkDrop::Get(this)->SetBaseColor(
++        kColorTabForegroundActiveFrameActive);
++    SetHasInkDropActionOnClick(true);
++  }
++
++  const std::string& space_id() const { return space_id_; }
++
++  void SetSpace(const Space& space) {
++    space_id_ = space.id;
++    icon_->SetSpace(space);
++    const std::u16string name = base::UTF8ToUTF16(space.name);
++    SetTooltipText(name);
++    GetViewAccessibility().SetName(name);
++  }
++
++  void SetEmphasized(bool emphasized) { icon_->SetEmphasized(emphasized); }
++
++  // views::Button:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(kButtonSize, kButtonSize);
++  }
++  void Layout(PassKey) override { icon_->SetBoundsRect(GetLocalBounds()); }
++
++ private:
++  std::string space_id_;
++  raw_ptr<SpaceIconView> icon_;
++};
++
++BEGIN_METADATA(SpaceSwitcherRow, SpaceButton)
++END_METADATA
++
++SpaceSwitcherRow::SpaceSwitcherRow(SpacesPagerView* pager) : pager_(pager) {
++  GetViewAccessibility().SetRole(ax::mojom::Role::kGroup);
++  GetViewAccessibility().SetName(u"Spaces");
++  pager_observation_.Observe(pager_);
++  Rebuild();
++}
++
++SpaceSwitcherRow::~SpaceSwitcherRow() = default;
++
++void SpaceSwitcherRow::Rebuild() {
++  for (raw_ptr<SpaceButton>& button : buttons_) {
++    RemoveChildViewT(std::exchange(button, nullptr));
++  }
++  buttons_.clear();
++  if (compact_button_) {
++    RemoveChildViewT(std::exchange(compact_button_, nullptr));
++  }
++  menu_runner_.reset();
++  menu_model_.reset();
++
++  const bool active = pager_->IsActive();
++  SetVisible(active);
++  if (active) {
++    for (const Space& space :
++         pager_->controller()->service()->spaces()) {
++      auto button = std::make_unique<SpaceButton>(
++          base::BindRepeating(&SpaceSwitcherRow::OnButtonPressed,
++                              base::Unretained(this), space.id),
++          space.id);
++      button->SetSpace(space);
++      buttons_.push_back(AddChildView(std::move(button)));
++    }
++    compact_button_ = AddChildView(std::make_unique<SpaceButton>(
++        base::BindRepeating(&SpaceSwitcherRow::ShowMenu,
++                            base::Unretained(this)),
++        std::string()));
++  }
++  strip_ = pager_->strip();
++  position_ = pager_->position();
++  PreferredSizeChanged();
++  InvalidateLayout();
++  OnPagerPositionChanged(strip_, position_);
++}
++
++int SpaceSwitcherRow::GetIconsWidth() const {
++  const int count = static_cast<int>(buttons_.size());
++  return count * kButtonSize + std::max(0, count - 1) * kButtonSpacing;
++}
++
++bool SpaceSwitcherRow::IsCompact() const {
++  return GetIconsWidth() + 2 * kReservedWidth > width();
++}
++
++void SpaceSwitcherRow::Layout(PassKey) {
++  const bool compact = IsCompact();
++  const int y = (height() - kButtonSize) / 2;
++  int x = (width() - GetIconsWidth()) / 2;
++  for (SpaceButton* button : buttons_) {
++    button->SetVisible(!compact);
++    button->SetBounds(x, y, kButtonSize, kButtonSize);
++    x += kButtonSize + kButtonSpacing;
++  }
++  if (compact_button_) {
++    compact_button_->SetVisible(compact);
++    compact_button_->SetBounds((width() - kButtonSize) / 2, y, kButtonSize,
++                               kButtonSize);
++  }
++  OnPagerPositionChanged(strip_, position_);
++}
++
++gfx::Size SpaceSwitcherRow::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  return gfx::Size(GetIconsWidth() + 2 * kReservedWidth, kRowHeight);
++}
++
++std::string SpaceSwitcherRow::GetShownSpaceId() const {
++  if (strip_.empty()) {
++    return std::string();
++  }
++  const int index =
++      std::clamp(static_cast<int>(std::lround(position_)), 0,
++                 static_cast<int>(strip_.size()) - 1);
++  return strip_[index];
++}
++
++SpaceSwitcherRow::SpaceButton* SpaceSwitcherRow::GetButton(
++    const std::string& space_id) const {
++  for (SpaceButton* button : buttons_) {
++    if (button->space_id() == space_id) {
++      return button;
++    }
++  }
++  return nullptr;
++}
++
++std::optional<gfx::RectF> SpaceSwitcherRow::GetHighlightBounds() const {
++  if (strip_.empty()) {
++    return std::nullopt;
++  }
++  if (IsCompact()) {
++    return compact_button_
++               ? std::optional<gfx::RectF>(
++                     gfx::RectF(compact_button_->GetMirroredBounds()))
++               : std::nullopt;
++  }
++  // Between the icons of the two spaces on screen, in proportion to how far
++  // the pages moved.
++  const double last = static_cast<double>(strip_.size()) - 1;
++  const double position = std::clamp(position_, 0.0, last);
++  const int from = static_cast<int>(std::floor(position));
++  const int to = static_cast<int>(std::ceil(position));
++  SpaceButton* from_button = GetButton(strip_[from]);
++  SpaceButton* to_button = GetButton(strip_[to]);
++  if (!from_button || !to_button) {
++    return std::nullopt;
++  }
++  const gfx::RectF a(from_button->GetMirroredBounds());
++  const gfx::RectF b(to_button->GetMirroredBounds());
++  const float t = static_cast<float>(position - from);
++  return gfx::RectF(a.x() + (b.x() - a.x()) * t, a.y(), a.width(),
++                    a.height());
++}
++
++void SpaceSwitcherRow::OnPaint(gfx::Canvas* canvas) {
++  views::View::OnPaint(canvas);
++  std::optional<gfx::RectF> highlight = GetHighlightBounds();
++  if (!highlight || !GetColorProvider()) {
++    return;
++  }
++  cc::PaintFlags flags;
++  flags.setAntiAlias(true);
++  flags.setColor(
++      GetColorProvider()->GetColor(kColorTabBackgroundActiveFrameActive));
++  canvas->DrawRoundRect(*highlight, kCornerRadius, flags);
++}
++
++void SpaceSwitcherRow::OnPagerPositionChanged(
++    const std::vector<std::string>& strip,
++    double position) {
++  strip_ = strip;
++  position_ = position;
++  const std::string shown = GetShownSpaceId();
++  for (SpaceButton* button : buttons_) {
++    button->SetEmphasized(button->space_id() == shown);
++  }
++  if (compact_button_) {
++    if (const Space* space =
++            pager_->controller()
++                ? pager_->controller()->service()->GetSpace(shown)
++                : nullptr) {
++      compact_button_->SetSpace(*space);
++    }
++  }
++  SchedulePaint();
++}
++
++void SpaceSwitcherRow::OnPagerSpacesChanged() {
++  Rebuild();
++}
++
++void SpaceSwitcherRow::OnButtonPressed(const std::string& space_id) {
++  pager_->ShowSpace(space_id);
++}
++
++void SpaceSwitcherRow::ShowMenu() {
++  if (!pager_->controller()) {
++    return;
++  }
++  menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  const std::vector<Space>& spaces = pager_->controller()->service()->spaces();
++  for (size_t i = 0; i < spaces.size(); ++i) {
++    menu_model_->AddCheckItem(static_cast<int>(i),
++                              base::UTF8ToUTF16(spaces[i].name));
++    menu_model_->SetIcon(menu_model_->GetItemCount() - 1,
++                         GetSpaceIconImage(spaces[i], kMenuIconSize));
++  }
++  menu_runner_ = std::make_unique<views::MenuRunner>(
++      menu_model_.get(), views::MenuRunner::HAS_MNEMONICS);
++  menu_runner_->RunMenuAt(GetWidget(), nullptr,
++                          compact_button_->GetAnchorBoundsInScreen(),
++                          views::MenuAnchorPosition::kTopLeft,
++                          ui::mojom::MenuSourceType::kMouse);
++}
++
++void SpaceSwitcherRow::ExecuteCommand(int command_id, int event_flags) {
++  if (!pager_->controller()) {
++    return;
++  }
++  const std::vector<Space>& spaces = pager_->controller()->service()->spaces();
++  if (command_id >= 0 && command_id < static_cast<int>(spaces.size())) {
++    pager_->ShowSpace(spaces[command_id].id);
++  }
++}
++
++bool SpaceSwitcherRow::IsCommandIdChecked(int command_id) const {
++  if (!pager_->controller()) {
++    return false;
++  }
++  const std::vector<Space>& spaces = pager_->controller()->service()->spaces();
++  return command_id >= 0 && command_id < static_cast<int>(spaces.size()) &&
++         spaces[command_id].id == pager_->GetVisibleSpaceId();
++}
++
++BEGIN_METADATA(SpaceSwitcherRow)
++END_METADATA
++
++}  // namespace neon::spaces
