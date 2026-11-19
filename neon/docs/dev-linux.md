@@ -526,3 +526,42 @@ the next agent can build incrementally.
   `--container=<name> URL`.
 - Rebuild cost by what you touch: a `.cc` file takes 10 to 30 seconds, a `chrome/browser` header
   3 to 7 minutes, a `content/public` header about 15 minutes. Batch header edits.
+
+## Notes from M4 (space management)
+
+- **Finding views to click.** `--enable-ui-devtools=PORT` serves the views tree on
+  `ws://127.0.0.1:PORT/0` (there is no `/json` list; asking for one logs a "Not implemented"
+  error). `DOM.getDocument` gives every view with its class name and object name,
+  `DOM.getNodeBoundsInScreen` its screen bounds, and `CSS.getMatchedStylesForNode` its views
+  metadata properties (`TooltipText`, `Text`, `Enabled`, `IsDrawn`, `Visible`). Hidden views
+  keep their bounds, so filter on `IsDrawn`. Neon's own views override `GetObjectName()` to add
+  their space id. `neon/tests/spaces_m4.py` has the client (`UiDevTools`).
+- **Menus.** Menu items show up as `MenuItemView` nodes with no title; tell them apart by order.
+  A submenu that was opened stays in the tree, still drawn, after the pointer moves on.
+- **Typing characters the X keymap lacks** (emoji): `xdotool type` remaps a spare key only for
+  the instant of the press, and the browser has not reloaded the keymap by then, so nothing is
+  typed. Map a spare keycode with `XChangeKeyboardMapping`, wait about a second, then press it
+  through XTEST (`type_unicode` in `spaces_m4.py`). `xmodmap` is not in the dev image.
+- **Clicking a `cr-input`** in a WebUI page must hit the inner `<input>` (`el.inputElement`);
+  a click on the wrapper's padding does not focus it.
+- **Restarts under Xvfb.** Without a window manager, session restore puts every window back at the
+  origin. Move them again (`Browser.setWindowBounds`) if the test needs them apart. Background
+  tabs after a restart may be frozen or never loaded and then never answer `Runtime.evaluate`.
+- **The Preferences file** is written about ten seconds after a change; poll it, or read it after
+  the browser has exited.
+- **Refreshing a lower Neon patch without a rebuild.** Popping and pushing the patches above it
+  gives their files new mtimes, and siso then rebuilds them (touching
+  `components/tabs/public/tab_context_menu_command.h` costs about 6 minutes). Save the mtimes of
+  the files of the patches above, pop, refresh, push, and restore the mtimes:
+
+  ```sh
+  cd build/src
+  target=neon/spaces/management-ui.patch
+  above=$(quilt applied | sed -n "\|^$target\$|,\$p" | tail -n +2)
+  for p in $above; do quilt files $p; done | sort -u | while read -r f; do
+    printf '%s\t%s\n' "$(date -r "$f" +%s.%N)" "$f"; done > /tmp/mtimes
+  quilt pop -q $target && quilt refresh $target && quilt push -q $(echo "$above" | tail -1)
+  while IFS=$'\t' read -r t f; do touch -d "@$t" "$f"; done < /tmp/mtimes
+  ```
+
+  Only do this when the patches above are already refreshed, so their content is unchanged.

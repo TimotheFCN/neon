@@ -1086,8 +1086,9 @@ def window_tab_id(b):
     return ext(b, 'chrome.windows.getAll().then(ws => Math.min(...ws.map(w => w.id)))')
 
 
-# "Hibernate" in the tab context menu, below the point the menu opens at.
-HIBERNATE_OFFSET = 390
+# "Hibernate" in the tab context menu, below the point the menu opens at. M4 added "Reopen in
+# space" (one 32 DIP item) above it.
+HIBERNATE_OFFSET = 422
 
 
 def hibernate_tab(ctx, b, name):

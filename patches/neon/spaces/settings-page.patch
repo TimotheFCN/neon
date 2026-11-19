@@ -1,0 +1,1178 @@
+--- a/chrome/browser/resources/settings/BUILD.gn
++++ b/chrome/browser/resources/settings/BUILD.gn
+@@ -208,6 +208,11 @@ build_webui("build") {
+     "appearance_page/appearance_page.ts",
+     "appearance_page/appearance_page_index.html.ts",
+     "appearance_page/appearance_page_index.ts",
++    "appearance_page/neon_spaces_browser_proxy.ts",
++    "appearance_page/neon_spaces_entry.html.ts",
++    "appearance_page/neon_spaces_entry.ts",
++    "appearance_page/neon_spaces_page.html.ts",
++    "appearance_page/neon_spaces_page.ts",
+     "appearance_page/home_url_input.html.ts",
+     "appearance_page/home_url_input.ts",
+     "autofill_page/account_card.html.ts",
+@@ -597,6 +602,7 @@ build_webui("build") {
+     "about_page/about_page.css",
+     "appearance_page/appearance_fonts_page.css",
+     "appearance_page/appearance_layout_page.css",
++    "appearance_page/neon_spaces_page.css",
+     "appearance_page/appearance_page.css",
+     "appearance_page/appearance_page_index.css",
+     "appearance_page/home_url_input.css",
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page_index.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page_index.html.ts
+@@ -14,6 +14,9 @@ export function getHtml(this: SettingsAp
+   <settings-appearance-layout-page slot="view" id="layout">
+   </settings-appearance-layout-page>
+ 
++  <settings-neon-spaces-entry slot="view" id="spacesEntry">
++  </settings-neon-spaces-entry>
++
+   <settings-appearance-page slot="view" id="appearance">
+   </settings-appearance-page>
+ 
+@@ -24,6 +27,11 @@ export function getHtml(this: SettingsAp
+       data-parent-view-id="appearance"
+       route-path="${this.routes_.FONTS.path}">
+   </settings-appearance-fonts-page>
++
++  <settings-neon-spaces-page slot="view" id="spaces"
++      data-parent-view-id="spacesEntry"
++      route-path="${this.routes_.SPACES.path}">
++  </settings-neon-spaces-page>
+ </cr-view-manager>
+ <!--_html_template_end_-->`;
+   // clang-format on
+--- a/chrome/browser/resources/settings/appearance_page/appearance_page_index.ts
++++ b/chrome/browser/resources/settings/appearance_page/appearance_page_index.ts
+@@ -6,6 +6,8 @@ import 'chrome://resources/cr_elements/c
+ import './appearance_behavior_page.js';
+ import './appearance_layout_page.js';
+ import './appearance_page.js';
++import './neon_spaces_entry.js';
++import './neon_spaces_page.js';
+ 
+ import type {CrViewManagerElement} from 'chrome://resources/cr_elements/cr_view_manager/cr_view_manager.js';
+ import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+@@ -74,6 +76,10 @@ export class SettingsAppearancePageIndex
+           this.$.viewManager.switchView(
+               'fonts', 'no-animation', 'no-animation');
+           break;
++        case routes.SPACES:
++          this.$.viewManager.switchView(
++              'spaces', 'no-animation', 'no-animation');
++          break;
+         case routes.BASIC:
+           // Switch back to the default view in case they are part of search
+           // results.
+--- /dev/null
++++ b/chrome/browser/resources/settings/appearance_page/neon_spaces_browser_proxy.ts
+@@ -0,0 +1,78 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import {sendWithPromise} from 'chrome://resources/js/cr.js';
++
++// One space, as chrome/browser/ui/neon/spaces/spaces_settings_handler.cc
++// sends it. |color| is an unsigned ARGB number, 0 for no colour. |icon| is
++// empty (first letter), an emoji, or 'vector:<name>'.
++export interface NeonSpace {
++  id: string;
++  name: string;
++  icon: string;
++  color: number;
++  isDefault: boolean;
++  tabs: number;
++}
++
++export interface NeonSpacesState {
++  available: boolean;
++  spaces: NeonSpace[];
++  colors: number[];
++  vectorIcons: string[];
++  // Black vector icons as PNG data URLs, by icon value, used as masks.
++  vectorIconUrls: Record<string, string>;
++  showSwitcherRow: boolean;
++  swipeToSwitch: boolean;
++}
++
++export interface NeonSpacesBrowserProxy {
++  getState(): Promise<NeonSpacesState>;
++  createSpace(): Promise<string>;
++  updateSpace(id: string, name: string, icon: string, color: number): void;
++  moveSpace(id: string, index: number): void;
++  deleteSpace(id: string): void;
++  getTabCount(id: string): Promise<number>;
++  setPref(name: 'showSwitcherRow'|'swipeToSwitch', value: boolean): void;
++}
++
++export class NeonSpacesBrowserProxyImpl implements NeonSpacesBrowserProxy {
++  getState(): Promise<NeonSpacesState> {
++    return sendWithPromise('neonSpacesGetState');
++  }
++
++  createSpace(): Promise<string> {
++    return sendWithPromise('neonSpacesCreate');
++  }
++
++  updateSpace(id: string, name: string, icon: string, color: number) {
++    chrome.send('neonSpacesUpdate', [id, name, icon, color]);
++  }
++
++  moveSpace(id: string, index: number) {
++    chrome.send('neonSpacesMove', [id, index]);
++  }
++
++  deleteSpace(id: string) {
++    chrome.send('neonSpacesDelete', [id]);
++  }
++
++  getTabCount(id: string): Promise<number> {
++    return sendWithPromise('neonSpacesGetTabCount', id);
++  }
++
++  setPref(name: 'showSwitcherRow'|'swipeToSwitch', value: boolean) {
++    chrome.send('neonSpacesSetPref', [name, value]);
++  }
++
++  static getInstance(): NeonSpacesBrowserProxy {
++    return instance || (instance = new NeonSpacesBrowserProxyImpl());
++  }
++
++  static setInstance(obj: NeonSpacesBrowserProxy) {
++    instance = obj;
++  }
++}
++
++let instance: NeonSpacesBrowserProxy|null = null;
+--- /dev/null
++++ b/chrome/browser/resources/settings/appearance_page/neon_spaces_entry.html.ts
+@@ -0,0 +1,20 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {SettingsNeonSpacesEntryElement} from './neon_spaces_entry.js';
++
++export function getHtml(this: SettingsNeonSpacesEntryElement) {
++  // clang-format off
++  return html`<!--_html_template_start_-->
++<settings-section page-title="Spaces">
++  <cr-link-row id="spacesSubpageTrigger" label="Manage spaces"
++      sub-label="Name, icon, colour and order of your spaces, and the sidebar's space switcher"
++      @click="${this.onClick_}" role-description="Subpage button">
++  </cr-link-row>
++</settings-section>
++<!--_html_template_end_-->`;
++  // clang-format on
++}
+--- /dev/null
++++ b/chrome/browser/resources/settings/appearance_page/neon_spaces_entry.ts
+@@ -0,0 +1,65 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// The Spaces card of the Appearance page: a link to the Spaces subpage.
++
++import 'chrome://resources/cr_elements/cr_link_row/cr_link_row.js';
++import '../settings_page/settings_section.js';
++
++import {assert} from 'chrome://resources/js/assert.js';
++import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import {routes} from '../route.js';
++import {Router} from '../router.js';
++import {SettingsViewMixinLit} from '../settings_page/settings_view_mixin_lit.js';
++
++import {getHtml} from './neon_spaces_entry.html.js';
++import {getCss} from './neon_spaces_page.css.js';
++
++const SettingsNeonSpacesEntryElementBase = SettingsViewMixinLit(CrLitElement);
++
++export class SettingsNeonSpacesEntryElement extends
++    SettingsNeonSpacesEntryElementBase {
++  static get is() {
++    return 'settings-neon-spaces-entry';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  protected onClick_() {
++    Router.getInstance().navigateTo(routes.SPACES);
++  }
++
++  // SettingsViewMixin
++  override getFocusConfig() {
++    const map = new Map();
++    if (routes.SPACES) {
++      map.set(routes.SPACES.path, '#spacesSubpageTrigger');
++    }
++    return map;
++  }
++
++  override getAssociatedControlFor(childViewId: string): HTMLElement {
++    assert(childViewId === 'spaces');
++    const control =
++        this.shadowRoot.querySelector<HTMLElement>('#spacesSubpageTrigger');
++    assert(control);
++    return control;
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'settings-neon-spaces-entry': SettingsNeonSpacesEntryElement;
++  }
++}
++
++customElements.define(
++    SettingsNeonSpacesEntryElement.is, SettingsNeonSpacesEntryElement);
+--- /dev/null
++++ b/chrome/browser/resources/settings/appearance_page/neon_spaces_page.css
+@@ -0,0 +1,103 @@
++/* Copyright 2026 The Neon Authors
++ * You can use, redistribute, and/or modify this source code under
++ * the terms of the GPL-3.0 license that can be found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #import=chrome://resources/cr_elements/cr_shared_style_lit.css.js
++ * #import=chrome://resources/cr_elements/md_select_lit.css.js
++ * #import=../settings_shared_lit.css.js
++ * #include=cr-shared-style-lit settings-shared-lit md-select-lit
++ * #css_wrapper_metadata_end */
++
++#spaceList {
++  padding: 0 var(--cr-section-padding);
++}
++
++.space-row {
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++  padding-bottom: 12px;
++  padding-top: 12px;
++}
++
++.space-row + .space-row {
++  border-top: var(--cr-separator-line);
++}
++
++.space-line {
++  align-items: center;
++  display: flex;
++  gap: 8px;
++}
++
++.space-options {
++  padding-inline-start: 36px;
++}
++
++.space-chip {
++  align-items: center;
++  border: 1.5px solid var(--cr-primary-text-color);
++  border-radius: 6px;
++  box-sizing: border-box;
++  color: var(--cr-primary-text-color);
++  display: inline-flex;
++  flex: none;
++  font-size: 13px;
++  font-weight: 600;
++  height: 28px;
++  justify-content: center;
++  width: 28px;
++}
++
++.vector-glyph {
++  background-color: currentColor;
++  height: 20px;
++  -webkit-mask-position: center;
++  -webkit-mask-repeat: no-repeat;
++  -webkit-mask-size: 20px 20px;
++  width: 20px;
++}
++
++.space-name {
++  --cr-input-width: 220px;
++  flex: none;
++}
++
++.space-tabs {
++  flex: 1;
++}
++
++.space-icon {
++  width: 140px;
++}
++
++.space-emoji {
++  --cr-input-width: 80px;
++}
++
++.swatches {
++  display: flex;
++  gap: 6px;
++  margin-inline-start: auto;
++}
++
++.swatch {
++  border: none;
++  border-radius: 50%;
++  cursor: pointer;
++  height: 20px;
++  outline-offset: 2px;
++  padding: 0;
++  width: 20px;
++}
++
++.swatch.none {
++  background: transparent;
++  border: 1.5px solid var(--cr-secondary-text-color);
++}
++
++.swatch[aria-pressed='true'] {
++  outline: 2px solid var(--cr-primary-text-color);
++}
+--- /dev/null
++++ b/chrome/browser/resources/settings/appearance_page/neon_spaces_page.html.ts
+@@ -0,0 +1,138 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {SettingsNeonSpacesPageElement} from './neon_spaces_page.js';
++
++export function getHtml(this: SettingsNeonSpacesPageElement) {
++  // clang-format off
++  return html`<!--_html_template_start_-->
++<settings-subpage page-title="Spaces" route-path="${this.routePath}">
++  <div class="cr-row first">
++    <div class="flex cr-padded-text" aria-hidden="true">
++      Show the space switcher row
++      <div class="cr-secondary-text">
++        The row of space icons at the bottom of the vertical tabs
++      </div>
++    </div>
++    <cr-toggle id="showSwitcherRow" aria-label="Show the space switcher row"
++        ?checked="${this.state_?.showSwitcherRow ?? true}"
++        @change="${this.onToggleChange_}">
++    </cr-toggle>
++  </div>
++  <div class="cr-row">
++    <div class="flex cr-padded-text" aria-hidden="true">
++      Swipe to switch spaces
++      <div class="cr-secondary-text">
++        A two-finger swipe or a sideways scroll over the vertical tabs
++      </div>
++    </div>
++    <cr-toggle id="swipeToSwitch" aria-label="Swipe to switch spaces"
++        ?checked="${this.state_?.swipeToSwitch ?? true}"
++        @change="${this.onToggleChange_}">
++    </cr-toggle>
++  </div>
++  <div class="cr-row continuation">
++    <h2 class="flex">Your spaces</h2>
++  </div>
++  <div id="spaceList">
++    ${this.getSpaces_().map((space, index) => html`
++      <div class="space-row" data-id="${space.id}"
++          data-icon="${space.icon}" data-color="${space.color}"
++          data-tabs="${space.tabs}">
++        <div class="space-line">
++          <span class="space-chip" style="${this.chipStyle_(space)}"
++              aria-hidden="true">
++            ${this.isVectorIcon_(space.icon) ? html`
++              <span class="vector-glyph"
++                  style="${this.vectorIconStyle_(space.icon)}"></span>
++            ` : html`${this.glyph_(space)}`}
++          </span>
++          <cr-input class="space-name" .value="${space.name}"
++              aria-label="Name of ${space.name}" maxlength="60"
++              @change="${this.onNameChange_}">
++          </cr-input>
++          <span class="space-tabs cr-secondary-text">
++            ${this.tabsText_(space)}
++          </span>
++          <cr-icon-button class="move-up" iron-icon="cr:keyboard-arrow-up"
++              title="Move up" aria-label="Move ${space.name} up"
++              ?disabled="${space.isDefault || index <= 1}"
++              @click="${this.onMoveClick_}">
++          </cr-icon-button>
++          <cr-icon-button class="move-down" iron-icon="cr:keyboard-arrow-down"
++              title="Move down" aria-label="Move ${space.name} down"
++              ?disabled="${space.isDefault || index === this.getSpaces_().length - 1}"
++              @click="${this.onMoveClick_}">
++          </cr-icon-button>
++          <cr-icon-button class="delete" iron-icon="cr:delete"
++              title="${space.isDefault ? 'The default space cannot be deleted' :
++                                         'Delete space'}"
++              aria-label="Delete ${space.name}"
++              ?disabled="${space.isDefault}"
++              @click="${this.onDeleteClick_}">
++          </cr-icon-button>
++        </div>
++        <div class="space-line space-options">
++          <select class="md-select space-icon" aria-label="Icon of ${space.name}"
++              @change="${this.onIconChange_}">
++            <option value="" ?selected="${this.iconOption_(space) === ''}">
++              First letter
++            </option>
++            ${this.getVectorIcons_().map(icon => html`
++              <option value="${icon}"
++                  ?selected="${this.iconOption_(space) === icon}">
++                ${this.iconLabel_(icon)}
++              </option>
++            `)}
++            <option value="emoji"
++                ?selected="${this.iconOption_(space) === 'emoji'}">
++              Emoji
++            </option>
++          </select>
++          <cr-input class="space-emoji" placeholder="Emoji"
++              aria-label="Emoji of ${space.name}"
++              .value="${this.isVectorIcon_(space.icon) ? '' : space.icon}"
++              ?hidden="${!this.isEmoji_(space)}"
++              @change="${this.onEmojiChange_}">
++          </cr-input>
++          <div class="swatches" role="group" aria-label="Colour of ${space.name}">
++            ${this.getColors_().map(color => html`
++              <button class="swatch ${color ? '' : 'none'}"
++                  data-color="${color}" title="${this.colorLabel_(color)}"
++                  aria-label="${this.colorLabel_(color)}"
++                  aria-pressed="${color === space.color}"
++                  style="${color ? `background-color: ${this.cssColor_(color)}` : ''}"
++                  @click="${this.onColorClick_}">
++              </button>
++            `)}
++          </div>
++        </div>
++      </div>
++    `)}
++  </div>
++  <div class="cr-row">
++    <cr-button id="addSpace" @click="${this.onAddClick_}"
++        ?disabled="${!this.state_?.available}">
++      Add space
++    </cr-button>
++  </div>
++</settings-subpage>
++<cr-dialog id="deleteDialog" @close="${this.onDeleteDialogClose_}">
++  <div slot="title">Delete “${this.deleting_?.name || ''}”?</div>
++  <div slot="body">${this.deleteText_()}</div>
++  <div slot="button-container">
++    <cr-button class="cancel-button" @click="${this.onDeleteCancelClick_}">
++      Cancel
++    </cr-button>
++    <cr-button id="confirmDelete" class="action-button"
++        @click="${this.onDeleteConfirmClick_}">
++      Delete
++    </cr-button>
++  </div>
++</cr-dialog>
++<!--_html_template_end_-->`;
++  // clang-format on
++}
+--- /dev/null
++++ b/chrome/browser/resources/settings/appearance_page/neon_spaces_page.ts
+@@ -0,0 +1,316 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Appearance > Spaces: the list of spaces (name, icon, colour, order,
++// delete), a button to add one, and the sidebar's two space toggles. Stays in
++// sync with changes made anywhere else (the sidebar, another settings tab).
++
++import 'chrome://resources/cr_elements/cr_button/cr_button.js';
++import 'chrome://resources/cr_elements/cr_dialog/cr_dialog.js';
++import 'chrome://resources/cr_elements/cr_icon_button/cr_icon_button.js';
++import 'chrome://resources/cr_elements/cr_input/cr_input.js';
++import 'chrome://resources/cr_elements/cr_toggle/cr_toggle.js';
++import 'chrome://resources/cr_elements/icons.html.js';
++import '../settings_page/settings_subpage.js';
++
++import type {CrDialogElement} from 'chrome://resources/cr_elements/cr_dialog/cr_dialog.js';
++import type {CrInputElement} from 'chrome://resources/cr_elements/cr_input/cr_input.js';
++import type {CrToggleElement} from 'chrome://resources/cr_elements/cr_toggle/cr_toggle.js';
++import {WebUiListenerMixinLit} from 'chrome://resources/cr_elements/web_ui_listener_mixin_lit.js';
++import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import {SettingsViewMixinLit} from '../settings_page/settings_view_mixin_lit.js';
++
++import type {NeonSpace, NeonSpacesBrowserProxy, NeonSpacesState} from './neon_spaces_browser_proxy.js';
++import {NeonSpacesBrowserProxyImpl} from './neon_spaces_browser_proxy.js';
++import {getCss} from './neon_spaces_page.css.js';
++import {getHtml} from './neon_spaces_page.html.js';
++
++// Labels of the vector icons and colours, by value. Keep in sync with
++// chrome/browser/neon/spaces/space_style.cc.
++const ICON_LABELS: Record<string, string> = {
++  'vector:home': 'Home',
++  'vector:work': 'Work',
++  'vector:code': 'Code',
++  'vector:science': 'Science',
++  'vector:shopping': 'Shopping',
++  'vector:travel': 'Travel',
++  'vector:games': 'Games',
++  'vector:pets': 'Pets',
++  'vector:star': 'Star',
++  'vector:music': 'Music',
++};
++const COLOR_LABELS = [
++  'Blue', 'Red', 'Yellow', 'Green', 'Pink', 'Purple', 'Cyan', 'Orange', 'Grey',
++];
++const EMOJI_OPTION = 'emoji';
++
++export interface SettingsNeonSpacesPageElement {
++  $: {
++    deleteDialog: CrDialogElement,
++    showSwitcherRow: CrToggleElement,
++    swipeToSwitch: CrToggleElement,
++  };
++}
++
++const SettingsNeonSpacesPageElementBase =
++    SettingsViewMixinLit(WebUiListenerMixinLit(CrLitElement));
++
++export class SettingsNeonSpacesPageElement extends
++    SettingsNeonSpacesPageElementBase {
++  static get is() {
++    return 'settings-neon-spaces-page';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      state_: {type: Object},
++      deleting_: {type: Object},
++      deletingTabs_: {type: Number},
++      emojiRows_: {type: Object},
++    };
++  }
++
++  protected accessor state_: NeonSpacesState|null = null;
++  // The space the delete dialog asks about.
++  protected accessor deleting_: NeonSpace|null = null;
++  protected accessor deletingTabs_: number = 0;
++  // Spaces whose icon menu is on "Emoji" while the emoji field is empty.
++  protected accessor emojiRows_: Set<string> = new Set();
++
++  private browserProxy_: NeonSpacesBrowserProxy =
++      NeonSpacesBrowserProxyImpl.getInstance();
++
++  override connectedCallback() {
++    super.connectedCallback();
++    this.addWebUiListener(
++        'neon-spaces-changed',
++        (state: NeonSpacesState) => this.onStateChanged_(state));
++    this.browserProxy_.getState().then(state => this.onStateChanged_(state));
++  }
++
++  private onStateChanged_(state: NeonSpacesState) {
++    this.state_ = state;
++    if (this.deleting_ &&
++        !state.spaces.some(space => space.id === this.deleting_!.id)) {
++      // Deleted elsewhere while the dialog was open.
++      this.$.deleteDialog.close();
++    }
++  }
++
++  // SettingsViewMixin
++  override focusBackButton() {
++    this.shadowRoot.querySelector('settings-subpage')!.focusBackButton();
++  }
++
++  protected getSpaces_(): NeonSpace[] {
++    return this.state_?.spaces || [];
++  }
++
++  protected getVectorIcons_(): string[] {
++    return this.state_?.vectorIcons || [];
++  }
++
++  protected getColors_(): number[] {
++    return [0, ...(this.state_?.colors || [])];
++  }
++
++  protected iconLabel_(icon: string): string {
++    return ICON_LABELS[icon] || icon;
++  }
++
++  protected colorLabel_(color: number): string {
++    const index = (this.state_?.colors || []).indexOf(color);
++    return index < 0 ? 'No colour' : COLOR_LABELS[index] || 'Colour';
++  }
++
++  protected isVectorIcon_(icon: string): boolean {
++    return icon.startsWith('vector:');
++  }
++
++  protected isEmoji_(space: NeonSpace): boolean {
++    return (space.icon !== '' && !this.isVectorIcon_(space.icon)) ||
++        this.emojiRows_.has(space.id);
++  }
++
++  protected iconOption_(space: NeonSpace): string {
++    return this.isEmoji_(space) ? EMOJI_OPTION : space.icon;
++  }
++
++  // What the chip shows: the emoji, or the name's first letter.
++  protected glyph_(space: NeonSpace): string {
++    if (space.icon && !this.isVectorIcon_(space.icon)) {
++      return space.icon;
++    }
++    if (this.isVectorIcon_(space.icon)) {
++      return '';
++    }
++    return Array.from(space.name)[0]?.toUpperCase() || '';
++  }
++
++  protected cssColor_(color: number): string {
++    const r = (color >>> 16) & 0xff;
++    const g = (color >>> 8) & 0xff;
++    const b = color & 0xff;
++    return `rgb(${r}, ${g}, ${b})`;
++  }
++
++  // The glyph colour that reads on |color|, as the sidebar picks it.
++  protected chipStyle_(space: NeonSpace): string {
++    if (!(space.color >>> 24)) {
++      return '';
++    }
++    const r = (space.color >>> 16) & 0xff;
++    const g = (space.color >>> 8) & 0xff;
++    const b = space.color & 0xff;
++    const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
++    const text = luminance > 0.55 ? '#202124' : '#ffffff';
++    return `background-color: ${this.cssColor_(space.color)}; ` +
++        `border-color: transparent; color: ${text};`;
++  }
++
++  protected vectorIconStyle_(icon: string): string {
++    const url = this.state_?.vectorIconUrls[icon];
++    return url ? `-webkit-mask-image: url("${url}");` : '';
++  }
++
++  protected tabsText_(space: NeonSpace): string {
++    return space.tabs === 1 ? '1 tab' : `${space.tabs} tabs`;
++  }
++
++  private spaceOf_(e: Event): NeonSpace|undefined {
++    const row = (e.target as HTMLElement).closest<HTMLElement>('.space-row');
++    return this.getSpaces_().find(space => space.id === row?.dataset['id']);
++  }
++
++  private update_(space: NeonSpace, changes: Partial<NeonSpace>) {
++    const next = {...space, ...changes};
++    this.browserProxy_.updateSpace(next.id, next.name, next.icon, next.color);
++  }
++
++  protected onNameChange_(e: Event) {
++    const space = this.spaceOf_(e);
++    const input = e.target as CrInputElement;
++    if (!space) {
++      return;
++    }
++    if (input.value.trim() === '') {
++      // A space always has a name.
++      input.value = space.name;
++      return;
++    }
++    this.update_(space, {name: input.value});
++  }
++
++  protected onIconChange_(e: Event) {
++    const space = this.spaceOf_(e);
++    const value = (e.target as HTMLSelectElement).value;
++    if (!space) {
++      return;
++    }
++    const emojiRows = new Set(this.emojiRows_);
++    if (value === EMOJI_OPTION) {
++      emojiRows.add(space.id);
++      this.emojiRows_ = emojiRows;
++      return;
++    }
++    emojiRows.delete(space.id);
++    this.emojiRows_ = emojiRows;
++    this.update_(space, {icon: value});
++  }
++
++  protected onEmojiChange_(e: Event) {
++    const space = this.spaceOf_(e);
++    const value = (e.target as CrInputElement).value.trim();
++    if (!space || value === '') {
++      return;
++    }
++    this.update_(space, {icon: value});
++  }
++
++  protected onColorClick_(e: Event) {
++    const space = this.spaceOf_(e);
++    const button = (e.target as HTMLElement).closest<HTMLElement>('.swatch');
++    if (!space || !button) {
++      return;
++    }
++    this.update_(space, {color: Number(button.dataset['color'])});
++  }
++
++  protected onMoveClick_(e: Event) {
++    const space = this.spaceOf_(e);
++    if (!space) {
++      return;
++    }
++    const delta =
++        (e.target as HTMLElement).classList.contains('move-up') ? -1 : 1;
++    const index = this.getSpaces_().indexOf(space) + delta;
++    // The default space stays first.
++    if (index < 1 || index >= this.getSpaces_().length) {
++      return;
++    }
++    this.browserProxy_.moveSpace(space.id, index);
++  }
++
++  protected async onDeleteClick_(e: Event) {
++    const space = this.spaceOf_(e);
++    if (!space || space.isDefault) {
++      return;
++    }
++    this.deletingTabs_ = await this.browserProxy_.getTabCount(space.id);
++    this.deleting_ = space;
++    this.$.deleteDialog.showModal();
++  }
++
++  protected deleteText_(): string {
++    const tabs = this.deletingTabs_;
++    const close = tabs === 0 ? 'No tabs are open in this space.' :
++        tabs === 1           ? 'Its 1 open tab will close.' :
++                               `Its ${tabs} open tabs will close.`;
++    return `${close} Its cookies and site data will be deleted. ` +
++        'This can\'t be undone.';
++  }
++
++  protected onDeleteConfirmClick_() {
++    if (this.deleting_) {
++      this.browserProxy_.deleteSpace(this.deleting_.id);
++    }
++    this.$.deleteDialog.close();
++  }
++
++  protected onDeleteCancelClick_() {
++    this.$.deleteDialog.cancel();
++  }
++
++  protected onDeleteDialogClose_() {
++    this.deleting_ = null;
++  }
++
++  protected onAddClick_() {
++    this.browserProxy_.createSpace();
++  }
++
++  protected onToggleChange_(e: Event) {
++    const toggle = e.target as CrToggleElement;
++    this.browserProxy_.setPref(
++        toggle.id as 'showSwitcherRow' | 'swipeToSwitch', toggle.checked);
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'settings-neon-spaces-page': SettingsNeonSpacesPageElement;
++  }
++}
++
++customElements.define(
++    SettingsNeonSpacesPageElement.is, SettingsNeonSpacesPageElement);
+--- a/chrome/browser/resources/settings/route.ts
++++ b/chrome/browser/resources/settings/route.ts
+@@ -217,6 +217,7 @@ function createRoutes(): SettingsRoutes
+         '/appearance', 'appearance',
+         loadTimeData.getString('appearancePageTitle'));
+     r.FONTS = r.APPEARANCE.createChild('/fonts');
++    r.SPACES = r.APPEARANCE.createChild('/spaces');
+   }
+ 
+   if (visibility.privacy !== false) {
+--- a/chrome/browser/resources/settings/router.ts
++++ b/chrome/browser/resources/settings/router.ts
+@@ -116,6 +116,7 @@ export interface SettingsRoutes {
+   SITE_SETTINGS_ZOOM_LEVELS: Route;
+   SITE_SETTINGS_WEB_PRINTING: Route;
+   SKILLS: Route;
++  SPACES: Route;
+   SHORTCUTS?: Route;
+   SUGGESTIONS_FROM_GEMINI: Route;
+   SYNC: Route;
+--- a/chrome/browser/ui/neon/spaces/BUILD.gn
++++ b/chrome/browser/ui/neon/spaces/BUILD.gn
+@@ -63,3 +63,27 @@ source_set("spaces") {
+     "//url",
+   ]
+ }
++
++# The Spaces page of chrome://settings.
++source_set("settings") {
++  sources = [
++    "spaces_settings_handler.cc",
++    "spaces_settings_handler.h",
++  ]
++
++  public_deps = [
++    "//base",
++    "//chrome/browser/neon/spaces",
++    "//components/prefs",
++    "//content/public/browser",
++  ]
++
++  deps = [
++    ":icons",
++    ":spaces",
++    "//chrome/browser/neon:containers_api",
++    "//chrome/browser/profiles:profile",
++    "//skia",
++    "//ui/gfx",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/spaces_settings_handler.cc
+@@ -0,0 +1,227 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/neon/spaces/spaces_settings_handler.h"
++
++#include <string>
++
++#include "base/base64.h"
++#include "base/functional/bind.h"
++#include "base/memory/ref_counted_memory.h"
++#include "base/strings/strcat.h"
++#include "chrome/browser/neon/containers_api.h"
++#include "chrome/browser/neon/spaces/space.h"
++#include "chrome/browser/neon/spaces/space_style.h"
++#include "chrome/browser/neon/spaces/spaces_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/neon/spaces/space_management.h"
++#include "chrome/browser/ui/neon/spaces/space_vector_icons.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/web_ui.h"
++#include "third_party/skia/include/core/SkColor.h"
++#include "ui/gfx/image/image.h"
++#include "ui/gfx/image/image_skia.h"
++#include "ui/gfx/paint_vector_icon.h"
++
++namespace neon::spaces {
++
++namespace {
++
++// Space colours travel as unsigned 32-bit ARGB numbers.
++double ColorToValue(SkColor color) {
++  return static_cast<double>(color);
++}
++
++std::optional<SkColor> ColorFromValue(const base::Value& value) {
++  if (!value.is_double() && !value.is_int()) {
++    return std::nullopt;
++  }
++  const double number = value.GetDouble();
++  if (number < 0 || number > 0xffffffffu) {
++    return std::nullopt;
++  }
++  const SkColor color = static_cast<SkColor>(number);
++  // A colour is either none or opaque.
++  return SkColorGetA(color) == 0 ? SK_ColorTRANSPARENT
++                                 : SkColorSetA(color, SK_AlphaOPAQUE);
++}
++
++// A black |icon| as a PNG data URL, for the page to use as a mask.
++std::string GetIconDataUrl(const gfx::VectorIcon& icon) {
++  constexpr int kSize = 40;
++  const gfx::Image image(gfx::CreateVectorIcon(icon, kSize, SK_ColorBLACK));
++  scoped_refptr<base::RefCountedMemory> png = image.As1xPNGBytes();
++  return base::StrCat({"data:image/png;base64,", base::Base64Encode(base::span(*png))});
++}
++
++}  // namespace
++
++SpacesSettingsHandler::SpacesSettingsHandler(Profile* profile)
++    : profile_(profile),
++      service_(SpacesServiceFactory::GetForProfile(profile)) {}
++
++SpacesSettingsHandler::~SpacesSettingsHandler() = default;
++
++void SpacesSettingsHandler::RegisterMessages() {
++  web_ui()->RegisterMessageCallback(
++      "neonSpacesGetState",
++      base::BindRepeating(&SpacesSettingsHandler::HandleGetState,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "neonSpacesCreate",
++      base::BindRepeating(&SpacesSettingsHandler::HandleCreateSpace,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "neonSpacesUpdate",
++      base::BindRepeating(&SpacesSettingsHandler::HandleUpdateSpace,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "neonSpacesMove",
++      base::BindRepeating(&SpacesSettingsHandler::HandleMoveSpace,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "neonSpacesDelete",
++      base::BindRepeating(&SpacesSettingsHandler::HandleDeleteSpace,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "neonSpacesGetTabCount",
++      base::BindRepeating(&SpacesSettingsHandler::HandleGetTabCount,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "neonSpacesSetPref",
++      base::BindRepeating(&SpacesSettingsHandler::HandleSetPref,
++                          base::Unretained(this)));
++}
++
++void SpacesSettingsHandler::OnJavascriptAllowed() {
++  if (service_) {
++    observation_.Observe(service_);
++  }
++  pref_change_registrar_.Init(profile_->GetPrefs());
++  for (const char* pref : {kShowSwitcherRowPref, kSwipeToSwitchPref}) {
++    pref_change_registrar_.Add(
++        pref, base::BindRepeating(&SpacesSettingsHandler::SendState,
++                                  base::Unretained(this)));
++  }
++}
++
++void SpacesSettingsHandler::OnJavascriptDisallowed() {
++  observation_.Reset();
++  pref_change_registrar_.RemoveAll();
++}
++
++void SpacesSettingsHandler::OnSpacesChanged() {
++  SendState();
++}
++
++void SpacesSettingsHandler::SendState() {
++  if (IsJavascriptAllowed()) {
++    FireWebUIListener("neon-spaces-changed", GetState());
++  }
++}
++
++base::DictValue SpacesSettingsHandler::GetState() const {
++  base::ListValue spaces;
++  if (service_) {
++    for (const Space& space : service_->spaces()) {
++      spaces.Append(
++          base::DictValue()
++              .Set("id", space.id)
++              .Set("name", space.name)
++              .Set("icon", space.icon)
++              .Set("color", ColorToValue(space.color))
++              .Set("isDefault", space.is_default())
++              .Set("tabs", CountTabsInSpace(profile_, space.id)));
++    }
++  }
++  base::ListValue colors;
++  for (SkColor color : GetSpaceColors()) {
++    colors.Append(ColorToValue(color));
++  }
++  base::ListValue icons;
++  base::DictValue icon_urls;
++  for (std::string_view name : GetSpaceVectorIconNames()) {
++    const std::string icon = base::StrCat({kVectorIconPrefix, name});
++    if (const gfx::VectorIcon* vector = GetSpaceVectorIcon(icon)) {
++      icon_urls.Set(icon, GetIconDataUrl(*vector));
++    }
++    icons.Append(icon);
++  }
++  PrefService* prefs = profile_->GetPrefs();
++  return base::DictValue()
++      .Set("available",
++           service_ != nullptr && containers_api::IsAvailable(profile_))
++      .Set("spaces", std::move(spaces))
++      .Set("colors", std::move(colors))
++      .Set("vectorIcons", std::move(icons))
++      .Set("vectorIconUrls", std::move(icon_urls))
++      .Set("showSwitcherRow", prefs->GetBoolean(kShowSwitcherRowPref))
++      .Set("swipeToSwitch", prefs->GetBoolean(kSwipeToSwitchPref));
++}
++
++void SpacesSettingsHandler::HandleGetState(const base::ListValue& args) {
++  AllowJavascript();
++  ResolveJavascriptCallback(args[0], GetState());
++}
++
++void SpacesSettingsHandler::HandleCreateSpace(const base::ListValue& args) {
++  AllowJavascript();
++  std::optional<std::string> id = CreateSpace(profile_);
++  ResolveJavascriptCallback(args[0], base::Value(id.value_or(std::string())));
++}
++
++void SpacesSettingsHandler::HandleUpdateSpace(const base::ListValue& args) {
++  // [id, name, icon, color]
++  if (!service_ || args.size() != 4 || !args[0].is_string() ||
++      !args[1].is_string() || !args[2].is_string()) {
++    return;
++  }
++  std::optional<SkColor> color = ColorFromValue(args[3]);
++  if (!color) {
++    return;
++  }
++  service_->UpdateSpace(args[0].GetString(), args[1].GetString(),
++                        args[2].GetString(), *color);
++}
++
++void SpacesSettingsHandler::HandleMoveSpace(const base::ListValue& args) {
++  // [id, index]
++  if (!service_ || args.size() != 2 || !args[0].is_string() ||
++      !args[1].is_int() || args[1].GetInt() < 0) {
++    return;
++  }
++  service_->MoveSpace(args[0].GetString(),
++                      static_cast<size_t>(args[1].GetInt()));
++}
++
++void SpacesSettingsHandler::HandleDeleteSpace(const base::ListValue& args) {
++  if (args.size() != 1 || !args[0].is_string()) {
++    return;
++  }
++  DeleteSpace(profile_, args[0].GetString());
++}
++
++void SpacesSettingsHandler::HandleGetTabCount(const base::ListValue& args) {
++  AllowJavascript();
++  // [callback id, space id]
++  const int count = args.size() == 2 && args[1].is_string()
++                        ? CountTabsInSpace(profile_, args[1].GetString())
++                        : 0;
++  ResolveJavascriptCallback(args[0], base::Value(count));
++}
++
++void SpacesSettingsHandler::HandleSetPref(const base::ListValue& args) {
++  // [name, value], for the two toggles only.
++  if (args.size() != 2 || !args[0].is_string() || !args[1].is_bool()) {
++    return;
++  }
++  const std::string& name = args[0].GetString();
++  if (name == "showSwitcherRow") {
++    profile_->GetPrefs()->SetBoolean(kShowSwitcherRowPref, args[1].GetBool());
++  } else if (name == "swipeToSwitch") {
++    profile_->GetPrefs()->SetBoolean(kSwipeToSwitchPref, args[1].GetBool());
++  }
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/spaces_settings_handler.h
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NEON_SPACES_SPACES_SETTINGS_HANDLER_H_
++#define CHROME_BROWSER_UI_NEON_SPACES_SPACES_SETTINGS_HANDLER_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/values.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "content/public/browser/web_ui_message_handler.h"
++
++class Profile;
++
++namespace neon::spaces {
++
++// Backs the Spaces page of chrome://settings (Appearance > Spaces): lists the
++// spaces and creates, edits, moves and deletes them, and reads and sets the
++// two sidebar toggles. Sends "neon-spaces-changed" with the whole state
++// whenever the space list or a toggle changes, from any window.
++class SpacesSettingsHandler : public content::WebUIMessageHandler,
++                              public SpacesService::Observer {
++ public:
++  explicit SpacesSettingsHandler(Profile* profile);
++  SpacesSettingsHandler(const SpacesSettingsHandler&) = delete;
++  SpacesSettingsHandler& operator=(const SpacesSettingsHandler&) = delete;
++  ~SpacesSettingsHandler() override;
++
++  // content::WebUIMessageHandler:
++  void RegisterMessages() override;
++  void OnJavascriptAllowed() override;
++  void OnJavascriptDisallowed() override;
++
++  // SpacesService::Observer:
++  void OnSpacesChanged() override;
++
++ private:
++  base::DictValue GetState() const;
++  void SendState();
++
++  void HandleGetState(const base::ListValue& args);
++  void HandleCreateSpace(const base::ListValue& args);
++  void HandleUpdateSpace(const base::ListValue& args);
++  void HandleMoveSpace(const base::ListValue& args);
++  void HandleDeleteSpace(const base::ListValue& args);
++  void HandleGetTabCount(const base::ListValue& args);
++  void HandleSetPref(const base::ListValue& args);
++
++  raw_ptr<Profile> profile_;
++  raw_ptr<SpacesService> service_;
++  PrefChangeRegistrar pref_change_registrar_;
++  base::ScopedObservation<SpacesService, SpacesService::Observer>
++      observation_{this};
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_NEON_SPACES_SPACES_SETTINGS_HANDLER_H_
+--- a/chrome/browser/ui/webui/settings/BUILD.gn
++++ b/chrome/browser/ui/webui/settings/BUILD.gn
+@@ -212,6 +212,7 @@ source_set("impl") {
+   deps = [
+     ":settings",
+     "//chrome/app:command_ids",
++    "//chrome/browser/ui/neon/spaces:settings",
+     "//chrome/app:generated_resources",
+     "//chrome/app/vector_icons",
+     "//chrome/browser:browser_features",
+--- a/chrome/browser/ui/webui/settings/settings_ui.cc
++++ b/chrome/browser/ui/webui/settings/settings_ui.cc
+@@ -65,6 +65,7 @@
+ #include "chrome/browser/ui/webui/sanitized_image/sanitized_image_source.h"
+ #include "chrome/browser/ui/webui/settings/about_handler.h"
+ #include "chrome/browser/ui/webui/settings/accessibility_main_handler.h"
++#include "chrome/browser/ui/neon/spaces/spaces_settings_handler.h"
+ #include "chrome/browser/ui/webui/settings/appearance_handler.h"
+ #include "chrome/browser/ui/webui/settings/brave_import_data_handler.h"
+ #include "chrome/browser/ui/webui/settings/browser_lifetime_handler.h"
+@@ -276,6 +277,8 @@ SettingsUI::SettingsUI(content::WebUI* w
+       "worker-src blob: chrome://resources 'self';");
+ 
+   AddSettingsPageUIHandler(std::make_unique<AppearanceHandler>(web_ui));
++  web_ui->AddMessageHandler(
++      std::make_unique<neon::spaces::SpacesSettingsHandler>(profile));
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+   AddSettingsPageUIHandler(std::make_unique<LanguagesHandler>(profile));

@@ -1,0 +1,2160 @@
+--- a/chrome/browser/neon/BUILD.gn
++++ b/chrome/browser/neon/BUILD.gn
+@@ -18,12 +18,15 @@ source_set("containers_api") {
+     "//base",
+     "//chrome/browser/containers",
+     "//chrome/browser/profiles:profile",
++    "//chrome/browser/sessions",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/navigator",
+     "//chrome/browser/ui/tabs:tab_enums",
+     "//components/containers/content/browser",
+     "//components/containers/core/common",
++    "//components/sessions",
+     "//content/public/browser",
++    "//services/network/public/mojom",
+     "//ui/base",
+     "//url",
+   ]
+--- a/chrome/browser/neon/containers_api.cc
++++ b/chrome/browser/neon/containers_api.cc
+@@ -6,13 +6,17 @@
+ 
+ #include <utility>
+ 
++#include "base/barrier_closure.h"
+ #include "base/check.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
++#include "base/scoped_observation.h"
+ #include "base/strings/string_util.h"
++#include "base/time/time.h"
+ #include "chrome/browser/containers/containers_navigator_utils.h"
+ #include "chrome/browser/containers/containers_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/sessions/tab_restore_service_factory.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+@@ -22,7 +26,14 @@
+ #include "components/containers/core/browser/containers_settings_handler.h"
+ #include "components/containers/core/common/features.h"
+ #include "components/containers/core/mojom/containers.mojom.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/sessions/core/tab_restore_service.h"
++#include "components/sessions/core/tab_restore_service_observer.h"
++#include "content/public/browser/storage_partition.h"
+ #include "content/public/browser/storage_partition_config.h"
++#include "services/network/public/mojom/clear_data_filter.mojom.h"
++#include "services/network/public/mojom/cookie_manager.mojom.h"
++#include "services/network/public/mojom/network_context.mojom.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
+ #include "url/gurl.h"
+@@ -75,6 +86,47 @@ base::OnceCallback<void(std::optional<Co
+       base::Unretained(result));
+ }
+ 
++bool IsNavigationInContainer(const std::string& id,
++                             const sessions::SerializedNavigationEntry& entry) {
++  const auto& key = entry.storage_partition_key();
++  return key.has_value() &&
++         containers::IsContainersStoragePartitionKey(key->first,
++                                                     key->second) &&
++         key->second == id;
++}
++
++// Waits for the recently closed list to load, then forgets a container in it.
++// Deletes itself.
++class ClosedTabsForgetter : public sessions::TabRestoreServiceObserver {
++ public:
++  ClosedTabsForgetter(sessions::TabRestoreService* service, std::string id)
++      : id_(std::move(id)) {
++    observation_.Observe(service);
++  }
++
++  void TabRestoreServiceLoaded(sessions::TabRestoreService* service) override {
++    Forget(service, id_);
++    delete this;
++  }
++
++  void TabRestoreServiceDestroyed(
++      sessions::TabRestoreService* service) override {
++    delete this;
++  }
++
++  static void Forget(sessions::TabRestoreService* service,
++                     const std::string& id) {
++    service->DeleteNavigationEntries(
++        base::BindRepeating(&IsNavigationInContainer, id));
++  }
++
++ private:
++  const std::string id_;
++  base::ScopedObservation<sessions::TabRestoreService,
++                          sessions::TabRestoreServiceObserver>
++      observation_{this};
++};
++
+ }  // namespace
+ 
+ void Observer::OnContainersListChanged() {
+@@ -155,6 +207,63 @@ bool DeleteContainer(Profile* profile, s
+   return !result.error;
+ }
+ 
++void ClearContainerStorage(Profile* profile,
++                           std::string_view id,
++                           base::OnceClosure done) {
++  if (!GetService(profile) || id.empty() ||
++      !containers::IsValidStoragePartitionKeyComponent(id)) {
++    std::move(done).Run();
++    return;
++  }
++  const content::StoragePartitionConfig config =
++      content::StoragePartitionConfig::Create(
++          profile, containers::kContainersStoragePartitionDomain,
++          std::string(id), profile->IsOffTheRecord());
++  // A partition that was never loaded this session has nothing in memory; its
++  // directory goes at the next start.
++  content::StoragePartition* partition =
++      profile->GetStoragePartition(config, /*can_create=*/false);
++  if (!partition) {
++    std::move(done).Run();
++    return;
++  }
++  // Cookies are written to disk in batches; flush once they are cleared so the
++  // file on disk no longer holds them either.
++  base::OnceClosure flush = base::BindOnce(
++      [](content::StoragePartition* partition, base::OnceClosure done) {
++        partition->GetCookieManagerForBrowserProcess()->FlushCookieStore(
++            std::move(done));
++      },
++      base::Unretained(partition), std::move(done));
++  base::RepeatingClosure barrier = base::BarrierClosure(2, std::move(flush));
++  partition->ClearData(
++      content::StoragePartition::REMOVE_DATA_MASK_ALL,
++      /*filter_builder=*/nullptr,
++      /*storage_key_policy_matcher=*/base::NullCallback(),
++      network::mojom::CookieDeletionFilter::New(),
++      /*perform_storage_cleanup=*/true, base::Time(), base::Time::Max(),
++      barrier);
++  partition->GetNetworkContext()->ClearHttpCache(
++      base::Time(), base::Time::Max(), /*filter=*/nullptr, barrier);
++}
++
++void ForgetContainerInClosedTabs(Profile* profile, std::string_view id) {
++  if (!GetService(profile) || id.empty()) {
++    return;
++  }
++  sessions::TabRestoreService* service =
++      TabRestoreServiceFactory::GetForProfile(profile);
++  if (!service) {
++    return;
++  }
++  if (service->IsLoaded()) {
++    ClosedTabsForgetter::Forget(service, std::string(id));
++    return;
++  }
++  new ClosedTabsForgetter(service, std::string(id));
++  service->LoadTabsFromLastSession();
++}
++
+ content::WebContents* OpenTabInContainer(BrowserWindowInterface* browser,
+                                          const GURL& url,
+                                          std::string_view id,
+--- a/chrome/browser/neon/containers_api.h
++++ b/chrome/browser/neon/containers_api.h
+@@ -87,6 +87,20 @@ bool UpdateContainer(Profile* profile,
+ // container's tabs first. Returns false if it does not exist.
+ bool DeleteContainer(Profile* profile, std::string_view id);
+ 
++// Clears the cookies, site storage and HTTP cache of container |id| now, if
++// its storage partition is loaded, and flushes the cookie store to disk. The
++// partition's directory itself is removed at the next start, once nothing
++// uses the container (see DeleteContainer()). Runs |done| when finished.
++void ClearContainerStorage(Profile* profile,
++                           std::string_view id,
++                           base::OnceClosure done);
++
++// Drops every recently closed tab, window and group navigation that was in
++// container |id|, so reopening a closed tab cannot bring the container back
++// and the next start can delete its storage. Loads the recently closed list
++// first if needed.
++void ForgetContainerInClosedTabs(Profile* profile, std::string_view id);
++
+ // Opens |url| in a new tab of |browser| inside container |id| at |index| (-1
+ // for the end). WebUI pages such as the new tab page open in the container
+ // too. about:blank does not: a SiteInstance without a site cannot hold a
+--- a/chrome/browser/neon/spaces/BUILD.gn
++++ b/chrome/browser/neon/spaces/BUILD.gn
+@@ -9,6 +9,8 @@ source_set("spaces") {
+   sources = [
+     "space.cc",
+     "space.h",
++    "space_style.cc",
++    "space_style.h",
+     "spaces_service.cc",
+     "spaces_service.h",
+     "spaces_service_factory.cc",
+@@ -17,6 +19,7 @@ source_set("spaces") {
+ 
+   public_deps = [
+     "//base",
++    "//base:i18n",
+     "//chrome/browser/profiles:profile",
+     "//components/keyed_service/core",
+     "//skia",
+--- /dev/null
++++ b/chrome/browser/neon/spaces/space_style.cc
+@@ -0,0 +1,94 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/neon/spaces/space_style.h"
++
++#include <algorithm>
++#include <array>
++
++#include "base/i18n/break_iterator.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/neon/spaces/space.h"
++
++namespace neon::spaces {
++
++namespace {
++
++constexpr auto kColors = std::to_array<SkColor>({
++    SkColorSetRGB(0x1a, 0x73, 0xe8),  // blue
++    SkColorSetRGB(0xd9, 0x30, 0x25),  // red
++    SkColorSetRGB(0xf9, 0xab, 0x00),  // yellow
++    SkColorSetRGB(0x1e, 0x8e, 0x3e),  // green
++    SkColorSetRGB(0xd0, 0x18, 0x84),  // pink
++    SkColorSetRGB(0x93, 0x34, 0xe6),  // purple
++    SkColorSetRGB(0x00, 0x7b, 0x83),  // cyan
++    SkColorSetRGB(0xe8, 0x71, 0x0a),  // orange
++    SkColorSetRGB(0x5f, 0x63, 0x68),  // grey
++});
++
++constexpr auto kVectorIcons = std::to_array<std::string_view>({
++    "home", "work", "code", "science", "shopping", "travel", "games", "pets",
++    "star", "music",
++});
++
++}  // namespace
++
++base::span<const SkColor> GetSpaceColors() {
++  return kColors;
++}
++
++base::span<const std::string_view> GetSpaceVectorIconNames() {
++  return kVectorIcons;
++}
++
++bool IsVectorIcon(std::string_view icon) {
++  if (!base::StartsWith(icon, kVectorIconPrefix)) {
++    return false;
++  }
++  icon.remove_prefix(std::char_traits<char>::length(kVectorIconPrefix));
++  return std::ranges::contains(kVectorIcons, icon);
++}
++
++std::string NormalizeSpaceIcon(std::string_view icon) {
++  if (IsVectorIcon(icon)) {
++    return std::string(icon);
++  }
++  std::u16string text;
++  base::TrimWhitespace(base::UTF8ToUTF16(icon), base::TRIM_ALL, &text);
++  if (text.empty()) {
++    return std::string();
++  }
++  // Keep the first user-perceived character (an emoji with its modifiers and
++  // joiners counts as one).
++  base::i18n::BreakIterator iter(text, base::i18n::BreakIterator::BREAK_CHARACTER);
++  if (iter.Init() && iter.Advance()) {
++    text = text.substr(0, iter.pos());
++  }
++  return base::UTF16ToUTF8(text);
++}
++
++std::string GetNewSpaceName(const std::vector<Space>& spaces) {
++  for (int n = 1;; ++n) {
++    const std::string name = base::StrCat({"Space ", base::NumberToString(n)});
++    if (std::ranges::none_of(
++            spaces, [&](const Space& space) { return space.name == name; })) {
++      return name;
++    }
++  }
++}
++
++SkColor GetNewSpaceColor(const std::vector<Space>& spaces) {
++  for (SkColor color : kColors) {
++    if (std::ranges::none_of(
++            spaces, [&](const Space& space) { return space.color == color; })) {
++      return color;
++    }
++  }
++  return kColors[spaces.size() % kColors.size()];
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/neon/spaces/space_style.h
+@@ -0,0 +1,47 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_NEON_SPACES_SPACE_STYLE_H_
++#define CHROME_BROWSER_NEON_SPACES_SPACE_STYLE_H_
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "third_party/skia/include/core/SkColor.h"
++
++namespace neon::spaces {
++
++struct Space;
++
++// The colours a space can take, in the order the pickers show them. Mid tones
++// that read on light and dark sidebars. A space may also have no colour
++// (SK_ColorTRANSPARENT), which draws its icon as an outline.
++base::span<const SkColor> GetSpaceColors();
++
++// A space icon is either text (an emoji or a few characters), empty (the
++// first letter of the name is shown), or one of a fixed set of vector icons,
++// stored as kVectorIconPrefix plus the icon's name.
++inline constexpr char kVectorIconPrefix[] = "vector:";
++
++// The names of the vector icons, in picker order.
++base::span<const std::string_view> GetSpaceVectorIconNames();
++
++// Whether |icon| names one of the vector icons.
++bool IsVectorIcon(std::string_view icon);
++
++// Normalises an icon typed by the user: trims whitespace and keeps at most
++// the first two characters (one emoji, possibly with a modifier), or a known
++// vector icon id unchanged. Returns an empty string for blank input.
++std::string NormalizeSpaceIcon(std::string_view icon);
++
++// The name and colour a new space gets: "Space N" with the lowest free N, and
++// the first palette colour no space uses yet.
++std::string GetNewSpaceName(const std::vector<Space>& spaces);
++SkColor GetNewSpaceColor(const std::vector<Space>& spaces);
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_NEON_SPACES_SPACE_STYLE_H_
+--- a/chrome/browser/neon/spaces/spaces_service.cc
++++ b/chrome/browser/neon/spaces/spaces_service.cc
+@@ -11,6 +11,7 @@
+ #include "base/functional/bind.h"
+ #include "base/strings/string_util.h"
+ #include "base/uuid.h"
++#include "chrome/browser/neon/spaces/space_style.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+ #include "components/prefs/pref_service.h"
+@@ -56,6 +57,8 @@ void SpacesService::RegisterProfilePrefs
+     user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterListPref(kSpacesListPref);
+   registry->RegisterDictionaryPref(kSavedGroupContainersPref);
++  registry->RegisterBooleanPref(kShowSwitcherRowPref, true);
++  registry->RegisterBooleanPref(kSwipeToSwitchPref, true);
+ }
+ 
+ const Space* SpacesService::GetSpace(std::string_view id) const {
+@@ -101,7 +104,8 @@ std::optional<std::string> SpacesService
+     return std::nullopt;
+   }
+   Space space(base::Uuid::GenerateRandomV4().AsLowercaseString(),
+-              std::string(name), std::string(icon), color, *container_id);
++              std::string(name), NormalizeSpaceIcon(icon), color,
++              *container_id);
+   std::string id = space.id;
+   spaces_.push_back(std::move(space));
+   Save();
+@@ -116,14 +120,28 @@ bool SpacesService::UpdateSpace(std::str
+   if (!space) {
+     return false;
+   }
+-  if (!space->is_default()) {
+-    containers_api::UpdateContainer(profile_, space->container_id, name,
+-                                    SkColorSetA(color, SK_AlphaOPAQUE));
++  // A space always has a name: a blank one keeps the old name.
++  std::string new_name(base::TrimWhitespaceASCII(name, base::TRIM_ALL));
++  if (new_name.empty()) {
++    new_name = space->name;
++  }
++  std::string new_icon = NormalizeSpaceIcon(icon);
++  if (new_name == space->name && new_icon == space->icon &&
++      color == space->color) {
++    return true;
+   }
+-  space->name = std::string(name);
+-  space->icon = std::string(icon);
++  space->name = new_name;
++  space->icon = std::move(new_icon);
+   space->color = color;
++  const std::string container_id = space->container_id;
+   Save();
++  // Renaming the container reloads the list from the pref (see
++  // OnContainersChanged()), which replaces |spaces_|: do it once the pref
++  // holds the new values, and after the last use of |space|.
++  if (!container_id.empty()) {
++    containers_api::UpdateContainer(profile_, container_id, new_name,
++                                    SkColorSetA(color, SK_AlphaOPAQUE));
++  }
+   return true;
+ }
+ 
+--- a/chrome/browser/neon/spaces/spaces_service.h
++++ b/chrome/browser/neon/spaces/spaces_service.h
+@@ -29,6 +29,10 @@ namespace neon::spaces {
+ // Profile pref: the ordered space list, a list of Space dicts. The first entry
+ // is the default space. Local to the device, not synced.
+ inline constexpr char kSpacesListPref[] = "neon.spaces.list";
++// Whether the sidebar shows the row of space icons below the tabs.
++inline constexpr char kShowSwitcherRowPref[] = "neon.spaces.show_switcher_row";
++// Whether a sideways swipe or wheel over the sidebar switches spaces.
++inline constexpr char kSwipeToSwitchPref[] = "neon.spaces.swipe_to_switch";
+ // The container each saved tab group's tabs were in when it was last open, by
+ // saved group id: a container id, or "" for the default partition. A closed
+ // saved group reopens there.
+--- a/chrome/browser/ui/neon/spaces/BUILD.gn
++++ b/chrome/browser/ui/neon/spaces/BUILD.gn
+@@ -17,8 +17,23 @@ source_set("hooks") {
+ }
+ 
+ # Visible space per window, switching, new tab placement and commands.
++# The vector icons a space can use.
++source_set("icons") {
++  sources = [
++    "space_vector_icons.cc",
++    "space_vector_icons.h",
++  ]
++  deps = [
++    "//chrome/browser/neon/spaces",
++    "//components/vector_icons",
++    "//ui/gfx",
++  ]
++}
++
+ source_set("spaces") {
+   sources = [
++    "space_management.cc",
++    "space_management.h",
+     "spaces_window_controller.cc",
+     "spaces_window_controller.h",
+     "spaces_window_manager.cc",
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/space_management.cc
+@@ -0,0 +1,132 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/neon/spaces/space_management.h"
++
++#include <vector>
++
++#include "base/functional/callback_helpers.h"
++#include "base/logging.h"
++#include "base/values.h"
++#include "chrome/browser/neon/containers_api.h"
++#include "chrome/browser/neon/spaces/space.h"
++#include "chrome/browser/neon/spaces/space_style.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "chrome/browser/neon/spaces/spaces_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/neon/spaces/spaces_window_controller.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/prefs/pref_service.h"
++
++namespace neon::spaces {
++
++namespace {
++
++std::vector<BrowserWindowInterface*> GetWindows(Profile* profile) {
++  std::vector<BrowserWindowInterface*> windows;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [&](BrowserWindowInterface* browser) {
++        if (browser->GetProfile() == profile && browser->GetTabStripModel()) {
++          windows.push_back(browser);
++        }
++        return true;
++      });
++  return windows;
++}
++
++}  // namespace
++
++int CountTabsInSpace(Profile* profile, const std::string& space_id) {
++  SpacesService* service = SpacesServiceFactory::GetForProfile(profile);
++  if (!service || !service->GetSpace(space_id)) {
++    return 0;
++  }
++  int count = 0;
++  for (BrowserWindowInterface* browser : GetWindows(profile)) {
++    TabStripModel* model = browser->GetTabStripModel();
++    for (int i = 0; i < model->count(); ++i) {
++      if (service->GetSpaceIdForContainer(containers_api::GetTabContainerId(
++              model->GetWebContentsAt(i))) == space_id) {
++        ++count;
++      }
++    }
++  }
++  return count;
++}
++
++std::optional<std::string> CreateSpace(Profile* profile) {
++  SpacesService* service = SpacesServiceFactory::GetForProfile(profile);
++  if (!service || !containers_api::IsAvailable(profile)) {
++    return std::nullopt;
++  }
++  return service->CreateSpace(GetNewSpaceName(service->spaces()),
++                              std::string(),
++                              GetNewSpaceColor(service->spaces()));
++}
++
++bool DeleteSpace(Profile* profile, const std::string& space_id) {
++  SpacesService* service = SpacesServiceFactory::GetForProfile(profile);
++  if (!service) {
++    return false;
++  }
++  const Space* space = service->GetSpace(space_id);
++  std::optional<size_t> index = service->GetSpaceIndex(space_id);
++  if (!space || !index || space->is_default()) {
++    return false;
++  }
++  const std::string container_id = space->container_id;
++  // The default space is first and stays, so there is always a space before.
++  const std::string neighbour = service->spaces()[*index - 1].id;
++
++  for (BrowserWindowInterface* browser : GetWindows(profile)) {
++    if (SpacesWindowController* controller =
++            SpacesWindowController::FromBrowser(browser)) {
++      controller->EvacuateSpace(space_id, neighbour);
++      continue;
++    }
++    // Popups and app windows have no space but can hold a tab of the space's
++    // container (a popup opened by one of its pages). They close with it.
++    TabStripModel* model = browser->GetTabStripModel();
++    for (int i = model->count() - 1; i >= 0; --i) {
++      if (i < model->count() && containers_api::GetTabContainerId(
++                                    model->GetWebContentsAt(i)) == container_id) {
++        model->DetachAndDeleteWebContentsAt(i);
++      }
++    }
++  }
++
++  // |space| is gone after this.
++  if (!service->DeleteSpace(space_id)) {
++    return false;
++  }
++
++  PrefService* prefs = profile->GetPrefs();
++  base::DictValue groups = prefs->GetDict(kSavedGroupContainersPref).Clone();
++  std::vector<std::string> stale;
++  for (const auto [group, value] : groups) {
++    if (value.is_string() && value.GetString() == container_id) {
++      stale.push_back(group);
++    }
++  }
++  if (!stale.empty()) {
++    for (const std::string& group : stale) {
++      groups.Remove(group);
++    }
++    prefs->SetDict(kSavedGroupContainersPref, std::move(groups));
++  }
++
++  containers_api::ForgetContainerInClosedTabs(profile, container_id);
++  containers_api::ClearContainerStorage(
++      profile, container_id,
++      base::BindOnce(
++          [](const std::string& id) {
++            VLOG(1) << "Neon: cleared the storage of deleted container " << id;
++          },
++          container_id));
++  return true;
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/space_management.h
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NEON_SPACES_SPACE_MANAGEMENT_H_
++#define CHROME_BROWSER_UI_NEON_SPACES_SPACE_MANAGEMENT_H_
++
++#include <optional>
++#include <string>
++
++class Profile;
++
++// Creating and deleting spaces, shared by the sidebar and the settings page.
++namespace neon::spaces {
++
++// The number of open tabs of space |space_id| in all windows of |profile|.
++int CountTabsInSpace(Profile* profile, const std::string& space_id);
++
++// Adds a space at the end of the list, with a container of its own, the first
++// free "Space N" name and the first unused palette colour. Returns its id, or
++// std::nullopt if the profile has no spaces or the container could not be
++// created.
++std::optional<std::string> CreateSpace(Profile* profile);
++
++// Deletes space |space_id| and everything in it:
++// - every window showing it first moves to the space before it in the list,
++//   then every tab of the space closes, in all windows of the profile, without
++//   unload handlers and without recently closed entries;
++// - the space and its container are removed from the lists;
++// - the container's cookies, site storage and cache are cleared now, and its
++//   directory is deleted at the next start;
++// - saved state that refers to the container is dropped: recently closed
++//   tabs and the saved tab group containers pref.
++// The default space cannot be deleted. Returns false if nothing was deleted.
++bool DeleteSpace(Profile* profile, const std::string& space_id);
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_NEON_SPACES_SPACE_MANAGEMENT_H_
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/space_vector_icons.cc
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/neon/spaces/space_vector_icons.h"
++
++#include <string>
++
++#include "chrome/browser/neon/spaces/space_style.h"
++#include "components/vector_icons/vector_icons.h"
++#include "ui/gfx/vector_icon_types.h"
++
++namespace neon::spaces {
++
++const gfx::VectorIcon* GetSpaceVectorIcon(std::string_view icon) {
++  if (!IsVectorIcon(icon)) {
++    return nullptr;
++  }
++  icon.remove_prefix(std::char_traits<char>::length(kVectorIconPrefix));
++  // Keep in sync with GetSpaceVectorIconNames().
++  static constexpr struct {
++    std::string_view name;
++    const gfx::VectorIcon& icon;
++  } kIcons[] = {
++      {"home", vector_icons::kHomeIcon},
++      {"work", vector_icons::kWorkIcon},
++      {"code", vector_icons::kCodeIcon},
++      {"science", vector_icons::kScienceIcon},
++      {"shopping", vector_icons::kShoppingBagIcon},
++      {"travel", vector_icons::kFlightIcon},
++      {"games", vector_icons::kVideogameAssetIcon},
++      {"pets", vector_icons::kPetsIcon},
++      {"star", vector_icons::kStarFilledIcon},
++      {"music", vector_icons::kHeadphonesIcon},
++  };
++  for (const auto& entry : kIcons) {
++    if (entry.name == icon) {
++      return &entry.icon;
++    }
++  }
++  return nullptr;
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/space_vector_icons.h
+@@ -0,0 +1,22 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NEON_SPACES_SPACE_VECTOR_ICONS_H_
++#define CHROME_BROWSER_UI_NEON_SPACES_SPACE_VECTOR_ICONS_H_
++
++#include <string_view>
++
++namespace gfx {
++struct VectorIcon;
++}  // namespace gfx
++
++namespace neon::spaces {
++
++// The vector icon a space icon value names ("vector:home", see
++// space_style.h), or null for text icons and unknown names.
++const gfx::VectorIcon* GetSpaceVectorIcon(std::string_view icon);
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_NEON_SPACES_SPACE_VECTOR_ICONS_H_
+--- a/chrome/browser/ui/neon/spaces/spaces_window_controller.cc
++++ b/chrome/browser/ui/neon/spaces/spaces_window_controller.cc
+@@ -535,9 +535,63 @@ void SpacesWindowController::OnSpaceTabC
+ }
+ 
+ void SpacesWindowController::OpenNewTabInSpace(const std::string& space_id) {
++  AddTabInSpace(space_id, GURL(), /*foreground=*/true);
++}
++
++content::WebContents* SpacesWindowController::AddTabInSpace(
++    const std::string& space_id,
++    const GURL& url,
++    bool foreground,
++    bool pinned) {
++  // The tab has no opener, so it takes the container GetContainerForNewTab()
++  // gives. A new tab page or a web page in a container is safe; about:blank
++  // would open in the default partition (see containers_api.h).
+   pending_new_tab_space_ = space_id;
+-  chrome::AddTabAt(browser_, GURL(), -1, /*foreground=*/true);
++  content::WebContents* contents =
++      chrome::AddAndReturnTabAt(browser_, url, -1, foreground,
++                                /*group=*/std::nullopt, pinned);
+   pending_new_tab_space_.reset();
++  return contents;
++}
++
++int SpacesWindowController::CountTabsInSpace(
++    const std::string& space_id) const {
++  int count = 0;
++  for (int i = 0; model_ && i < model_->count(); ++i) {
++    if (GetSpaceIdOf(model_->GetWebContentsAt(i)) == space_id) {
++      ++count;
++    }
++  }
++  return count;
++}
++
++void SpacesWindowController::EvacuateSpace(const std::string& space_id,
++                                           const std::string& to_space_id) {
++  if (!model_ || model_->empty()) {
++    return;
++  }
++  const bool visible =
++      model_->GetActiveTab() && GetSpaceIdOf(model_->GetActiveTab()) == space_id;
++  if (visible || CountTabsInSpace(space_id) == model_->count()) {
++    // Leave the space first, so the window never runs out of tabs and the
++    // last-tab rule does not open a new tab page in the space.
++    tabs::TabInterface* tab = GetLastActiveTabOfSpace(to_space_id);
++    if (!tab) {
++      AddTabInSpace(to_space_id, GURL(), /*foreground=*/true);
++    } else {
++      model_->ActivateTabAt(
++          model_->GetIndexOfTab(tab),
++          TabStripUserGestureDetails(
++              TabStripUserGestureDetails::GestureType::kOther));
++    }
++  }
++  last_visible_space_ = GetVisibleSpaceId();
++  for (int i = model_->count() - 1; i >= 0; --i) {
++    if (i < model_->count() &&
++        GetSpaceIdOf(model_->GetWebContentsAt(i)) == space_id) {
++      model_->DetachAndDeleteWebContentsAt(i);
++    }
++  }
+ }
+ 
+ void SpacesWindowController::SwitchAwayFrom(const std::string& space_id) {
+--- a/chrome/browser/ui/neon/spaces/spaces_window_controller.h
++++ b/chrome/browser/ui/neon/spaces/spaces_window_controller.h
+@@ -20,6 +20,7 @@
+ #include "components/tab_groups/tab_group_id.h"
+ 
+ class BrowserWindowInterface;
++class GURL;
+ class TabStripModel;
+ 
+ namespace content {
+@@ -123,6 +124,24 @@ class SpacesWindowController : public Ta
+   // its most recently active tab, or opens a new tab page in it.
+   void ActivateSpace(const std::string& space_id);
+ 
++  // Opens |url| (the new tab page if empty) in a new tab of space |space_id|
++  // at the end of the space's tabs (pinned tabs: of its pinned tabs). Works
++  // whether or not spaces are active in this window. Returns the new tab's
++  // contents.
++  content::WebContents* AddTabInSpace(const std::string& space_id,
++                                      const GURL& url,
++                                      bool foreground,
++                                      bool pinned = false);
++
++  // The number of tabs of space |space_id| in this window.
++  int CountTabsInSpace(const std::string& space_id) const;
++
++  // Space |space_id| is being deleted: if it is visible, shows |to_space_id|
++  // first (its last active tab, or a new tab page), then closes every tab of
++  // |space_id| without unload handlers and without recently closed entries.
++  void EvacuateSpace(const std::string& space_id,
++                     const std::string& to_space_id);
++
+   // The tab of |space_id| that was active most recently, or null.
+   tabs::TabInterface* GetLastActiveTabOfSpace(const std::string& space_id) const;
+ 
+--- a/chrome/browser/ui/views/neon/spaces/BUILD.gn
++++ b/chrome/browser/ui/views/neon/spaces/BUILD.gn
+@@ -5,6 +5,8 @@
+ # The sidebar pager: one page per space in the vertical tab strip.
+ source_set("spaces") {
+   sources = [
++    "space_edit_bubble.cc",
++    "space_edit_bubble.h",
+     "space_icon_view.cc",
+     "space_icon_view.h",
+     "space_page_view.cc",
+@@ -38,6 +40,9 @@ source_set("spaces") {
+ 
+   deps = [
+     "//base:i18n",
++    "//chrome/app/vector_icons",
++    "//chrome/browser/ui/neon/spaces:icons",
++    "//components/prefs",
+     "//cc/paint",
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/ui:layout_constants",
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/space_edit_bubble.cc
+@@ -0,0 +1,483 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/neon/spaces/space_edit_bubble.h"
++
++#include <memory>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/scoped_observation.h"
++#include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "cc/paint/paint_flags.h"
++#include "chrome/browser/neon/spaces/space.h"
++#include "chrome/browser/neon/spaces/space_style.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "chrome/browser/neon/spaces/spaces_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/neon/spaces/space_management.h"
++#include "chrome/browser/ui/views/neon/spaces/space_icon_view.h"
++#include "ui/accessibility/ax_enums.mojom.h"
++#include "ui/base/interaction/element_identifier.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/dialog_model.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/rect_f.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/bubble/bubble_border.h"
++#include "ui/views/bubble/bubble_dialog_model_host.h"
++#include "ui/views/controls/button/button.h"
++#include "ui/views/controls/focus_ring.h"
++#include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/controls/textfield/textfield.h"
++#include "ui/views/controls/textfield/textfield_controller.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/layout/box_layout_view.h"
++#include "ui/views/style/typography.h"
++#include "ui/views/view_tracker.h"
++#include "ui/views/widget/widget.h"
++
++namespace neon::spaces {
++
++namespace {
++
++DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kSpaceNameFieldId);
++
++constexpr int kChoiceSize = 28;
++constexpr int kChoiceIconSize = 18;
++constexpr int kChoiceSpacing = 4;
++constexpr int kSectionSpacing = 12;
++constexpr int kCornerRadius = 8;
++// The bubble is too narrow for more in one row.
++constexpr size_t kChoicesPerRow = 6;
++
++// Labels of GetSpaceColors() and GetSpaceVectorIconNames(), in order.
++constexpr std::u16string_view kColorLabels[] = {
++    u"Blue", u"Red",    u"Yellow", u"Green", u"Pink",
++    u"Purple", u"Cyan", u"Orange", u"Grey"};
++constexpr std::u16string_view kIconLabels[] = {
++    u"Home", u"Work", u"Code", u"Science", u"Shopping",
++    u"Travel", u"Games", u"Pets", u"Star", u"Music"};
++
++std::string ColorKey(SkColor color) {
++  return SkColorGetA(color) ? base::HexEncode(base::byte_span_from_ref(color))
++                            : "none";
++}
++
++// The edit view of the space being edited, so a second edit replaces it.
++views::ViewTracker& CurrentEditView() {
++  static base::NoDestructor<views::ViewTracker> tracker;
++  return *tracker;
++}
++
++// One choice in the icon or colour row: a square button that shows a ring
++// when selected.
++class ChoiceButton : public views::Button {
++  METADATA_HEADER(ChoiceButton, views::Button)
++
++ public:
++  using Painter = base::RepeatingCallback<
++      void(gfx::Canvas*, const gfx::RectF&, const ui::ColorProvider*)>;
++
++  ChoiceButton(PressedCallback callback,
++               std::string object_name,
++               std::u16string_view label,
++               Painter painter)
++      : views::Button(std::move(callback)),
++        object_name_(std::move(object_name)),
++        painter_(std::move(painter)) {
++    SetTooltipText(std::u16string(label));
++    GetViewAccessibility().SetName(std::u16string(label));
++    GetViewAccessibility().SetRole(ax::mojom::Role::kRadioButton);
++    views::InstallRoundRectHighlightPathGenerator(this, gfx::Insets(),
++                                                  kCornerRadius);
++    views::FocusRing::Install(this);
++  }
++
++  void SetSelected(bool selected) {
++    if (selected_ != selected) {
++      selected_ = selected;
++      GetViewAccessibility().SetCheckedState(
++          selected ? ax::mojom::CheckedState::kTrue
++                   : ax::mojom::CheckedState::kFalse);
++      SchedulePaint();
++    }
++  }
++  bool selected() const { return selected_; }
++
++  // views::View:
++  std::string GetObjectName() const override { return object_name_; }
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(kChoiceSize, kChoiceSize);
++  }
++
++  // views::Button:
++  void PaintButtonContents(gfx::Canvas* canvas) override {
++    const ui::ColorProvider* colors = GetColorProvider();
++    if (!colors) {
++      return;
++    }
++    gfx::RectF bounds(GetLocalBounds());
++    if (selected_ || GetState() == STATE_HOVERED) {
++      cc::PaintFlags flags;
++      flags.setAntiAlias(true);
++      flags.setStyle(cc::PaintFlags::kStroke_Style);
++      flags.setStrokeWidth(2);
++      SkColor ring = colors->GetColor(kColorTabForegroundActiveFrameActive);
++      flags.setColor(selected_ ? ring : SkColorSetA(ring, 0x40));
++      gfx::RectF ring_bounds = bounds;
++      ring_bounds.Inset(1);
++      canvas->DrawRoundRect(ring_bounds, kCornerRadius, flags);
++    }
++    painter_.Run(canvas, bounds, colors);
++  }
++
++ private:
++  const std::string object_name_;
++  Painter painter_;
++  bool selected_ = false;
++};
++
++BEGIN_METADATA(ChoiceButton)
++END_METADATA
++
++// The contents of the edit bubble: name, icon and colour. Every change is
++// saved at once.
++class SpaceEditView : public views::View,
++                      public views::TextfieldController,
++                      public SpacesService::Observer {
++  METADATA_HEADER(SpaceEditView, views::View)
++
++ public:
++  SpaceEditView(Profile* profile, const Space& space)
++      : service_(SpacesServiceFactory::GetForProfile(profile)),
++        space_id_(space.id),
++        icon_(space.icon),
++        color_(space.color) {
++    auto* layout = SetLayoutManager(std::make_unique<views::BoxLayout>(
++        views::BoxLayout::Orientation::kVertical, gfx::Insets(),
++        kSectionSpacing));
++    layout->set_cross_axis_alignment(
++        views::BoxLayout::CrossAxisAlignment::kStretch);
++
++    name_field_ = AddChildView(std::make_unique<views::Textfield>());
++    name_field_->SetText(base::UTF8ToUTF16(space.name));
++    name_field_->SetAccessibleName(u"Space name");
++    name_field_->SetPlaceholderText(u"Name");
++    name_field_->set_controller(this);
++    name_field_->SelectAll(/*reversed=*/false);
++
++    AddSectionLabel(u"Icon");
++    auto* icon_grid = AddGrid();
++    auto* icons = AddRow(icon_grid);
++    AddIconChoice(icons, std::string(), u"First letter");
++    const auto names = GetSpaceVectorIconNames();
++    for (size_t i = 0; i < names.size(); ++i) {
++      if ((i + 1) % kChoicesPerRow == 0) {
++        icons = AddRow(icon_grid);
++      }
++      AddIconChoice(icons, base::StrCat({kVectorIconPrefix, names[i]}),
++                    kIconLabels[i]);
++    }
++    // Fills the end of the last row of icons.
++    emoji_field_ = icons->AddChildView(std::make_unique<views::Textfield>());
++    emoji_field_->SetAccessibleName(u"Emoji");
++    emoji_field_->SetPlaceholderText(u"Emoji");
++    emoji_field_->SetDefaultWidthInChars(5);
++    emoji_field_->set_controller(this);
++    if (!icon_.empty() && !IsVectorIcon(icon_)) {
++      emoji_field_->SetText(base::UTF8ToUTF16(icon_));
++    }
++
++    AddSectionLabel(u"Colour");
++    auto* color_grid = AddGrid();
++    auto* colors = AddRow(color_grid);
++    AddColorChoice(colors, SK_ColorTRANSPARENT, u"No colour");
++    const auto palette = GetSpaceColors();
++    for (size_t i = 0; i < palette.size(); ++i) {
++      if ((i + 1) % kChoicesPerRow == 0) {
++        colors = AddRow(color_grid);
++      }
++      AddColorChoice(colors, palette[i], kColorLabels[i]);
++    }
++    UpdateSelection();
++    observation_.Observe(service_);
++  }
++
++  ~SpaceEditView() override = default;
++
++  views::Textfield* name_field() const { return name_field_; }
++  const std::string& space_id() const { return space_id_; }
++
++  // views::View:
++  std::string GetObjectName() const override {
++    return base::StrCat({"SpaceEditView/", space_id_});
++  }
++
++  // views::TextfieldController:
++  void ContentsChanged(views::Textfield* sender,
++                       const std::u16string& new_contents) override {
++    if (sender == emoji_field_) {
++      const std::string icon =
++          NormalizeSpaceIcon(base::UTF16ToUTF8(new_contents));
++      if (!icon.empty()) {
++        icon_ = icon;
++      } else if (!IsVectorIcon(icon_)) {
++        icon_.clear();
++      }
++      UpdateSelection();
++    } else {
++      // The letter choice previews the name's first letter.
++      for (auto& [button, icon] : icon_choices_) {
++        button->SchedulePaint();
++      }
++    }
++    Save();
++  }
++
++  // SpacesService::Observer:
++  void OnSpacesChanged() override {
++    const Space* space = service_->GetSpace(space_id_);
++    if (!space) {
++      // Deleted while being edited.
++      if (GetWidget()) {
++        GetWidget()->Close();
++      }
++      return;
++    }
++    if (space->icon != icon_ || space->color != color_) {
++      icon_ = space->icon;
++      color_ = space->color;
++      UpdateSelection();
++    }
++  }
++
++ private:
++  void AddSectionLabel(std::u16string_view text) {
++    auto* label = AddChildView(std::make_unique<views::Label>(
++        std::u16string(text), views::style::CONTEXT_DIALOG_BODY_TEXT,
++        views::style::STYLE_SECONDARY));
++    label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++  }
++
++  // A column of rows of choices.
++  views::BoxLayoutView* AddGrid() {
++    auto* grid = AddChildView(std::make_unique<views::BoxLayoutView>());
++    grid->SetOrientation(views::BoxLayout::Orientation::kVertical);
++    grid->SetBetweenChildSpacing(kChoiceSpacing);
++    grid->SetCrossAxisAlignment(views::BoxLayout::CrossAxisAlignment::kStart);
++    return grid;
++  }
++
++  views::BoxLayoutView* AddRow(views::View* parent) {
++    auto* row = parent->AddChildView(std::make_unique<views::BoxLayoutView>());
++    row->SetOrientation(views::BoxLayout::Orientation::kHorizontal);
++    row->SetBetweenChildSpacing(kChoiceSpacing);
++    return row;
++  }
++
++  void AddIconChoice(views::View* row,
++                     std::string icon,
++                     std::u16string_view label) {
++    auto* button = row->AddChildView(std::make_unique<ChoiceButton>(
++        base::BindRepeating(&SpaceEditView::SelectIcon,
++                            base::Unretained(this), icon),
++        base::StrCat({"SpaceIconChoice/", icon.empty() ? "letter" : icon}),
++        label,
++        base::BindRepeating(
++            [](SpaceEditView* view, std::string icon, gfx::Canvas* canvas,
++               const gfx::RectF& bounds, const ui::ColorProvider* colors) {
++              Space preview;
++              preview.icon = icon;
++              preview.color = view->color_;
++              preview.name = base::UTF16ToUTF8(view->name_field_->GetText());
++              PaintSpaceIcon(
++                  canvas, bounds, kChoiceIconSize, GetSpaceGlyph(preview),
++                  preview.color,
++                  colors->GetColor(kColorTabForegroundActiveFrameActive),
++                  /*emphasized=*/true);
++            },
++            base::Unretained(this), icon)));
++    icon_choices_.emplace_back(button, std::move(icon));
++  }
++
++  void AddColorChoice(views::View* row,
++                      SkColor color,
++                      std::u16string_view label) {
++    auto* button = row->AddChildView(std::make_unique<ChoiceButton>(
++        base::BindRepeating(&SpaceEditView::SelectColor,
++                            base::Unretained(this), color),
++        base::StrCat({"SpaceColorChoice/", ColorKey(color)}), label,
++        base::BindRepeating(
++            [](SkColor color, gfx::Canvas* canvas, const gfx::RectF& bounds,
++               const ui::ColorProvider* colors) {
++              gfx::RectF dot = bounds;
++              dot.ClampToCenteredSize(gfx::SizeF(16, 16));
++              cc::PaintFlags flags;
++              flags.setAntiAlias(true);
++              if (SkColorGetA(color)) {
++                flags.setColor(color);
++                canvas->DrawCircle(dot.CenterPoint(), dot.width() / 2, flags);
++                return;
++              }
++              flags.setStyle(cc::PaintFlags::kStroke_Style);
++              flags.setStrokeWidth(1.5f);
++              flags.setColor(
++                  colors->GetColor(kColorTabForegroundActiveFrameActive));
++              canvas->DrawCircle(dot.CenterPoint(), dot.width() / 2 - 0.75f,
++                                 flags);
++            },
++            color)));
++    color_choices_.emplace_back(button, color);
++  }
++
++  void SelectIcon(std::string icon) {
++    icon_ = std::move(icon);
++    if (!emoji_field_->GetText().empty()) {
++      emoji_field_->SetText(std::u16string());
++    }
++    UpdateSelection();
++    Save();
++  }
++
++  void SelectColor(SkColor color) {
++    color_ = color;
++    UpdateSelection();
++    Save();
++  }
++
++  void UpdateSelection() {
++    for (auto& [button, icon] : icon_choices_) {
++      button->SetSelected(icon == icon_);
++      button->SchedulePaint();
++    }
++    for (auto& [button, color] : color_choices_) {
++      button->SetSelected(color == color_);
++    }
++  }
++
++  void Save() {
++    service_->UpdateSpace(space_id_, base::UTF16ToUTF8(name_field_->GetText()),
++                          icon_, color_);
++  }
++
++  const raw_ptr<SpacesService> service_;
++  const std::string space_id_;
++  std::string icon_;
++  SkColor color_;
++  raw_ptr<views::Textfield> name_field_ = nullptr;
++  raw_ptr<views::Textfield> emoji_field_ = nullptr;
++  std::vector<std::pair<raw_ptr<ChoiceButton>, std::string>> icon_choices_;
++  std::vector<std::pair<raw_ptr<ChoiceButton>, SkColor>> color_choices_;
++  base::ScopedObservation<SpacesService, SpacesService::Observer>
++      observation_{this};
++};
++
++BEGIN_METADATA(SpaceEditView)
++END_METADATA
++
++}  // namespace
++
++views::Widget* ShowSpaceEditBubble(views::View* anchor,
++                                   Profile* profile,
++                                   const std::string& space_id) {
++  SpacesService* service = SpacesServiceFactory::GetForProfile(profile);
++  const Space* space = service ? service->GetSpace(space_id) : nullptr;
++  if (!anchor || !anchor->GetWidget() || !space) {
++    return nullptr;
++  }
++  if (views::View* current = CurrentEditView().view();
++      current && current->GetWidget()) {
++    current->GetWidget()->CloseNow();
++  }
++
++  auto view = std::make_unique<SpaceEditView>(profile, *space);
++  views::Textfield* name_field = view->name_field();
++  CurrentEditView().SetView(view.get());
++
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder()
++          .SetTitle(u"Edit space")
++          .AddCustomField(
++              std::make_unique<views::BubbleDialogModelHost::CustomView>(
++                  std::move(view),
++                  views::BubbleDialogModelHost::FieldType::kControl,
++                  name_field),
++              kSpaceNameFieldId)
++          .SetInitiallyFocusedField(kSpaceNameFieldId)
++          .AddOkButton(base::DoNothing(),
++                       ui::DialogModel::Button::Params().SetLabel(u"Done"))
++          .Build();
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), anchor, views::BubbleBorder::LEFT_BOTTOM);
++  views::Widget* widget = views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET);
++  widget->Show();
++  return widget;
++}
++
++views::Widget* GetSpaceEditBubbleForTesting() {
++  views::View* view = CurrentEditView().view();
++  return view ? view->GetWidget() : nullptr;
++}
++
++void ShowDeleteSpaceConfirmation(views::View* anchor,
++                                 Profile* profile,
++                                 const std::string& space_id) {
++  SpacesService* service = SpacesServiceFactory::GetForProfile(profile);
++  const Space* space = service ? service->GetSpace(space_id) : nullptr;
++  if (!anchor || !anchor->GetWidget() || !space || space->is_default()) {
++    return;
++  }
++  const int tabs = CountTabsInSpace(profile, space_id);
++  std::u16string body;
++  if (tabs == 0) {
++    body = u"No tabs are open in this space.";
++  } else if (tabs == 1) {
++    body = u"Its 1 open tab will close.";
++  } else {
++    body = base::StrCat(
++        {u"Its ", base::NumberToString16(tabs), u" open tabs will close."});
++  }
++  body += u" Its cookies and site data will be deleted. This can't be undone.";
++
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder()
++          .SetTitle(base::StrCat(
++              {u"Delete “", base::UTF8ToUTF16(space->name), u"”?"}))
++          .AddParagraph(ui::DialogModelLabel(body))
++          .AddOkButton(
++              base::BindOnce(
++                  [](base::WeakPtr<Profile> profile, std::string space_id) {
++                    if (profile) {
++                      DeleteSpace(profile.get(), space_id);
++                    }
++                  },
++                  profile->GetWeakPtr(), space_id),
++              ui::DialogModel::Button::Params().SetLabel(u"Delete"))
++          .AddCancelButton(base::DoNothing())
++          .OverrideDefaultButton(ui::mojom::DialogButton::kCancel)
++          .Build();
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), anchor, views::BubbleBorder::LEFT_BOTTOM);
++  views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
++      ->Show();
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/views/neon/spaces/space_edit_bubble.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_EDIT_BUBBLE_H_
++#define CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_EDIT_BUBBLE_H_
++
++#include <string>
++
++class Profile;
++
++namespace views {
++class View;
++class Widget;
++}  // namespace views
++
++namespace neon::spaces {
++
++// Shows the bubble that edits space |space_id| (name, icon and colour),
++// anchored to |anchor|. Changes apply as they are made. Closes a bubble
++// already open for another space. Returns the bubble's widget.
++views::Widget* ShowSpaceEditBubble(views::View* anchor,
++                                   Profile* profile,
++                                   const std::string& space_id);
++
++// The edit bubble on screen, if any.
++views::Widget* GetSpaceEditBubbleForTesting();
++
++// Asks whether to delete space |space_id|, saying how many tabs close, in a
++// bubble anchored to |anchor|. Deletes it (see DeleteSpace()) on confirmation.
++void ShowDeleteSpaceConfirmation(views::View* anchor,
++                                 Profile* profile,
++                                 const std::string& space_id);
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_NEON_SPACES_SPACE_EDIT_BUBBLE_H_
+--- a/chrome/browser/ui/views/neon/spaces/space_icon_view.cc
++++ b/chrome/browser/ui/views/neon/spaces/space_icon_view.cc
+@@ -10,6 +10,7 @@
+ #include "cc/paint/paint_flags.h"
+ #include "chrome/browser/neon/spaces/space.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/neon/spaces/space_vector_icons.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/color/color_provider.h"
+ #include "ui/gfx/canvas.h"
+@@ -17,7 +18,9 @@
+ #include "ui/gfx/font_list.h"
+ #include "ui/gfx/geometry/rect_f.h"
+ #include "ui/gfx/image/canvas_image_source.h"
++#include "ui/gfx/paint_vector_icon.h"
+ #include "ui/gfx/text_constants.h"
++#include "ui/gfx/vector_icon_types.h"
+ 
+ namespace neon::spaces {
+ 
+@@ -136,6 +139,17 @@ void PaintSpaceIcon(gfx::Canvas* canvas,
+   if (glyph.empty()) {
+     return;
+   }
++  if (const gfx::VectorIcon* vector =
++          GetSpaceVectorIcon(base::UTF16ToUTF8(glyph))) {
++    const int icon_size = std::max(8, size * 3 / 4);
++    const gfx::ImageSkia image =
++        gfx::CreateVectorIcon(*vector, icon_size, glyph_color);
++    canvas->DrawImageInt(
++        image,
++        static_cast<int>(bounds.x() + (bounds.width() - icon_size) / 2),
++        static_cast<int>(bounds.y() + (bounds.height() - icon_size) / 2));
++    return;
++  }
+   const gfx::FontList font_list =
+       gfx::FontList().DeriveWithSizeDelta(size / 2 - 12).DeriveWithWeight(
+           gfx::Font::Weight::SEMIBOLD);
+--- a/chrome/browser/ui/views/neon/spaces/space_switcher_row.cc
++++ b/chrome/browser/ui/views/neon/spaces/space_switcher_row.cc
+@@ -9,21 +9,32 @@
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
++#include "base/strings/strcat.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "cc/paint/paint_flags.h"
++#include "chrome/app/vector_icons/vector_icons.h"
+ #include "chrome/browser/neon/spaces/space.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/neon/spaces/space_management.h"
+ #include "chrome/browser/ui/neon/spaces/spaces_window_controller.h"
++#include "chrome/browser/ui/views/neon/spaces/space_edit_bubble.h"
+ #include "chrome/browser/ui/views/neon/spaces/space_icon_view.h"
++#include "components/prefs/pref_service.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/image_model.h"
+ #include "ui/base/mojom/menu_source_type.mojom.h"
+ #include "ui/color/color_provider.h"
++#include "ui/events/event.h"
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/geometry/insets.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/animation/ink_drop.h"
+ #include "ui/views/animation/ink_drop_host.h"
+ #include "ui/views/controls/button/button.h"
++#include "ui/views/controls/button/image_button.h"
+ #include "ui/views/controls/highlight_path_generator.h"
+ #include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/widget/widget.h"
+@@ -35,12 +46,29 @@ namespace {
+ constexpr int kRowHeight = 36;
+ constexpr int kButtonSize = 28;
+ constexpr int kIconSize = 18;
++constexpr int kAddIconSize = 16;
+ constexpr int kButtonSpacing = 4;
+ constexpr int kCornerRadius = 8;
+ constexpr int kMenuIconSize = 16;
+-// Kept free at the trailing end for the "new space" button (M4), and the
+-// same at the leading end so the icons stay centred.
++// The "new space" button and its gap, after the icons. Icons and button are
++// centred together.
+ constexpr int kReservedWidth = kButtonSize + kButtonSpacing;
++// Kept free at each end of the row.
++constexpr int kEdgePadding = 4;
++
++// Context menu commands. The compact menu uses the space indices below these.
++constexpr int kEditCommand = 1000;
++constexpr int kDeleteCommand = 1001;
++constexpr int kNewSpaceCommand = 1002;
++
++void InstallInkDrop(views::Button* button) {
++  views::InstallRoundRectHighlightPathGenerator(button, gfx::Insets(),
++                                                kCornerRadius);
++  views::InkDrop::Get(button)->SetMode(views::InkDropHost::InkDropMode::ON);
++  views::InkDrop::Get(button)->SetBaseColor(
++      kColorTabForegroundActiveFrameActive);
++  button->SetHasInkDropActionOnClick(true);
++}
+ 
+ }  // namespace
+ 
+@@ -48,21 +76,20 @@ class SpaceSwitcherRow::SpaceButton : pu
+   METADATA_HEADER(SpaceButton, views::Button)
+ 
+  public:
+-  SpaceButton(PressedCallback callback, std::string space_id)
+-      : views::Button(std::move(callback)), space_id_(std::move(space_id)) {
++  SpaceButton(SpaceSwitcherRow* row,
++              PressedCallback callback,
++              std::string space_id)
++      : views::Button(std::move(callback)),
++        row_(row),
++        space_id_(std::move(space_id)) {
+     icon_ = AddChildView(std::make_unique<SpaceIconView>(kIconSize));
+-    views::InstallRoundRectHighlightPathGenerator(this, gfx::Insets(),
+-                                                  kCornerRadius);
+-    views::InkDrop::Get(this)->SetMode(views::InkDropHost::InkDropMode::ON);
+-    views::InkDrop::Get(this)->SetBaseColor(
+-        kColorTabForegroundActiveFrameActive);
+-    SetHasInkDropActionOnClick(true);
++    InstallInkDrop(this);
++    set_context_menu_controller(row);
+   }
+ 
+   const std::string& space_id() const { return space_id_; }
+ 
+   void SetSpace(const Space& space) {
+-    space_id_ = space.id;
+     icon_->SetSpace(space);
+     const std::u16string name = base::UTF8ToUTF16(space.name);
+     SetTooltipText(name);
+@@ -71,57 +98,180 @@ class SpaceSwitcherRow::SpaceButton : pu
+ 
+   void SetEmphasized(bool emphasized) { icon_->SetEmphasized(emphasized); }
+ 
+-  // views::Button:
++  // views::View:
++  std::string GetObjectName() const override {
++    return space_id_.empty() ? std::string("SpaceButton/compact")
++                             : base::StrCat({"SpaceButton/", space_id_});
++  }
+   gfx::Size CalculatePreferredSize(
+       const views::SizeBounds& available_size) const override {
+     return gfx::Size(kButtonSize, kButtonSize);
+   }
+   void Layout(PassKey) override { icon_->SetBoundsRect(GetLocalBounds()); }
+ 
++  bool OnMousePressed(const ui::MouseEvent& event) override {
++    press_location_ = event.location();
++    dragging_ = false;
++    return views::Button::OnMousePressed(event);
++  }
++
++  bool OnMouseDragged(const ui::MouseEvent& event) override {
++    if (event.IsOnlyLeftMouseButton() && row_->CanReorder(this)) {
++      if (!dragging_ &&
++          views::View::ExceededDragThreshold(event.location() -
++                                             press_location_)) {
++        dragging_ = true;
++        SetState(STATE_NORMAL);
++        views::InkDrop::Get(this)->AnimateToState(
++            views::InkDropState::HIDDEN, nullptr);
++        row_->BeginReorder(this, press_location_.x() + x());
++      }
++      if (dragging_) {
++        row_->UpdateReorder(event.location().x() + x());
++        return true;
++      }
++    }
++    return views::Button::OnMouseDragged(event);
++  }
++
++  void OnMouseReleased(const ui::MouseEvent& event) override {
++    if (dragging_) {
++      // A drag is not a click.
++      dragging_ = false;
++      SetState(STATE_NORMAL);
++      row_->EndReorder(/*commit=*/true);
++      return;
++    }
++    views::Button::OnMouseReleased(event);
++  }
++
++  void OnMouseCaptureLost() override {
++    if (dragging_) {
++      dragging_ = false;
++      row_->EndReorder(/*commit=*/false);
++    }
++    views::Button::OnMouseCaptureLost();
++  }
++
+  private:
++  const raw_ptr<SpaceSwitcherRow> row_;
++  // Empty for the compact button, which shows whichever space is visible.
+   std::string space_id_;
+   raw_ptr<SpaceIconView> icon_;
++  gfx::Point press_location_;
++  bool dragging_ = false;
+ };
+ 
+ BEGIN_METADATA(SpaceSwitcherRow, SpaceButton)
+ END_METADATA
+ 
++class SpaceSwitcherRow::AddButton : public views::ImageButton {
++  METADATA_HEADER(AddButton, views::ImageButton)
++
++ public:
++  AddButton(SpaceSwitcherRow* row, PressedCallback callback)
++      : views::ImageButton(std::move(callback)) {
++    SetImageModel(views::Button::STATE_NORMAL,
++                  ui::ImageModel::FromVectorIcon(
++                      kAddIcon, kColorToolbarButtonIconDisabled, kAddIconSize));
++    SetImageHorizontalAlignment(views::ImageButton::ALIGN_CENTER);
++    SetImageVerticalAlignment(views::ImageButton::ALIGN_MIDDLE);
++    SetTooltipText(u"New space");
++    GetViewAccessibility().SetName(u"New space");
++    InstallInkDrop(this);
++    set_context_menu_controller(row);
++  }
++
++  // views::View:
++  std::string GetObjectName() const override { return "SpaceAddButton"; }
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(kButtonSize, kButtonSize);
++  }
++};
++
++BEGIN_METADATA(SpaceSwitcherRow, AddButton)
++END_METADATA
++
+ SpaceSwitcherRow::SpaceSwitcherRow(SpacesPagerView* pager) : pager_(pager) {
+   GetViewAccessibility().SetRole(ax::mojom::Role::kGroup);
+   GetViewAccessibility().SetName(u"Spaces");
++  set_context_menu_controller(this);
+   pager_observation_.Observe(pager_);
++  if (Profile* profile = pager_->GetProfile()) {
++    pref_change_registrar_.Init(profile->GetPrefs());
++    pref_change_registrar_.Add(
++        kShowSwitcherRowPref,
++        base::BindRepeating(&SpaceSwitcherRow::UpdateVisibility,
++                            base::Unretained(this)));
++  }
+   Rebuild();
+ }
+ 
+ SpaceSwitcherRow::~SpaceSwitcherRow() = default;
+ 
++Profile* SpaceSwitcherRow::GetProfile() const {
++  return pager_->GetProfile();
++}
++
++void SpaceSwitcherRow::UpdateVisibility() {
++  const bool show =
++      pager_->IsActive() && GetProfile() &&
++      GetProfile()->GetPrefs()->GetBoolean(kShowSwitcherRowPref);
++  SetVisible(show);
++}
++
+ void SpaceSwitcherRow::Rebuild() {
+-  for (raw_ptr<SpaceButton>& button : buttons_) {
+-    RemoveChildViewT(std::exchange(button, nullptr));
+-  }
+-  buttons_.clear();
+-  if (compact_button_) {
+-    RemoveChildViewT(std::exchange(compact_button_, nullptr));
++  if (reorder_button_) {
++    EndReorder(/*commit=*/false);
+   }
+   menu_runner_.reset();
+   menu_model_.reset();
+ 
+   const bool active = pager_->IsActive();
+-  SetVisible(active);
++  UpdateVisibility();
++  // Keep the buttons of spaces that still exist, so a bubble anchored to one
++  // stays where it is when its space changes.
++  std::vector<raw_ptr<SpaceButton>> buttons;
+   if (active) {
+-    for (const Space& space :
+-         pager_->controller()->service()->spaces()) {
+-      auto button = std::make_unique<SpaceButton>(
+-          base::BindRepeating(&SpaceSwitcherRow::OnButtonPressed,
+-                              base::Unretained(this), space.id),
+-          space.id);
++    for (const Space& space : pager_->controller()->service()->spaces()) {
++      SpaceButton* button = GetButton(space.id);
++      if (!button) {
++        button = AddChildView(std::make_unique<SpaceButton>(
++            this,
++            base::BindRepeating(&SpaceSwitcherRow::OnButtonPressed,
++                                base::Unretained(this), space.id),
++            space.id));
++      }
+       button->SetSpace(space);
+-      buttons_.push_back(AddChildView(std::move(button)));
++      buttons.push_back(button);
++    }
++  }
++  for (raw_ptr<SpaceButton>& button : buttons_) {
++    if (!std::ranges::contains(buttons, button)) {
++      RemoveChildViewT(std::exchange(button, nullptr));
+     }
++  }
++  buttons_ = std::move(buttons);
++  // Focus and accessibility follow the space order.
++  for (size_t i = 0; i < buttons_.size(); ++i) {
++    ReorderChildView(buttons_[i], i);
++  }
++  if (active && !compact_button_) {
+     compact_button_ = AddChildView(std::make_unique<SpaceButton>(
++        this,
+         base::BindRepeating(&SpaceSwitcherRow::ShowMenu,
+                             base::Unretained(this)),
+         std::string()));
++  } else if (!active && compact_button_) {
++    RemoveChildViewT(std::exchange(compact_button_, nullptr));
++  }
++  if (active && !add_button_) {
++    add_button_ = AddChildView(std::make_unique<AddButton>(
++        this, base::BindRepeating(&SpaceSwitcherRow::CreateSpace,
++                                  base::Unretained(this))));
++  } else if (!active && add_button_) {
++    RemoveChildViewT(std::exchange(add_button_, nullptr));
+   }
+   strip_ = pager_->strip();
+   position_ = pager_->position();
+@@ -135,30 +285,58 @@ int SpaceSwitcherRow::GetIconsWidth() co
+   return count * kButtonSize + std::max(0, count - 1) * kButtonSpacing;
+ }
+ 
++int SpaceSwitcherRow::GetIconsStart() const {
++  const int icons = IsCompact() ? kButtonSize : GetIconsWidth();
++  const bool add = icons + kReservedWidth <= width() - 2 * kEdgePadding;
++  return (width() - icons - (add ? kReservedWidth : 0)) / 2;
++}
++
+ bool SpaceSwitcherRow::IsCompact() const {
+-  return GetIconsWidth() + 2 * kReservedWidth > width();
++  return GetIconsWidth() + kReservedWidth > width() - 2 * kEdgePadding;
+ }
+ 
+ void SpaceSwitcherRow::Layout(PassKey) {
+   const bool compact = IsCompact();
+   const int y = (height() - kButtonSize) / 2;
+-  int x = (width() - GetIconsWidth()) / 2;
++  const int start = GetIconsStart();
++  const size_t target = reorder_button_ ? GetReorderTarget() : 0;
++  size_t slot = 0;
+   for (SpaceButton* button : buttons_) {
+     button->SetVisible(!compact);
+-    button->SetBounds(x, y, kButtonSize, kButtonSize);
+-    x += kButtonSize + kButtonSpacing;
++    if (button == reorder_button_) {
++      button->SetBounds(reorder_x_, y, kButtonSize, kButtonSize);
++      continue;
++    }
++    if (reorder_button_ && slot == target) {
++      ++slot;
++    }
++    button->SetBounds(start + static_cast<int>(slot) *
++                                  (kButtonSize + kButtonSpacing),
++                      y, kButtonSize, kButtonSize);
++    ++slot;
+   }
+   if (compact_button_) {
+     compact_button_->SetVisible(compact);
+-    compact_button_->SetBounds((width() - kButtonSize) / 2, y, kButtonSize,
+-                               kButtonSize);
++    compact_button_->SetBounds(start, y, kButtonSize, kButtonSize);
++  }
++  if (add_button_) {
++    // Right after the icons, in the slot kept free for it.
++    const int x =
++        start + (compact ? kButtonSize : GetIconsWidth()) + kButtonSpacing;
++    add_button_->SetVisible(x + kButtonSize <= width() - kEdgePadding);
++    add_button_->SetBounds(x, y, kButtonSize, kButtonSize);
+   }
+   OnPagerPositionChanged(strip_, position_);
+ }
+ 
+ gfx::Size SpaceSwitcherRow::CalculatePreferredSize(
+     const views::SizeBounds& available_size) const {
+-  return gfx::Size(GetIconsWidth() + 2 * kReservedWidth, kRowHeight);
++  return gfx::Size(GetIconsWidth() + kReservedWidth + 2 * kEdgePadding,
++                   kRowHeight);
++}
++
++void SpaceSwitcherRow::AddedToWidget() {
++  UpdateVisibility();
+ }
+ 
+ std::string SpaceSwitcherRow::GetShownSpaceId() const {
+@@ -254,6 +432,7 @@ void SpaceSwitcherRow::ShowMenu() {
+   if (!pager_->controller()) {
+     return;
+   }
++  menu_space_id_.clear();
+   menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
+   const std::vector<Space>& spaces = pager_->controller()->service()->spaces();
+   for (size_t i = 0; i < spaces.size(); ++i) {
+@@ -262,6 +441,8 @@ void SpaceSwitcherRow::ShowMenu() {
+     menu_model_->SetIcon(menu_model_->GetItemCount() - 1,
+                          GetSpaceIconImage(spaces[i], kMenuIconSize));
+   }
++  menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++  menu_model_->AddItem(kNewSpaceCommand, u"New space");
+   menu_runner_ = std::make_unique<views::MenuRunner>(
+       menu_model_.get(), views::MenuRunner::HAS_MNEMONICS);
+   menu_runner_->RunMenuAt(GetWidget(), nullptr,
+@@ -270,10 +451,60 @@ void SpaceSwitcherRow::ShowMenu() {
+                           ui::mojom::MenuSourceType::kMouse);
+ }
+ 
++void SpaceSwitcherRow::ShowContextMenuForViewImpl(
++    views::View* source,
++    const gfx::Point& point,
++    ui::mojom::MenuSourceType source_type) {
++  if (!pager_->controller() || reorder_button_) {
++    return;
++  }
++  menu_space_id_.clear();
++  for (SpaceButton* button : buttons_) {
++    if (button == source) {
++      menu_space_id_ = button->space_id();
++    }
++  }
++  if (compact_button_ && source == compact_button_) {
++    menu_space_id_ = pager_->GetVisibleSpaceId();
++  }
++  menu_model_ = std::make_unique<ui::SimpleMenuModel>(this);
++  if (!menu_space_id_.empty()) {
++    menu_model_->AddItem(kEditCommand, u"Edit space…");
++    menu_model_->AddItem(kDeleteCommand, u"Delete space…");
++    menu_model_->AddSeparator(ui::NORMAL_SEPARATOR);
++  }
++  menu_model_->AddItem(kNewSpaceCommand, u"New space");
++  menu_runner_ = std::make_unique<views::MenuRunner>(
++      menu_model_.get(),
++      views::MenuRunner::HAS_MNEMONICS | views::MenuRunner::CONTEXT_MENU);
++  menu_runner_->RunMenuAt(GetWidget(), nullptr, gfx::Rect(point, gfx::Size()),
++                          views::MenuAnchorPosition::kTopLeft, source_type);
++}
++
+ void SpaceSwitcherRow::ExecuteCommand(int command_id, int event_flags) {
+   if (!pager_->controller()) {
+     return;
+   }
++  // The menu runs nested; act once it is gone, since acting rebuilds the row.
++  const std::string space_id = menu_space_id_;
++  switch (command_id) {
++    case kEditCommand:
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&SpaceSwitcherRow::EditSpace,
++                                    weak_factory_.GetWeakPtr(), space_id));
++      return;
++    case kDeleteCommand:
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE,
++          base::BindOnce(&SpaceSwitcherRow::ConfirmDeleteSpace,
++                         weak_factory_.GetWeakPtr(), space_id));
++      return;
++    case kNewSpaceCommand:
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&SpaceSwitcherRow::CreateSpace,
++                                    weak_factory_.GetWeakPtr()));
++      return;
++  }
+   const std::vector<Space>& spaces = pager_->controller()->service()->spaces();
+   if (command_id >= 0 && command_id < static_cast<int>(spaces.size())) {
+     pager_->ShowSpace(spaces[command_id].id);
+@@ -289,6 +520,116 @@ bool SpaceSwitcherRow::IsCommandIdChecke
+          spaces[command_id].id == pager_->GetVisibleSpaceId();
+ }
+ 
++bool SpaceSwitcherRow::IsCommandIdEnabled(int command_id) const {
++  if (command_id == kDeleteCommand) {
++    // The default space cannot be deleted.
++    return menu_space_id_ != kDefaultSpaceId;
++  }
++  return true;
++}
++
++void SpaceSwitcherRow::CreateSpace() {
++  Profile* profile = GetProfile();
++  if (!profile || !pager_->controller()) {
++    return;
++  }
++  std::optional<std::string> space_id = neon::spaces::CreateSpace(profile);
++  if (!space_id) {
++    return;
++  }
++  // The row rebuilt itself when the space was added. Show the space (a new
++  // tab page opens in it), then let the user name it.
++  pager_->ShowSpace(*space_id);
++  EditSpace(*space_id);
++}
++
++void SpaceSwitcherRow::EditSpace(const std::string& space_id) {
++  views::View* anchor = GetButton(space_id);
++  if (!anchor || !anchor->GetVisible()) {
++    anchor = IsCompact() && compact_button_ ? compact_button_.get()
++                                            : static_cast<views::View*>(this);
++  }
++  if (GetWidget()) {
++    GetWidget()->LayoutRootViewIfNecessary();
++  }
++  ShowSpaceEditBubble(anchor, GetProfile(), space_id);
++}
++
++void SpaceSwitcherRow::ConfirmDeleteSpace(const std::string& space_id) {
++  views::View* anchor = GetButton(space_id);
++  if (!anchor || !anchor->GetVisible()) {
++    anchor = this;
++  }
++  ShowDeleteSpaceConfirmation(anchor, GetProfile(), space_id);
++}
++
++bool SpaceSwitcherRow::CanReorder(const SpaceButton* button) const {
++  // The default space stays first; a lone movable icon has nowhere to go.
++  return pager_->controller() && !IsCompact() && buttons_.size() > 2 &&
++         button->space_id() != kDefaultSpaceId &&
++         std::ranges::contains(buttons_, button);
++}
++
++void SpaceSwitcherRow::BeginReorder(SpaceButton* button, int x) {
++  reorder_button_ = button;
++  reorder_grab_ = x - button->x();
++  reorder_x_ = button->x();
++  // Paint above its neighbours while it moves.
++  ReorderChildView(button, children().size());
++  InvalidateLayout();
++}
++
++void SpaceSwitcherRow::UpdateReorder(int x) {
++  if (!reorder_button_) {
++    return;
++  }
++  // Stays within the icons, right of the default space's icon.
++  const int start = GetIconsStart();
++  const int min_x = start + kButtonSize + kButtonSpacing;
++  const int max_x = start + GetIconsWidth() - kButtonSize;
++  reorder_x_ = std::clamp(x - reorder_grab_, min_x, std::max(min_x, max_x));
++  InvalidateLayout();
++}
++
++size_t SpaceSwitcherRow::GetReorderTarget() const {
++  const int slot_width = kButtonSize + kButtonSpacing;
++  const int slot = static_cast<int>(std::lround(
++      static_cast<double>(reorder_x_ - GetIconsStart()) / slot_width));
++  return static_cast<size_t>(
++      std::clamp(slot, 1, static_cast<int>(buttons_.size()) - 1));
++}
++
++void SpaceSwitcherRow::EndReorder(bool commit) {
++  if (!reorder_button_) {
++    return;
++  }
++  const size_t target = GetReorderTarget();
++  SpaceButton* button = std::exchange(reorder_button_, nullptr);
++  const std::string space_id = button->space_id();
++  if (commit) {
++    // Show the new order now; the service confirms it and every window's row
++    // follows. The button is in the middle of handling the release, so the
++    // move, which rebuilds rows, waits for it to finish.
++    std::erase(buttons_, button);
++    buttons_.insert(buttons_.begin() + target, button);
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::WeakPtr<SpaceSwitcherRow> row, std::string space_id,
++               size_t target) {
++              if (row && row->pager_->controller()) {
++                row->pager_->controller()->service()->MoveSpace(space_id,
++                                                                target);
++              }
++            },
++            weak_factory_.GetWeakPtr(), space_id, target));
++  }
++  for (size_t i = 0; i < buttons_.size(); ++i) {
++    ReorderChildView(buttons_[i], i);
++  }
++  InvalidateLayout();
++}
++
+ BEGIN_METADATA(SpaceSwitcherRow)
+ END_METADATA
+ 
+--- a/chrome/browser/ui/views/neon/spaces/space_switcher_row.h
++++ b/chrome/browser/ui/views/neon/spaces/space_switcher_row.h
+@@ -11,13 +11,18 @@
+ #include <vector>
+ 
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "chrome/browser/ui/views/neon/spaces/spaces_pager_view.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "ui/base/metadata/metadata_header_macros.h"
+ #include "ui/gfx/geometry/rect_f.h"
+ #include "ui/menus/simple_menu_model.h"
++#include "ui/views/context_menu_controller.h"
+ #include "ui/views/view.h"
+ 
++class Profile;
++
+ namespace views {
+ class Button;
+ class MenuRunner;
+@@ -33,11 +38,15 @@ class SpaceIconView;
+ // icons as the pages move. A click shows that space.
+ //
+ // When the icons do not fit (the collapsed sidebar), the row shows only the
+-// visible space's icon, which opens a menu of the spaces. The trailing end is
+-// kept free for the "new space" button of space management (M4).
++// visible space's icon, which opens a menu of the spaces.
++//
++// Managing spaces: a "+" button after the icons creates a space, a context
++// menu on an icon edits or deletes its space, and dragging an icon sideways
++// reorders the spaces (the default space stays first).
+ class SpaceSwitcherRow : public views::View,
+                          public SpacesPagerView::Observer,
+-                         public ui::SimpleMenuModel::Delegate {
++                         public ui::SimpleMenuModel::Delegate,
++                         public views::ContextMenuController {
+   METADATA_HEADER(SpaceSwitcherRow, views::View)
+ 
+  public:
+@@ -54,6 +63,7 @@ class SpaceSwitcherRow : public views::V
+   gfx::Size CalculatePreferredSize(
+       const views::SizeBounds& available_size) const override;
+   void OnPaint(gfx::Canvas* canvas) override;
++  void AddedToWidget() override;
+ 
+   // SpacesPagerView::Observer:
+   void OnPagerPositionChanged(const std::vector<std::string>& strip,
+@@ -63,32 +73,69 @@ class SpaceSwitcherRow : public views::V
+   // ui::SimpleMenuModel::Delegate:
+   void ExecuteCommand(int command_id, int event_flags) override;
+   bool IsCommandIdChecked(int command_id) const override;
++  bool IsCommandIdEnabled(int command_id) const override;
++
++  // views::ContextMenuController:
++  void ShowContextMenuForViewImpl(
++      views::View* source,
++      const gfx::Point& point,
++      ui::mojom::MenuSourceType source_type) override;
+ 
+  private:
+   class SpaceButton;
++  class AddButton;
++  friend class SpaceButton;
+ 
++  Profile* GetProfile() const;
+   void Rebuild();
++  void UpdateVisibility();
+   void OnButtonPressed(const std::string& space_id);
+   void ShowMenu();
++  // Creates a space, shows it and opens its edit bubble.
++  void CreateSpace();
++  void EditSpace(const std::string& space_id);
++  void ConfirmDeleteSpace(const std::string& space_id);
+   // The space the row shows as current at the pager's position.
+   std::string GetShownSpaceId() const;
+   // The highlight's bounds at the pager's position, or nullopt when hidden.
+   std::optional<gfx::RectF> GetHighlightBounds() const;
+   SpaceButton* GetButton(const std::string& space_id) const;
+   int GetIconsWidth() const;
++  // The x of the first icon slot.
++  int GetIconsStart() const;
++
++  // Reordering by drag. |button| follows the pointer; |x| is the pointer in
++  // the row's coordinates.
++  bool CanReorder(const SpaceButton* button) const;
++  void BeginReorder(SpaceButton* button, int x);
++  void UpdateReorder(int x);
++  void EndReorder(bool commit);
++  // The slot the dragged button would drop into.
++  size_t GetReorderTarget() const;
+ 
+   const raw_ptr<SpacesPagerView> pager_;
+   std::vector<raw_ptr<SpaceButton>> buttons_;
+   // Compact mode: the visible space's icon, which opens the menu.
+   raw_ptr<SpaceButton> compact_button_ = nullptr;
++  raw_ptr<AddButton> add_button_ = nullptr;
+   std::vector<std::string> strip_;
+   double position_ = 0;
+ 
++  // The space a context menu was opened on, or empty.
++  std::string menu_space_id_;
+   std::unique_ptr<ui::SimpleMenuModel> menu_model_;
+   std::unique_ptr<views::MenuRunner> menu_runner_;
+ 
++  // The button being dragged, the pointer's offset in it and where its left
++  // edge is now.
++  raw_ptr<SpaceButton> reorder_button_ = nullptr;
++  int reorder_grab_ = 0;
++  int reorder_x_ = 0;
++
++  PrefChangeRegistrar pref_change_registrar_;
+   base::ScopedObservation<SpacesPagerView, SpacesPagerView::Observer>
+       pager_observation_{this};
++  base::WeakPtrFactory<SpaceSwitcherRow> weak_factory_{this};
+ };
+ 
+ }  // namespace neon::spaces
+--- a/chrome/browser/ui/views/neon/spaces/spaces_pager_view.cc
++++ b/chrome/browser/ui/views/neon/spaces/spaces_pager_view.cc
+@@ -13,6 +13,7 @@
+ #include "base/metrics/histogram_functions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "chrome/browser/neon/spaces/space.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -20,6 +21,7 @@
+ #include "chrome/browser/ui/views/neon/spaces/space_page_view.h"
+ #include "chrome/browser/ui/views/neon/spaces/spaces_swipe_handler.h"
+ #include "chrome/browser/ui/views/tabs/common/tab_strip_view.h"
++#include "components/prefs/pref_service.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
+ #include "ui/compositor/compositor.h"
+ #include "ui/compositor/layer.h"
+@@ -177,6 +179,15 @@ bool SpacesPagerView::IsActive() const {
+   return model_ && controller_ && controller_->IsActive();
+ }
+ 
++bool SpacesPagerView::IsSwipeEnabled() const {
++  Profile* profile = GetProfile();
++  return profile && profile->GetPrefs()->GetBoolean(kSwipeToSwitchPref);
++}
++
++Profile* SpacesPagerView::GetProfile() const {
++  return browser_view_ ? browser_view_->browser()->GetProfile() : nullptr;
++}
++
+ std::string SpacesPagerView::GetVisibleSpaceId() const {
+   return model_ && controller_ ? controller_->GetVisibleSpaceId()
+                                : std::string();
+@@ -837,6 +848,20 @@ void SpacesPagerView::OnThemeChanged() {
+ }
+ 
+ void SpacesPagerView::OnSpacesChanged() {
++  // A peek page of a space that is gone shows nothing until it is needed
++  // again, and the tab lists filter by the new list at their next layout
++  // (a tab's space comes from the list).
++  for (SpacePageView* peek : peeks_) {
++    if (peek && !peek->space_id().empty() && !GetSpace(peek->space_id())) {
++      peek->ClearSpace();
++    }
++  }
++  real_page_->InvalidateTabLayout();
++  for (SpacePageView* peek : peeks_) {
++    if (peek) {
++      peek->InvalidateTabLayout();
++    }
++  }
+   UpdateActiveState();
+ }
+ 
+--- a/chrome/browser/ui/views/neon/spaces/spaces_pager_view.h
++++ b/chrome/browser/ui/views/neon/spaces/spaces_pager_view.h
+@@ -32,6 +32,7 @@
+ #include "ui/views/view.h"
+ 
+ class BrowserView;
++class Profile;
+ class TabStripRegionView;
+ class TabStripView;
+ 
+@@ -101,6 +102,9 @@ class SpacesPagerView : public views::Vi
+ 
+   // Whether the window has spaces now: vertical layout and two or more spaces.
+   bool IsActive() const;
++  // Whether a sideways swipe or wheel switches spaces (a setting).
++  bool IsSwipeEnabled() const;
++  Profile* GetProfile() const;
+   // The visible space, the space of the active tab.
+   std::string GetVisibleSpaceId() const;
+ 
+--- a/chrome/browser/ui/views/neon/spaces/spaces_swipe_handler.cc
++++ b/chrome/browser/ui/views/neon/spaces/spaces_swipe_handler.cc
+@@ -27,7 +27,7 @@ SpacesSwipeHandler::SpacesSwipeHandler(S
+ SpacesSwipeHandler::~SpacesSwipeHandler() = default;
+ 
+ void SpacesSwipeHandler::OnScrollEvent(ui::ScrollEvent* event) {
+-  if (!pager_->IsActive()) {
++  if (!pager_->IsActive() || !pager_->IsSwipeEnabled()) {
+     return;
+   }
+   const base::TimeTicks time = event->time_stamp();
+@@ -91,7 +91,8 @@ void SpacesSwipeHandler::OnScrollEvent(u
+ }
+ 
+ void SpacesSwipeHandler::OnMouseEvent(ui::MouseEvent* event) {
+-  if (!event->IsMouseWheelEvent() || !pager_->IsActive()) {
++  if (!event->IsMouseWheelEvent() || !pager_->IsActive() ||
++      !pager_->IsSwipeEnabled()) {
+     return;
+   }
+   const base::TimeTicks time = event->time_stamp();

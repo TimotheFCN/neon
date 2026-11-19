@@ -402,3 +402,6 @@ neon/spaces/switcher-row.patch
 neon/spaces/swipe.patch
 neon/spaces/range-filter.patch
 neon/spaces/groups.patch
+neon/spaces/management-ui.patch
+neon/spaces/settings-page.patch
+neon/spaces/move-to-space.patch
