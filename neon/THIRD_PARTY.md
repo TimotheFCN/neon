@@ -39,6 +39,8 @@ names (`brave.containers.*`) are Brave's.
 | `chrome/browser/containers/container_specifier_utils` | `browser/containers/` | `command-line` |
 | Hunks in Chromium files | Brave `chromium_src/` overrides and `patches/*.patch` for the same files, rewritten as plain hunks | `content-partition`, `session-persistence`, `browser-service`, `tab-partition`, `command-line` |
 | `components/containers/content/browser/platform_auth_helper` | `browser/enterprise/platform_auth_helper.cc` (moved into the containers component, namespace `containers`), with the hunk from `rewrite/chrome/browser/enterprise/platform_auth/platform_auth_navigation_throttle.cc.yaml` | `platform-auth` (M1b) |
+| `chrome/browser/containers/used_container_storage_partitions` | `browser/containers/` | `clear-browsing-data` (M6) |
+| Hunk in `ChromeBrowsingDataRemoverDelegate::RemoveEmbedderData` | `BraveBrowsingDataRemoverDelegate::RemoveEmbedderData` in `browser/browsing_data/brave_browsing_data_remover_delegate.cc` (the containers block only) | `clear-browsing-data` (M6) |
 
 ### Changes from Brave
 
@@ -49,7 +51,10 @@ names (`brave.containers.*`) are Brave's.
 - `temporary_container.cc` does not use the BIP-39 word list or Brave's Nala colours: generated
   names are `Temporary <4 hex digits>` and colours come from a fixed list of eight.
 - Unit tests, browser tests and their GN targets are not imported.
+- Clear browsing data (M6): the clear-on-exit observer in
+  `chrome_browsing_data_lifetime_manager.cc` also waits for the per-container removals the
+  delegate queues; in Brave the browser can exit before they run.
 
 Not imported: settings UI, tab and hover card indicators, page action, context menus, Traffic
-Control, sync, clear browsing data, shared zoom, Shields and AI chat hooks, PWA `--container`,
+Control, sync, shared zoom, Shields and AI chat hooks, PWA `--container`,
 Brave's split view helper (Neon's M1b inherits the container for new split tabs its own way).
