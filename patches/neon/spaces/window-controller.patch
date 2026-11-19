@@ -1,0 +1,1064 @@
+Neon spaces (M2), part 2 of 5: window controller.
+
+One SpacesWindowController per normal window of a regular profile, created
+by SpacesWindowManager as the window is created. The visible space is the
+space of the active tab, and a tab's space is derived from its container, so
+nothing is stored and session restore brings both back. The controller
+switches space (most recently active tab of the space, or a new tab page),
+picks the container of new tabs without a source page (the visible space's,
+or for a new window the last active window's), leaves a new tab page in a
+space whose last tab closes while other spaces have tabs, and keeps each
+space's tabs together within the pinned and unpinned tabs. space_tab_filter.h
+is the small hooks target the Chromium hooks in the next patches call.
+Neon code, GPL-3.0.
+
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1171,6 +1171,7 @@ source_set("core") {
+     "//chrome/browser/navigation_predictor",
+     "//chrome/browser/neon:containers_api",
+     "//chrome/browser/neon/spaces",
++    "//chrome/browser/ui/neon/spaces",
+     "//chrome/browser/net",
+     "//chrome/browser/notifications",
+     "//chrome/browser/notifications:system_notification_helper",
+--- a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -143,6 +143,7 @@
+ #include "chrome/browser/navigation_predictor/search_engine_preconnector.h"
+ #include "chrome/browser/navigation_predictor/search_engine_preconnector_keyed_service_factory.h"
+ #include "chrome/browser/neon/spaces/spaces_service_factory.h"
++#include "chrome/browser/ui/neon/spaces/spaces_window_manager.h"
+ #include "chrome/browser/net/dns_probe_service_factory.h"
+ #include "chrome/browser/net/profile_network_context_service_factory.h"
+ #include "chrome/browser/new_tab_page/microsoft_auth/microsoft_auth_service_factory.h"
+@@ -1173,6 +1174,7 @@ void ChromeBrowserMainExtraPartsProfiles
+ #endif  // !BUILDFLAG(IS_ANDROID)
+   NavigationPredictorKeyedServiceFactory::GetInstance();
+   neon::spaces::SpacesServiceFactory::GetInstance();
++  neon::spaces::SpacesWindowManagerFactory::GetInstance();
+ #if BUILDFLAG(CHROME_ROOT_STORE_CERT_MANAGEMENT_UI)
+   net::ServerCertificateDatabaseServiceFactory::GetInstance();
+ #endif
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/BUILD.gn
+@@ -0,0 +1,48 @@
++# Copyright 2026 The Neon Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++# What Chromium's tab strip model, browser commands and tab strip views call.
++# Kept free of chrome/browser dependencies so the hooked targets can depend on
++# it; SpacesWindowController registers the implementation at runtime.
++source_set("hooks") {
++  sources = [
++    "space_tab_filter.cc",
++    "space_tab_filter.h",
++  ]
++  public_deps = [
++    "//base",
++    "//components/tabs:public",
++  ]
++}
++
++# Visible space per window, switching, new tab placement and commands.
++source_set("spaces") {
++  sources = [
++    "spaces_window_controller.cc",
++    "spaces_window_controller.h",
++    "spaces_window_manager.cc",
++    "spaces_window_manager.h",
++  ]
++
++  public_deps = [
++    ":hooks",
++    "//chrome/browser/neon/spaces",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/tabs:tab_strip",
++    "//components/keyed_service/core",
++    "//components/prefs",
++  ]
++
++  deps = [
++    "//chrome/browser/neon:containers_api",
++    "//chrome/browser/ui:browser_tabstrip",
++    "//chrome/browser/ui/helium:helium_layout_state_controller",
++    "//chrome/common",
++    "//components/tabs:public",
++    "//content/public/browser",
++    "//content/public/common",
++    "//url",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/space_tab_filter.cc
+@@ -0,0 +1,85 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
++
++#include <array>
++#include <variant>
++
++#include "base/strings/string_number_conversions.h"
++
++#include "components/tabs/public/tab_collection.h"
++#include "components/tabs/public/tab_interface.h"
++
++namespace neon::spaces {
++
++namespace {
++
++HooksDelegate* g_delegate = nullptr;
++
++constexpr std::array<int, 11> kCommandIds = {
++    kNextSpaceCommand,       kPreviousSpaceCommand,
++    kSelectSpaceCommand,     kSelectSpaceCommand + 1,
++    kSelectSpaceCommand + 2, kSelectSpaceCommand + 3,
++    kSelectSpaceCommand + 4, kSelectSpaceCommand + 5,
++    kSelectSpaceCommand + 6, kSelectSpaceCommand + 7,
++    kSelectLastSpaceCommand,
++};
++
++}  // namespace
++
++base::span<const int> GetCommandIds() {
++  return kCommandIds;
++}
++
++std::optional<std::u16string> GetCommandLabel(int command_id) {
++  if (command_id == kNextSpaceCommand) {
++    return u"Next space";
++  }
++  if (command_id == kPreviousSpaceCommand) {
++    return u"Previous space";
++  }
++  if (command_id >= kSelectSpaceCommand &&
++      command_id <= kSelectLastSpaceCommand) {
++    return u"Space " +
++           base::NumberToString16(command_id - kSelectSpaceCommand + 1);
++  }
++  return std::nullopt;
++}
++
++void SetHooksDelegate(HooksDelegate* delegate) {
++  g_delegate = delegate;
++}
++
++bool IsTabHidden(const TabStripModel* model, const tabs::TabInterface* tab) {
++  return g_delegate && tab && g_delegate->IsTabHidden(model, tab);
++}
++
++bool IsChildHidden(const tabs::ConstChildPtr& child) {
++  if (!g_delegate) {
++    return false;
++  }
++  if (std::holds_alternative<tabs::ConstDanglingUntriagedTabInterface>(child)) {
++    return IsTabHidden(
++        nullptr,
++        std::get<tabs::ConstDanglingUntriagedTabInterface>(child).get());
++  }
++  const tabs::TabCollection* collection =
++      std::get<tabs::ConstDanglingUntriagedTabCollection>(child).get();
++  if (!collection || collection->TabCountRecursive() == 0) {
++    return false;
++  }
++  return IsTabHidden(nullptr, collection->GetTabAtIndexRecursive(0));
++}
++
++bool TakeVisibleSpaceChange(const void* key,
++                            const tabs::TabInterface* active_tab) {
++  return g_delegate && g_delegate->TakeVisibleSpaceChange(key, active_tab);
++}
++
++bool ExecuteCommand(BrowserWindowInterface* browser, int command_id) {
++  return g_delegate && g_delegate->ExecuteCommand(browser, command_id);
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/space_tab_filter.h
+@@ -0,0 +1,130 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NEON_SPACES_SPACE_TAB_FILTER_H_
++#define CHROME_BROWSER_UI_NEON_SPACES_SPACE_TAB_FILTER_H_
++
++#include <optional>
++#include <string>
++
++#include "base/containers/span.h"
++#include "components/tabs/public/tab_collection_types.h"
++
++class BrowserWindowInterface;
++class TabStripModel;
++
++namespace tabs {
++class TabInterface;
++}  // namespace tabs
++
++// The calls that Chromium's tab strip model, browser commands and tab strip
++// views make into Neon spaces. Each hook is one line in an existing file. This
++// target only depends on //base and //components/tabs, so the hooked targets
++// can depend on it without a cycle; the logic behind it lives in
++// SpacesWindowController, which registers itself as the delegate.
++//
++// A window shows one space at a time, the space of its active tab (the visible
++// space). A tab of another space is hidden: the vertical tab strip leaves it
++// out, and keyboard tab navigation, the choice of the next active tab and the
++// close commands skip it. Nothing is hidden in incognito, in non-normal
++// windows, outside the vertical layout, or with only the default space.
++namespace neon::spaces {
++
++// Browser commands, outside chrome_command_ids.h so that adding them rebuilds
++// little. Values are clear of Chromium's and Helium's ids.
++inline constexpr int kNextSpaceCommand = 39000;
++inline constexpr int kPreviousSpaceCommand = 39001;
++// "Go to space N" for N = 1..9: kSelectSpaceCommand + N - 1.
++inline constexpr int kSelectSpaceCommand = 39010;
++inline constexpr int kSelectLastSpaceCommand = kSelectSpaceCommand + 8;
++
++// Every spaces command id, for enabling them in a browser.
++base::span<const int> GetCommandIds();
++
++// The name of a spaces command on the shortcuts settings page, or std::nullopt
++// for other commands. English only until spaces have a strings file (M4).
++std::optional<std::u16string> GetCommandLabel(int command_id);
++
++class HooksDelegate {
++ public:
++  virtual ~HooksDelegate() = default;
++
++  // |model| is the model that holds |tab|, or null when the caller does not
++  // know it.
++  virtual bool IsTabHidden(const TabStripModel* model,
++                           const tabs::TabInterface* tab) = 0;
++  // True if the visible space shown by tab strip |key| changed since the last
++  // call for |key|, now that |active_tab| is active.
++  virtual bool TakeVisibleSpaceChange(const void* key,
++                                      const tabs::TabInterface* active_tab) = 0;
++  // Runs a spaces command. Returns false if |command_id| is not one.
++  virtual bool ExecuteCommand(BrowserWindowInterface* browser,
++                              int command_id) = 0;
++};
++
++void SetHooksDelegate(HooksDelegate* delegate);
++
++// Whether |tab| of |model| belongs to a space other than the visible one.
++bool IsTabHidden(const TabStripModel* model, const tabs::TabInterface* tab);
++
++// Same for a tab strip child: a tab, or a group or split (by its first tab).
++bool IsChildHidden(const tabs::ConstChildPtr& child);
++
++bool TakeVisibleSpaceChange(const void* key,
++                            const tabs::TabInterface* active_tab);
++
++// Runs |command_id| if it is a spaces command and returns true, otherwise
++// returns false.
++bool ExecuteCommand(BrowserWindowInterface* browser, int command_id);
++
++// Tab strip views helpers. |Node| is a TabCollectionNode; templates keep this
++// target free of a dependency on the views.
++
++// Whether child view |child| of collection node |parent| is hidden.
++template <typename Node, typename View>
++bool IsChildViewHidden(const Node* parent, const View* child) {
++  if (!parent) {
++    return false;
++  }
++  for (const auto& node : parent->children()) {
++    if (node->view() == child) {
++      return IsChildHidden(node->GetNodeData());
++    }
++  }
++  return false;
++}
++
++// The number of hidden views among |children| of |parent|.
++template <typename Node, typename Views>
++int CountHiddenChildViews(const Node* parent, const Views& children) {
++  int count = 0;
++  for (const auto* child : children) {
++    if (IsChildViewHidden(parent, child)) {
++      ++count;
++    }
++  }
++  return count;
++}
++
++// Called by the root of a tab strip when the active tab changes. When that
++// changes the visible space, the pinned and unpinned containers lay out again
++// to show the new space's tabs.
++template <typename Root>
++void OnActiveTabChanged(Root* root, const tabs::TabInterface* active_tab) {
++  if (!TakeVisibleSpaceChange(root, active_tab)) {
++    return;
++  }
++  for (const auto& node : root->children()) {
++    if (node->view()) {
++      node->view()->InvalidateLayout();
++    }
++  }
++  if (root->view()) {
++    root->view()->InvalidateLayout();
++  }
++}
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_NEON_SPACES_SPACE_TAB_FILTER_H_
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/spaces_window_controller.cc
+@@ -0,0 +1,441 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/neon/spaces/spaces_window_controller.h"
++
++#include <algorithm>
++#include <map>
++#include <utility>
++#include <vector>
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "base/no_destructor.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/neon/containers_api.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_tabstrip.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
++#include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
++#include "chrome/common/pref_names.h"
++#include "chrome/common/webui_url_constants.h"
++#include "components/prefs/pref_service.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/common/url_constants.h"
++#include "url/gurl.h"
++
++namespace neon::spaces {
++
++namespace {
++
++std::vector<SpacesWindowController*>& Registry() {
++  static base::NoDestructor<std::vector<SpacesWindowController*>> registry;
++  return *registry;
++}
++
++bool IsDeletion(TabRemovedReason reason) {
++  return reason == TabRemovedReason::kDeleted ||
++         reason == TabRemovedReason::kDeletedAndExpandSidePanel;
++}
++
++// A new tab page nobody has used: closing it should not leave another one.
++bool IsUntouchedNewTabPage(content::WebContents* contents) {
++  const GURL& url = contents->GetLastCommittedURL().is_empty()
++                        ? contents->GetVisibleURL()
++                        : contents->GetLastCommittedURL();
++  return url.SchemeIs(content::kChromeUIScheme) &&
++         (url.host() == chrome::kChromeUINewTabHost ||
++          url.host() == chrome::kChromeUINewTabPageHost) &&
++         !contents->GetController().CanGoBack();
++}
++
++class HooksDelegateImpl : public HooksDelegate {
++ public:
++  bool IsTabHidden(const TabStripModel* model,
++                   const tabs::TabInterface* tab) override {
++    SpacesWindowController* controller =
++        model ? SpacesWindowController::FromModel(model)
++              : SpacesWindowController::FromTab(tab);
++    return controller && controller->IsTabHidden(tab);
++  }
++
++  bool TakeVisibleSpaceChange(const void* key,
++                              const tabs::TabInterface* active_tab) override {
++    std::string space;
++    if (SpacesWindowController* controller =
++            active_tab ? SpacesWindowController::FromTab(active_tab)
++                       : nullptr;
++        controller && controller->IsActive()) {
++      space = controller->GetSpaceIdOf(active_tab);
++    }
++    auto it = last_spaces_.find(key);
++    if (it != last_spaces_.end() && it->second == space) {
++      return false;
++    }
++    last_spaces_[key] = std::move(space);
++    return true;
++  }
++
++  bool ExecuteCommand(BrowserWindowInterface* browser,
++                      int command_id) override {
++    if (!std::ranges::contains(GetCommandIds(), command_id)) {
++      return false;
++    }
++    SpacesWindowController* controller =
++        SpacesWindowController::FromBrowser(browser);
++    if (!controller) {
++      return true;
++    }
++    if (command_id == kNextSpaceCommand) {
++      controller->SwitchToRelativeSpace(1);
++    } else if (command_id == kPreviousSpaceCommand) {
++      controller->SwitchToRelativeSpace(-1);
++    } else {
++      controller->SwitchToSpaceAt(command_id - kSelectSpaceCommand);
++    }
++    return true;
++  }
++
++ private:
++  // The visible space each tab strip last showed, by tab strip.
++  std::map<const void*, std::string> last_spaces_;
++};
++
++std::string GetContainerForNewTabIn(BrowserWindowInterface* browser) {
++  SpacesWindowController* controller =
++      SpacesWindowController::FromBrowser(browser);
++  return controller ? controller->GetContainerForNewTab() : std::string();
++}
++
++}  // namespace
++
++SpacesWindowController::SpacesWindowController(
++    BrowserWindowInterface* browser,
++    SpacesService* service)
++    : browser_(browser),
++      model_(browser->GetTabStripModel()),
++      service_(service) {
++  Registry().push_back(this);
++  model_->AddObserver(this);
++  service_->AddObserver(this);
++  pref_change_registrar_.Init(browser_->GetProfile()->GetPrefs());
++  pref_change_registrar_.Add(
++      prefs::kHeliumLayout,
++      base::BindRepeating(&SpacesWindowController::ScheduleRepair,
++                          base::Unretained(this)));
++  last_visible_space_ = GetVisibleSpaceId();
++}
++
++SpacesWindowController::~SpacesWindowController() {
++  std::erase(Registry(), this);
++  service_->RemoveObserver(this);
++  if (model_) {
++    model_->RemoveObserver(this);
++  }
++}
++
++// static
++SpacesWindowController* SpacesWindowController::FromBrowser(
++    const BrowserWindowInterface* browser) {
++  for (SpacesWindowController* controller : Registry()) {
++    if (controller->browser_ == browser) {
++      return controller;
++    }
++  }
++  return nullptr;
++}
++
++// static
++SpacesWindowController* SpacesWindowController::FromModel(
++    const TabStripModel* model) {
++  for (SpacesWindowController* controller : Registry()) {
++    if (controller->model_ == model) {
++      return controller;
++    }
++  }
++  return nullptr;
++}
++
++// static
++SpacesWindowController* SpacesWindowController::FromTab(
++    const tabs::TabInterface* tab) {
++  if (!tab) {
++    return nullptr;
++  }
++  // Compares pointers only, so a tab that is being removed is safe to pass.
++  for (SpacesWindowController* controller : Registry()) {
++    if (controller->model_ &&
++        controller->model_->GetIndexOfTab(tab) != TabStripModel::kNoTab) {
++      return controller;
++    }
++  }
++  return nullptr;
++}
++
++// static
++void SpacesWindowController::InstallHooks() {
++  static base::NoDestructor<HooksDelegateImpl> delegate;
++  SetHooksDelegate(delegate.get());
++  containers_api::SetNewTabContainerProvider(
++      base::BindRepeating(&GetContainerForNewTabIn));
++}
++
++bool SpacesWindowController::IsActive() const {
++  return model_ && service_->spaces().size() > 1 &&
++         browser_->GetProfile()->GetPrefs()->GetInteger(
++             prefs::kHeliumLayout) ==
++             std::to_underlying(HeliumLayoutType::kVertical);
++}
++
++const std::string& SpacesWindowController::GetSpaceIdOf(
++    content::WebContents* contents) const {
++  return service_->GetSpaceIdForContainer(
++      contents ? containers_api::GetTabContainerId(contents) : std::string());
++}
++
++const std::string& SpacesWindowController::GetSpaceIdOf(
++    const tabs::TabInterface* tab) const {
++  return GetSpaceIdOf(tab ? tab->GetContents() : nullptr);
++}
++
++const std::string& SpacesWindowController::GetVisibleSpaceId() const {
++  return GetSpaceIdOf(model_ ? model_->GetActiveTab() : nullptr);
++}
++
++bool SpacesWindowController::IsTabHidden(const tabs::TabInterface* tab) const {
++  if (!tab || !IsActive()) {
++    return false;
++  }
++  const tabs::TabInterface* active_tab = model_->GetActiveTab();
++  if (!active_tab || active_tab == tab) {
++    return false;
++  }
++  return GetSpaceIdOf(tab) != GetSpaceIdOf(active_tab);
++}
++
++void SpacesWindowController::SwitchToSpace(const std::string& space_id) {
++  if (!IsActive() || !service_->GetSpace(space_id) ||
++      space_id == GetVisibleSpaceId()) {
++    return;
++  }
++  int best_index = TabStripModel::kNoTab;
++  base::TimeTicks best_time;
++  for (int i = 0; i < model_->count(); ++i) {
++    content::WebContents* contents = model_->GetWebContentsAt(i);
++    if (GetSpaceIdOf(contents) != space_id) {
++      continue;
++    }
++    const base::TimeTicks time = contents->GetLastActiveTimeTicks();
++    if (best_index == TabStripModel::kNoTab || time > best_time) {
++      best_index = i;
++      best_time = time;
++    }
++  }
++  if (best_index == TabStripModel::kNoTab) {
++    OpenNewTabInSpace(space_id);
++    return;
++  }
++  model_->ActivateTabAt(best_index,
++                        TabStripUserGestureDetails(
++                            TabStripUserGestureDetails::GestureType::kOther));
++}
++
++void SpacesWindowController::SwitchToSpaceAt(size_t index) {
++  if (index < service_->spaces().size()) {
++    SwitchToSpace(service_->spaces()[index].id);
++  }
++}
++
++void SpacesWindowController::SwitchToRelativeSpace(int delta) {
++  std::optional<size_t> current = service_->GetSpaceIndex(GetVisibleSpaceId());
++  if (!current) {
++    return;
++  }
++  const int target = static_cast<int>(*current) + delta;
++  if (target < 0 || target >= static_cast<int>(service_->spaces().size())) {
++    return;
++  }
++  SwitchToSpaceAt(target);
++}
++
++std::string SpacesWindowController::GetContainerForNewTab() const {
++  if (pending_new_tab_space_) {
++    const Space* space = service_->GetSpace(*pending_new_tab_space_);
++    return space ? space->container_id : std::string();
++  }
++  if (!IsActive()) {
++    return std::string();
++  }
++  if (model_->GetActiveTab()) {
++    return service_->GetSpace(GetVisibleSpaceId())->container_id;
++  }
++  // A new window (Ctrl+N) opens on the space of the window it came from, the
++  // last active one.
++  std::string container_id;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [&](BrowserWindowInterface* browser) {
++        SpacesWindowController* other = FromBrowser(browser);
++        if (!other || other == this || other->service_ != service_ ||
++            !other->model_ || other->model_->empty()) {
++          return true;
++        }
++        container_id = other->GetContainerForNewTab();
++        return false;
++      },
++      BrowserCollection::Order::kActivation);
++  return container_id;
++}
++
++void SpacesWindowController::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  if (tab_strip_model->closing_all()) {
++    return;
++  }
++  if (change.type() == TabStripModelChange::kRemoved && IsActive()) {
++    for (const auto& removed : change.GetRemove()->contents) {
++      if (!IsDeletion(removed.remove_reason) || !removed.contents) {
++        continue;
++      }
++      const std::string& space_id = GetSpaceIdOf(removed.contents.get());
++      if (space_id != last_visible_space_ || SpaceHasTabs(space_id) ||
++          model_->empty()) {
++        continue;
++      }
++      // The model is mid-change: act once it is done.
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE,
++          base::BindOnce(&SpacesWindowController::OnSpaceTabClosed,
++                         weak_factory_.GetWeakPtr(), space_id,
++                         IsUntouchedNewTabPage(removed.contents.get())));
++    }
++  }
++  if (change.type() == TabStripModelChange::kInserted ||
++      change.type() == TabStripModelChange::kMoved) {
++    ScheduleRepair();
++  }
++  last_visible_space_ = GetVisibleSpaceId();
++}
++
++void SpacesWindowController::OnTabPinnedStateChanged(tabs::TabInterface* tab,
++                                                     int index) {
++  ScheduleRepair();
++}
++
++void SpacesWindowController::OnTabStripModelDestroyed(
++    TabStripModel* tab_strip_model) {
++  model_ = nullptr;
++}
++
++void SpacesWindowController::OnSpacesChanged() {
++  ScheduleRepair();
++}
++
++void SpacesWindowController::OnSpaceTabClosed(const std::string& space_id,
++                                              bool was_new_tab_page) {
++  if (!model_ || model_->empty() || model_->closing_all() || !IsActive() ||
++      !service_->GetSpace(space_id) || SpaceHasTabs(space_id)) {
++    return;
++  }
++  if (was_new_tab_page) {
++    SwitchAwayFrom(space_id);
++  } else {
++    OpenNewTabInSpace(space_id);
++  }
++}
++
++void SpacesWindowController::OpenNewTabInSpace(const std::string& space_id) {
++  pending_new_tab_space_ = space_id;
++  chrome::AddTabAt(browser_, GURL(), -1, /*foreground=*/true);
++  pending_new_tab_space_.reset();
++}
++
++void SpacesWindowController::SwitchAwayFrom(const std::string& space_id) {
++  const std::vector<Space>& spaces = service_->spaces();
++  std::optional<size_t> index = service_->GetSpaceIndex(space_id);
++  if (!index) {
++    return;
++  }
++  for (size_t i = *index; i-- > 0;) {
++    if (SpaceHasTabs(spaces[i].id)) {
++      SwitchToSpace(spaces[i].id);
++      return;
++    }
++  }
++  for (size_t i = *index + 1; i < spaces.size(); ++i) {
++    if (SpaceHasTabs(spaces[i].id)) {
++      SwitchToSpace(spaces[i].id);
++      return;
++    }
++  }
++}
++
++bool SpacesWindowController::SpaceHasTabs(const std::string& space_id) const {
++  for (int i = 0; i < model_->count(); ++i) {
++    if (GetSpaceIdOf(model_->GetWebContentsAt(i)) == space_id) {
++      return true;
++    }
++  }
++  return false;
++}
++
++void SpacesWindowController::ScheduleRepair() {
++  if (repair_scheduled_) {
++    return;
++  }
++  repair_scheduled_ = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SpacesWindowController::RepairContiguity,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void SpacesWindowController::RepairContiguity() {
++  repair_scheduled_ = false;
++  if (!model_ || model_->empty() || model_->closing_all() || !IsActive()) {
++    return;
++  }
++  RepairRange(0, model_->IndexOfFirstNonPinnedTab());
++  RepairRange(model_->IndexOfFirstNonPinnedTab(), model_->count());
++  // The moves above scheduled another pass; it finds nothing to do.
++}
++
++void SpacesWindowController::RepairRange(int start, int end) {
++  // Order the tabs by the first appearance of their space, keeping their
++  // relative order within a space. A tab added at the end of the strip thus
++  // joins the end of its space's run.
++  std::vector<std::string> space_order;
++  std::vector<std::pair<size_t, tabs::TabInterface*>> tabs;
++  for (int i = start; i < end; ++i) {
++    tabs::TabInterface* tab = model_->GetTabAtIndex(i);
++    // Moving single tabs could break up a group or a split. Leave those
++    // ranges alone.
++    if (tab->GetGroup().has_value() || tab->IsSplit()) {
++      return;
++    }
++    const std::string& space_id = GetSpaceIdOf(tab);
++    auto it = std::ranges::find(space_order, space_id);
++    if (it == space_order.end()) {
++      it = space_order.insert(space_order.end(), space_id);
++    }
++    tabs.emplace_back(it - space_order.begin(), tab);
++  }
++  std::ranges::stable_sort(tabs, {}, &std::pair<size_t, tabs::TabInterface*>::first);
++  int position = start;
++  for (const auto& [order, tab] : tabs) {
++    const int index = model_->GetIndexOfTab(tab);
++    if (index != position) {
++      model_->MoveWebContentsAt(index, position, /*select_after_move=*/false);
++    }
++    ++position;
++  }
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/spaces_window_controller.h
+@@ -0,0 +1,142 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NEON_SPACES_SPACES_WINDOW_CONTROLLER_H_
++#define CHROME_BROWSER_UI_NEON_SPACES_SPACES_WINDOW_CONTROLLER_H_
++
++#include <optional>
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/prefs/pref_change_registrar.h"
++
++class BrowserWindowInterface;
++class TabStripModel;
++
++namespace content {
++class WebContents;
++}  // namespace content
++
++namespace tabs {
++class TabInterface;
++}  // namespace tabs
++
++namespace neon::spaces {
++
++// The spaces of one normal browser window. The window shows one space at a
++// time, the visible space, which is the space of the active tab. Nothing about
++// it is stored: a tab's space comes from its container, so session restore
++// brings back the tabs in their spaces, the visible space with the active tab,
++// and each space's last active tab through the tabs' last active times.
++//
++// The controller:
++// - answers which tabs are hidden (other spaces) for the hooks in
++//   space_tab_filter.h,
++// - switches space by activating the space's most recently active tab, or a
++//   new tab page in the space when it has none,
++// - picks the container of new tabs opened without a source page,
++// - opens a new tab page in a space whose last tab was closed while other
++//   spaces still have tabs,
++// - keeps each space's tabs together within the pinned and the unpinned tabs,
++//   so ranges of the visible tabs never include hidden ones.
++//
++// All of this is off (IsActive() false) outside the vertical layout and with
++// only the default space, so the window then behaves like stock Helium.
++class SpacesWindowController : public TabStripModelObserver,
++                               public SpacesService::Observer {
++ public:
++  SpacesWindowController(BrowserWindowInterface* browser,
++                         SpacesService* service);
++  SpacesWindowController(const SpacesWindowController&) = delete;
++  SpacesWindowController& operator=(const SpacesWindowController&) = delete;
++  ~SpacesWindowController() override;
++
++  // The controller of a normal window of a regular profile, or null.
++  static SpacesWindowController* FromBrowser(
++      const BrowserWindowInterface* browser);
++  static SpacesWindowController* FromModel(const TabStripModel* model);
++  // The controller whose model holds |tab|, or null.
++  static SpacesWindowController* FromTab(const tabs::TabInterface* tab);
++
++  // Registers the hooks delegate and the new tab container provider. Once per
++  // process.
++  static void InstallHooks();
++
++  BrowserWindowInterface* browser() const { return browser_; }
++  TabStripModel* model() const { return model_; }
++
++  // Whether spaces apply to this window now: vertical layout and more than one
++  // space.
++  bool IsActive() const;
++
++  // The space of |contents| or |tab|, by its container.
++  const std::string& GetSpaceIdOf(content::WebContents* contents) const;
++  const std::string& GetSpaceIdOf(const tabs::TabInterface* tab) const;
++  // The space of the active tab, or the default space with no active tab.
++  const std::string& GetVisibleSpaceId() const;
++
++  // Whether |tab| is in another space than the visible one. Always false when
++  // inactive.
++  bool IsTabHidden(const tabs::TabInterface* tab) const;
++
++  // Shows space |space_id|: activates its most recently active tab, or opens a
++  // new tab page in it. Does nothing if inactive or the space is unknown.
++  void SwitchToSpace(const std::string& space_id);
++  // Shows the space at |index| in the space list.
++  void SwitchToSpaceAt(size_t index);
++  // Shows the next (|delta| 1) or previous (-1) space. Stops at the ends.
++  void SwitchToRelativeSpace(int delta);
++
++  // The container a new tab of this window opens in when it has no source
++  // page: the visible space's, or for a window without tabs yet the visible
++  // space of the last active window. Empty for the default partition.
++  std::string GetContainerForNewTab() const;
++
++ private:
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++  void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
++  void OnTabStripModelDestroyed(TabStripModel* tab_strip_model) override;
++
++  // SpacesService::Observer:
++  void OnSpacesChanged() override;
++
++  // A tab of |space_id| was closed. If it was the space's last tab and the
++  // space was visible, leaves a new tab page there, unless the closed tab was
++  // itself an untouched new tab page: then the window moves on to another
++  // space and the space stays empty.
++  void OnSpaceTabClosed(const std::string& space_id, bool was_new_tab_page);
++  void OpenNewTabInSpace(const std::string& space_id);
++  // Shows the space before |space_id| in the list that still has tabs, or the
++  // one after it.
++  void SwitchAwayFrom(const std::string& space_id);
++  bool SpaceHasTabs(const std::string& space_id) const;
++
++  void ScheduleRepair();
++  void RepairContiguity();
++  // Moves tabs in [start, end) so each space's tabs are adjacent. Ranges with
++  // groups or splits are left alone.
++  void RepairRange(int start, int end);
++
++  raw_ptr<BrowserWindowInterface> browser_;
++  raw_ptr<TabStripModel> model_;
++  raw_ptr<SpacesService> service_;
++  // Set while this controller opens a tab in a given space.
++  std::optional<std::string> pending_new_tab_space_;
++  // The visible space as of the last model change.
++  std::string last_visible_space_;
++  bool repair_scheduled_ = false;
++  PrefChangeRegistrar pref_change_registrar_;
++  base::WeakPtrFactory<SpacesWindowController> weak_factory_{this};
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_NEON_SPACES_SPACES_WINDOW_CONTROLLER_H_
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/spaces_window_manager.cc
+@@ -0,0 +1,84 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/neon/spaces/spaces_window_manager.h"
++
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "chrome/browser/neon/spaces/spaces_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_selections.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/neon/spaces/spaces_window_controller.h"
++
++namespace neon::spaces {
++
++SpacesWindowManager::SpacesWindowManager(Profile* profile,
++                                         SpacesService* service)
++    : profile_(profile), service_(service) {
++  GlobalBrowserCollection* browsers = GlobalBrowserCollection::GetInstance();
++  observation_.Observe(browsers);
++  browsers->ForEach([this](BrowserWindowInterface* browser) {
++    OnBrowserCreated(browser);
++    return true;
++  });
++}
++
++SpacesWindowManager::~SpacesWindowManager() = default;
++
++void SpacesWindowManager::Shutdown() {
++  observation_.Reset();
++  controllers_.clear();
++}
++
++void SpacesWindowManager::OnBrowserCreated(BrowserWindowInterface* browser) {
++  if (browser->GetProfile() != profile_ ||
++      browser->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
++      controllers_.contains(browser)) {
++    return;
++  }
++  controllers_[browser] =
++      std::make_unique<SpacesWindowController>(browser, service_);
++}
++
++void SpacesWindowManager::OnBrowserClosed(BrowserWindowInterface* browser) {
++  controllers_.erase(browser);
++}
++
++// static
++SpacesWindowManagerFactory* SpacesWindowManagerFactory::GetInstance() {
++  static base::NoDestructor<SpacesWindowManagerFactory> instance;
++  return instance.get();
++}
++
++SpacesWindowManagerFactory::SpacesWindowManagerFactory()
++    : ProfileKeyedServiceFactory(
++          "NeonSpacesWindowManager",
++          ProfileSelections::Builder()
++              .WithRegular(ProfileSelection::kOriginalOnly)
++              .WithGuest(ProfileSelection::kNone)
++              .WithSystem(ProfileSelection::kNone)
++              .Build()) {
++  DependsOn(SpacesServiceFactory::GetInstance());
++  SpacesWindowController::InstallHooks();
++}
++
++SpacesWindowManagerFactory::~SpacesWindowManagerFactory() = default;
++
++bool SpacesWindowManagerFactory::ServiceIsCreatedWithBrowserContext() const {
++  return true;
++}
++
++std::unique_ptr<KeyedService>
++SpacesWindowManagerFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  Profile* profile = Profile::FromBrowserContext(context);
++  SpacesService* service = SpacesServiceFactory::GetForProfile(profile);
++  if (!service) {
++    return nullptr;
++  }
++  return std::make_unique<SpacesWindowManager>(profile, service);
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/spaces_window_manager.h
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NEON_SPACES_SPACES_WINDOW_MANAGER_H_
++#define CHROME_BROWSER_UI_NEON_SPACES_SPACES_WINDOW_MANAGER_H_
++
++#include <map>
++#include <memory>
++
++#include "base/memory/raw_ptr.h"
++#include "base/no_destructor.h"
++#include "base/scoped_observation.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
++#include "components/keyed_service/core/keyed_service.h"
++
++class BrowserCollection;
++class BrowserWindowInterface;
++class Profile;
++
++namespace neon::spaces {
++
++class SpacesService;
++class SpacesWindowController;
++
++// Gives every normal window of a regular profile a SpacesWindowController,
++// from the moment the window exists, before its first tab.
++class SpacesWindowManager : public KeyedService,
++                            public BrowserCollectionObserver {
++ public:
++  SpacesWindowManager(Profile* profile, SpacesService* service);
++  SpacesWindowManager(const SpacesWindowManager&) = delete;
++  SpacesWindowManager& operator=(const SpacesWindowManager&) = delete;
++  ~SpacesWindowManager() override;
++
++  // KeyedService:
++  void Shutdown() override;
++
++ private:
++  // BrowserCollectionObserver:
++  void OnBrowserCreated(BrowserWindowInterface* browser) override;
++  void OnBrowserClosed(BrowserWindowInterface* browser) override;
++
++  raw_ptr<Profile> profile_;
++  raw_ptr<SpacesService> service_;
++  std::map<BrowserWindowInterface*, std::unique_ptr<SpacesWindowController>>
++      controllers_;
++  base::ScopedObservation<BrowserCollection, BrowserCollectionObserver>
++      observation_{this};
++};
++
++class SpacesWindowManagerFactory : public ProfileKeyedServiceFactory {
++ public:
++  static SpacesWindowManagerFactory* GetInstance();
++
++ private:
++  friend base::NoDestructor<SpacesWindowManagerFactory>;
++
++  SpacesWindowManagerFactory();
++  ~SpacesWindowManagerFactory() override;
++
++  // ProfileKeyedServiceFactory:
++  bool ServiceIsCreatedWithBrowserContext() const override;
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_NEON_SPACES_SPACES_WINDOW_MANAGER_H_

@@ -31,6 +31,20 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+Neon changes to the port: a container tab restored on a WebUI page (new tab
+page, settings, history) gets a SiteInstance with no site, fixed to its
+container's partition, as noopener windows do, instead of the default
+partition Brave restores it in. A restored about:blank anchors the partition
+on a site from the tab's own history, since a blank page committed in a
+SiteInstance without a site trips a BrowsingInstance CHECK on the next
+navigation.
+
+Neon also lets spaces pick the container of new tabs that have no opener,
+source page or explicit container (Ctrl+T, the new tab button, links from
+other apps): GetStoragePartitionConfigToInherit asks a provider set with
+SetNewTabContainerProvider, where Brave master consults its "open new tabs
+in" setting (brave-core #40693).
+
 --- a/chrome/browser/chrome_content_browser_client.cc
 +++ b/chrome/browser/chrome_content_browser_client.cc
 @@ -255,6 +255,8 @@
@@ -99,7 +113,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
      "//components/sessions",
 --- /dev/null
 +++ b/chrome/browser/containers/containers_navigator_utils.cc
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,127 @@
 +// Copyright (c) 2026 The Brave Authors. All rights reserved.
 +// This Source Code Form is subject to the terms of the Mozilla Public
 +// License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -116,6 +130,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 +#include <utility>
 +
 +#include "base/feature_list.h"
++#include "base/no_destructor.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/tab_contents/tab_util.h"
 +#include "chrome/browser/ui/navigator/browser_navigator_params.h"
@@ -128,6 +143,34 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 +#include "content/public/browser/site_instance.h"
 +
 +namespace containers {
++
++namespace {
++
++NewTabContainerProvider& GetNewTabContainerProvider() {
++  static base::NoDestructor<NewTabContainerProvider> provider;
++  return *provider;
++}
++
++// Neon: the container for a new tab with no opener, source page or explicit
++// container, as picked by the provider (spaces). Mirrors where Brave master
++// consults its "open new tabs in" setting.
++std::optional<content::StoragePartitionConfig>
++GetNewTabTargetStoragePartitionConfig(const NavigateParams& params) {
++  const NewTabContainerProvider& provider = GetNewTabContainerProvider();
++  if (!provider || !params.browser) {
++    return std::nullopt;
++  }
++  // Only a Containers partition applies.
++  const std::optional<content::StoragePartitionConfig> config =
++      provider.Run(params.browser.get());
++  return MaybeInheritStoragePartition(config);
++}
++
++}  // namespace
++
++void SetNewTabContainerProvider(NewTabContainerProvider provider) {
++  GetNewTabContainerProvider() = std::move(provider);
++}
 +
 +std::optional<content::StoragePartitionConfig>
 +GetStoragePartitionConfigToInherit(const NavigateParams& params) {
@@ -146,7 +189,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 +            .GetStoragePartitionConfig());
 +  }
 +
-+  return std::nullopt;
++  return GetNewTabTargetStoragePartitionConfig(params);
 +}
 +
 +void MaybeSetContainerSiteInstance(
@@ -161,11 +204,36 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 +    return;
 +  }
 +
-+  // Skips WebUI URLs even when a container partition applies, since eagerly
-+  // assigning their SiteInstance here would undo https://crrev.com/c/8287626.
 +  const GURL& url = navigations[selected_navigation].virtual_url();
++  // Neon: Brave skips WebUI URLs here, so a container tab showing the new tab
++  // page, settings or history restored into the default partition, and what it
++  // loaded next stayed there. It gets a SiteInstance with no site yet, fixed
++  // to the container's partition, as noopener windows do; its WebUI navigation
++  // assigns the site and later navigations keep the partition.
 +  if (ChromeWebUIControllerFactory::GetInstance()->UseWebUIForURL(profile,
 +                                                                  url)) {
++    create_params->site_instance =
++        content::SiteInstance::CreateForFixedStoragePartition(
++            profile, GURL(), *storage_partition_config);
++    return;
++  }
++  // A URL without a site (about:blank) cannot use the same trick: once it
++  // commits in a SiteInstance that has no site, the next navigation fails a
++  // CHECK in BrowsingInstance (the instance reports the default partition).
++  // Anchor the partition on a site from the tab's own history instead.
++  if (!content::SiteInstance::ShouldAssignSiteForURL(url)) {
++    for (const auto& navigation : navigations) {
++      const GURL& other = navigation.virtual_url();
++      if (content::SiteInstance::ShouldAssignSiteForURL(other) &&
++          !ChromeWebUIControllerFactory::GetInstance()->UseWebUIForURL(
++              profile, other)) {
++        create_params->site_instance =
++            content::SiteInstance::CreateForFixedStoragePartition(
++                profile, other, *storage_partition_config);
++        return;
++      }
++    }
++    // Nothing to anchor it on: the tab restores in the default partition.
 +    return;
 +  }
 +  create_params->site_instance = tab_util::GetSiteInstanceForNewTab(
@@ -175,7 +243,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 +}  // namespace containers
 --- /dev/null
 +++ b/chrome/browser/containers/containers_navigator_utils.h
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,59 @@
 +// Copyright (c) 2026 The Brave Authors. All rights reserved.
 +// This Source Code Form is subject to the terms of the Mozilla Public
 +// License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -187,9 +255,11 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 +#include <optional>
 +
 +#include "base/containers/span.h"
++#include "base/functional/callback.h"
 +#include "content/public/browser/storage_partition_config.h"
 +#include "content/public/browser/web_contents.h"
 +
++class BrowserWindowInterface;
 +class Profile;
 +struct NavigateParams;
 +
@@ -202,14 +272,28 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 +// Returns the Containers storage partition a new tab created by |params|
 +// should use: |params.storage_partition_config| when it is a Containers
 +// partition, otherwise the partition of |params.source_site_instance| when that
-+// is one. Returns std::nullopt in every other case and when Containers is
-+// disabled.
++// is one, otherwise the container the new tab container provider picks for
++// |params.browser|. Returns std::nullopt in every other case and when
++// Containers is disabled.
 +std::optional<content::StoragePartitionConfig>
 +GetStoragePartitionConfigToInherit(const NavigateParams& params);
 +
++// Neon: picks the storage partition of a new tab that has no opener, no source
++// page and no explicit container: Ctrl+T, the new tab button, links from other
++// apps, bookmarks. Brave master answers the same question with its "open new
++// tabs in" setting (brave-core #40693, GetNewTabTargetStoragePartitionConfig).
++// Neon lets spaces answer it through neon::containers_api, so a new tab opens
++// in the window's visible space. std::nullopt means the default partition.
++using NewTabContainerProvider =
++    base::RepeatingCallback<std::optional<content::StoragePartitionConfig>(
++        BrowserWindowInterface* browser)>;
++void SetNewTabContainerProvider(NewTabContainerProvider provider);
++
 +// Sets |create_params->site_instance| for a tab restored from |navigations|
 +// when the selected navigation belongs to a container, so the restored tab is
-+// created in the container's storage partition. WebUI URLs are skipped.
++// created in the container's storage partition. WebUI pages get a
++// SiteInstance with no site yet, fixed to that partition; blank pages get one
++// for a site from the tab's history.
 +void MaybeSetContainerSiteInstance(
 +    Profile* profile,
 +    base::span<const sessions::SerializedNavigationEntry> navigations,
