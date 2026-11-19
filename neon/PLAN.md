@@ -51,6 +51,7 @@ across spaces on purpose.
 | R1 | Containers port study: map Brave's implementation onto Helium's patch layout | done | |
 | R2 | Spaces design: data model, sidebar pager, persistence | done | |
 | M1 | Containers core: a tab can live in a named persistent container | done | M0, R1 |
+| M1b | Containers hardening: fix the review findings on the port | todo | M2 |
 | M2 | Spaces model: tabs grouped by space, one visible space, switch by command | doing | M1, R2 |
 | M3 | Sidebar pager: space switcher row, slide animation, scroll gesture | todo | M2 |
 | M4 | Space management: create, rename, icon, colour, delete, reorder, settings page | todo | M2 |
@@ -115,6 +116,22 @@ M1 landed as seven patches: 3,490 lines of new files and 382 hook lines in 32 Ch
 page or blank tab opened "in a container" still lands in the default partition (M2 must solve
 this for new tabs in a space), and deleting a container's storage, temporary containers and
 reopening a closed tab compile but have never been run.
+
+### M1b: Containers hardening
+
+An independent review of the M1 patches (read from code, nothing run) found these. The first
+three were handed to the M2 agent because they sit in the new-tab code it is changing.
+
+| # | Finding | Owner |
+|---|---|---|
+| 1 | A container tab left on a WebUI page or `about:blank` restores into the default partition | M2 |
+| 2 | `OpenTabInContainer` accepts unknown and uppercase ids, and fails for `about:blank` | M2 |
+| 3 | Incognito profiles get a containers service although spaces must not exist there | M2 |
+| 4 | Saved tab groups reopen their tabs in the default partition (also Brave issue #58219) | M1b |
+| 5 | Brave skips platform SSO in container tabs and the port does not. On a managed Mac every container would be signed into the device's work account | M1b |
+| 6 | New split tabs do not inherit the container | M1b |
+| 7 | Helium's deferred pinned startup tabs ignore the container | M5, with per-space pins |
+| 8 | The M1 check never tests lazy restore, reopen closed tab or window, Back and Forward after restart, discard and reload | M2 for the first three, M1b for the rest |
 
 ### M2 to M5
 
