@@ -45,6 +45,14 @@ other apps): GetStoragePartitionConfigToInherit asks a provider set with
 SetNewTabContainerProvider, where Brave master consults its "open new tabs
 in" setting (brave-core #40693).
 
+Neon (M1b) also opens tabs that Chromium creates by URL on behalf of a
+container in that container (ScopedNewTabStoragePartition): the tabs of a
+saved tab group reopened from tab restore, which Brave opens in the default
+partition (brave-core #58219), and the new half of a split. An extension page
+opened as a new tab (chrome.tabs.create, runtime.openOptionsPage) stays in the
+default partition, where its extension keeps its storage, whatever space
+shows.
+
 --- a/chrome/browser/chrome_content_browser_client.cc
 +++ b/chrome/browser/chrome_content_browser_client.cc
 @@ -255,6 +255,8 @@
@@ -99,7 +107,7 @@ in" setting (brave-core #40693).
      "//components/containers/core/browser",
      "//components/containers/core/common",
    ]
-@@ -27,8 +30,11 @@ source_set("containers") {
+@@ -27,12 +30,16 @@ source_set("containers") {
    deps = [
      "//chrome/browser/profiles:profile",
      "//chrome/browser/sessions",
@@ -111,9 +119,14 @@ in" setting (brave-core #40693).
      "//chrome/common",
      "//chrome/common:buildflags",
      "//components/sessions",
+     "//content/public/browser",
+     "//crypto",
++    "//extensions/common:common_constants",
+   ]
+ }
 --- /dev/null
 +++ b/chrome/browser/containers/containers_navigator_utils.cc
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,169 @@
 +// Copyright (c) 2026 The Brave Authors. All rights reserved.
 +// This Source Code Form is subject to the terms of the Mozilla Public
 +// License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -128,6 +141,7 @@ in" setting (brave-core #40693).
 +#include "chrome/browser/containers/containers_navigator_utils.h"
 +
 +#include <utility>
++#include <vector>
 +
 +#include "base/feature_list.h"
 +#include "base/no_destructor.h"
@@ -141,6 +155,7 @@ in" setting (brave-core #40693).
 +#include "components/sessions/core/serialized_navigation_entry.h"
 +#include "content/public/browser/security_principal.h"
 +#include "content/public/browser/site_instance.h"
++#include "extensions/common/constants.h"
 +
 +namespace containers {
 +
@@ -149,6 +164,16 @@ in" setting (brave-core #40693).
 +NewTabContainerProvider& GetNewTabContainerProvider() {
 +  static base::NoDestructor<NewTabContainerProvider> provider;
 +  return *provider;
++}
++
++// Neon: the partitions of the live ScopedNewTabStoragePartition instances,
++// innermost last.
++std::vector<std::optional<content::StoragePartitionConfig>>&
++GetScopedPartitions() {
++  static base::NoDestructor<
++      std::vector<std::optional<content::StoragePartitionConfig>>>
++      partitions;
++  return *partitions;
 +}
 +
 +// Neon: the container for a new tab with no opener, source page or explicit
@@ -172,6 +197,24 @@ in" setting (brave-core #40693).
 +  GetNewTabContainerProvider() = std::move(provider);
 +}
 +
++ScopedNewTabStoragePartition::ScopedNewTabStoragePartition(
++    std::optional<content::StoragePartitionConfig> config) {
++  GetScopedPartitions().push_back(std::move(config));
++}
++
++ScopedNewTabStoragePartition::ScopedNewTabStoragePartition(
++    content::WebContents* web_contents)
++    : ScopedNewTabStoragePartition(
++          web_contents ? std::make_optional(web_contents->GetSiteInstance()
++                                                ->GetSecurityPrincipal()
++                                                .GetStoragePartitionConfig())
++                       : std::nullopt) {}
++
++ScopedNewTabStoragePartition::~ScopedNewTabStoragePartition() {
++  CHECK(!GetScopedPartitions().empty());
++  GetScopedPartitions().pop_back();
++}
++
 +std::optional<content::StoragePartitionConfig>
 +GetStoragePartitionConfigToInherit(const NavigateParams& params) {
 +  if (!base::FeatureList::IsEnabled(containers::features::kContainers)) {
@@ -187,6 +230,18 @@ in" setting (brave-core #40693).
 +    return containers::MaybeInheritStoragePartition(
 +        params.source_site_instance->GetSecurityPrincipal()
 +            .GetStoragePartitionConfig());
++  }
++
++  // Neon: an extension page (an extension's options or welcome page, opened
++  // by chrome.tabs.create or runtime.openOptionsPage) shares storage with its
++  // extension's background page only in the default partition.
++  if (params.url.SchemeIs(extensions::kExtensionScheme)) {
++    return std::nullopt;
++  }
++
++  if (!GetScopedPartitions().empty()) {
++    return containers::MaybeInheritStoragePartition(
++        GetScopedPartitions().back());
 +  }
 +
 +  return GetNewTabTargetStoragePartitionConfig(params);
@@ -243,7 +298,7 @@ in" setting (brave-core #40693).
 +}  // namespace containers
 --- /dev/null
 +++ b/chrome/browser/containers/containers_navigator_utils.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,81 @@
 +// Copyright (c) 2026 The Brave Authors. All rights reserved.
 +// This Source Code Form is subject to the terms of the Mozilla Public
 +// License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -272,9 +327,12 @@ in" setting (brave-core #40693).
 +// Returns the Containers storage partition a new tab created by |params|
 +// should use: |params.storage_partition_config| when it is a Containers
 +// partition, otherwise the partition of |params.source_site_instance| when that
-+// is one, otherwise the container the new tab container provider picks for
-+// |params.browser|. Returns std::nullopt in every other case and when
-+// Containers is disabled.
++// is one, otherwise (Neon) the partition of the innermost
++// ScopedNewTabStoragePartition, otherwise the container the new tab container
++// provider picks for |params.browser|. Returns std::nullopt in every other case
++// and when Containers is disabled. Neon: an extension page that nothing above
++// the scope picked a container for stays in the default partition, where its
++// extension keeps its storage.
 +std::optional<content::StoragePartitionConfig>
 +GetStoragePartitionConfigToInherit(const NavigateParams& params);
 +
@@ -288,6 +346,25 @@ in" setting (brave-core #40693).
 +    base::RepeatingCallback<std::optional<content::StoragePartitionConfig>(
 +        BrowserWindowInterface* browser)>;
 +void SetNewTabContainerProvider(NewTabContainerProvider provider);
++
++// Neon: while an instance is alive, a new tab that has no opener, source page
++// or explicit container opens in the partition it holds, instead of the one
++// the new tab container provider picks: a container's partition, or the
++// default partition for std::nullopt. Used where Chromium opens tabs by URL
++// on behalf of a tab or a saved entry that has a container (a saved tab group
++// reopened from tab restore, a new split tab). Scopes nest and the innermost
++// one wins. UI thread only.
++class ScopedNewTabStoragePartition {
++ public:
++  explicit ScopedNewTabStoragePartition(
++      std::optional<content::StoragePartitionConfig> config);
++  // The partition of |web_contents|: its container's, or the default one.
++  explicit ScopedNewTabStoragePartition(content::WebContents* web_contents);
++  ScopedNewTabStoragePartition(const ScopedNewTabStoragePartition&) = delete;
++  ScopedNewTabStoragePartition& operator=(
++      const ScopedNewTabStoragePartition&) = delete;
++  ~ScopedNewTabStoragePartition();
++};
 +
 +// Sets |create_params->site_instance| for a tab restored from |navigations|
 +// when the selected navigation belongs to a container, so the restored tab is
@@ -488,3 +565,54 @@ in" setting (brave-core #40693).
    switch (GetPermissionDelegationMode(permission)) {
      case PermissionDelegationMode::kDelegated:
        return false;
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -35,6 +35,7 @@
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/browsing_data/chrome_browsing_data_remover_delegate.h"
+ #include "chrome/browser/chained_back_navigation_tracker.h"
++#include "chrome/browser/containers/containers_navigator_utils.h"
+ #include "chrome/browser/contextual_tasks/contextual_tasks_side_panel_coordinator.h"
+ #include "chrome/browser/contextual_tasks/contextual_tasks_utils.h"
+ #include "chrome/browser/devtools/devtools_window.h"
+@@ -1825,6 +1826,9 @@ void NewSplitTab(BrowserWindowInterface*
+               tab_strip_model->count() > 1
+           ? GURL(chrome::kChromeUISplitViewNewTabPageURL)
+           : chrome::ChromeUINewTabURLAsGURL();
++  // Containers: the new half of the split opens in the active tab's container.
++  const containers::ScopedNewTabStoragePartition container(
++      tab_strip_model->GetActiveWebContents());
+   tab_strip_model->delegate()->AddTabAt(
+       new_tab_url, active_index + 1, true,
+       tab_strip_model->GetTabGroupForTab(active_index),
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -15,6 +15,7 @@
+ #include "base/uuid.h"
+ #include "base/values.h"
+ #include "chrome/browser/apps/app_service/web_contents_app_id_utils.h"
++#include "chrome/browser/containers/containers_navigator_utils.h"
+ #include "chrome/browser/contextual_tasks/contextual_tasks_panel_controller.h"
+ #include "chrome/browser/glic/glic_tab_restore_helper.h"
+ #include "chrome/browser/performance_manager/public/background_tab_loading_policy.h"
+@@ -39,6 +40,7 @@
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/window_metadata/window_metadata_controller.h"
+ #include "chrome/browser/web_applications/web_app_helpers.h"
++#include "components/containers/content/browser/tab_restore_utils.h"
+ #include "components/saved_tab_groups/public/features.h"
+ #include "components/saved_tab_groups/public/saved_tab_group.h"
+ #include "components/saved_tab_groups/public/tab_group_sync_service.h"
+@@ -424,6 +426,12 @@ sessions::LiveTab* BrowserLiveTabContext
+               tab.group.value()));
+     }
+   } else {
++    // Neon: the saved group reopens its tabs by URL alone. Open them in the
++    // container the restored tab was in.
++    const containers::ScopedNewTabStoragePartition container(
++        containers::GetStoragePartitionConfigToRestore(
++            &profile_.get(), tab.navigations,
++            tab.normalized_navigation_index()));
+     // Saved groups intentionally bypass deferred restoration and reopen eagerly
+     // as a batch from the sync model.
+     std::optional<tab_groups::SavedTabGroup> saved_group =
