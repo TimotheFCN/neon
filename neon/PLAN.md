@@ -347,7 +347,7 @@ Left open by M6:
 
 ### M7 to M11
 
-M8 is its patches X1 and X2, M9 is X4. M7 waits for study
+M8 is patches X1 and X2 of `neon/docs/global-space-design.md`, and M9 is its patch X4. M7 waits for study
 R4 (`neon/docs/pinned-tabs-design.md`).
 
 The owner decided on 2026-11-19 not to import upstream's pinned tabs pull request before it
