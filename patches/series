@@ -387,3 +387,6 @@ helium/ui/hide-page-actions-flag.patch
 neon/containers/core.patch
 neon/containers/content-partition.patch
 neon/containers/session-persistence.patch
+neon/containers/browser-service.patch
+neon/containers/tab-partition.patch
+neon/containers/command-line.patch

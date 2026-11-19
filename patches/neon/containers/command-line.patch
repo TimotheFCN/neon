@@ -1,0 +1,293 @@
+Neon containers port (M1), part 6 of 7: command line.
+
+--container=<name> and --temporary-container open the command line tabs in a
+container, as brave-core v1.100.58 (bd6d26d1) does through StartupTab. This
+is also how the M1 test puts tabs in containers without UI. Pinned tab
+containers (pinned_tab_codec.cc) are not ported yet.
+
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this file,
+You can obtain one at https://mozilla.org/MPL/2.0/.
+
+Copyright (c) 2025-2026, The Brave Authors
+Copyright (c) 2026, The Neon Authors
+
+Alternatively, the contents of this file may be used under the terms
+of the GNU General Public License Version 3, as described below:
+
+Copyright (C) 2026 The Neon Authors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+--- a/chrome/browser/containers/BUILD.gn
++++ b/chrome/browser/containers/BUILD.gn
+@@ -9,6 +9,8 @@ assert(enable_containers)
+ 
+ source_set("containers") {
+   sources = [
++    "container_specifier_utils.cc",
++    "container_specifier_utils.h",
+     "container_tab_tracker.cc",
+     "container_tab_tracker.h",
+     "containers_navigator_utils.cc",
+--- /dev/null
++++ b/chrome/browser/containers/container_specifier_utils.cc
+@@ -0,0 +1,85 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "chrome/browser/containers/container_specifier_utils.h"
++
++#include "base/logging.h"
++#include "chrome/browser/containers/containers_service_factory.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
++#include "components/containers/core/browser/containers_service.h"
++#include "components/containers/core/common/features.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "content/public/browser/browser_context.h"
++#include "content/public/browser/storage_partition_config.h"
++
++namespace containers {
++namespace {
++
++constexpr char kContainerIdKey[] = "container_id";
++
++}  // namespace
++
++void SerializeContainerSpecifier(content::WebContents* web_contents,
++                                 base::Value& value) {
++  if (!base::FeatureList::IsEnabled(features::kContainers)) {
++    return;
++  }
++
++  CHECK(value.is_dict());
++  if (std::string container_id = GetContainerIdForWebContents(web_contents);
++      !container_id.empty()) {
++    value.GetDict().Set(kContainerIdKey, base::Value(container_id));
++  }
++}
++
++void DeserializeContainerSpecifier(const base::Value& value,
++                                   ContainerSpecifier& container_specifier) {
++  if (!base::FeatureList::IsEnabled(features::kContainers)) {
++    return;
++  }
++
++  if (!value.is_dict()) {
++    LOG(ERROR) << "value is not a dictionary";
++    return;
++  }
++
++  if (const std::string* container_id =
++          value.GetDict().FindString(kContainerIdKey)) {
++    container_specifier = ContainerId(*container_id);
++  }
++}
++
++std::optional<content::StoragePartitionConfig>
++GetStoragePartitionConfigForContainerSpecifier(
++    content::BrowserContext* browser_context,
++    const ContainerSpecifier& container_specifier) {
++  if (!base::FeatureList::IsEnabled(features::kContainers)) {
++    return std::nullopt;
++  }
++
++  // If the container specifier is not set, return nullopt.
++  if (std::holds_alternative<std::monostate>(container_specifier)) {
++    return std::nullopt;
++  }
++
++  auto* containers_service = ContainersServiceFactory::GetForProfile(
++      Profile::FromBrowserContext(browser_context));
++  if (!containers_service) {
++    return std::nullopt;
++  }
++
++  if (auto container_id =
++          containers_service->GetContainerIdFromContainerSpecifier(
++              container_specifier)) {
++    return content::StoragePartitionConfig::Create(
++        browser_context, kContainersStoragePartitionDomain, *container_id,
++        browser_context->IsOffTheRecord());
++  }
++
++  return std::nullopt;
++}
++
++}  // namespace containers
+--- /dev/null
++++ b/chrome/browser/containers/container_specifier_utils.h
+@@ -0,0 +1,39 @@
++// Copyright (c) 2026 The Brave Authors. All rights reserved.
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at https://mozilla.org/MPL/2.0/.
++
++#ifndef CHROME_BROWSER_CONTAINERS_CONTAINER_SPECIFIER_UTILS_H_
++#define CHROME_BROWSER_CONTAINERS_CONTAINER_SPECIFIER_UTILS_H_
++
++#include <optional>
++
++#include "base/values.h"
++#include "components/containers/core/browser/container_specifier.h"
++
++namespace content {
++class BrowserContext;
++class StoragePartitionConfig;
++class WebContents;
++}  // namespace content
++
++namespace containers {
++
++// Serializes the container specifier for the given web contents into the value.
++void SerializeContainerSpecifier(content::WebContents* web_contents,
++                                 base::Value& value);
++
++// Deserializes the container specifier from the value into the container
++// specifier.
++void DeserializeContainerSpecifier(const base::Value& value,
++                                   ContainerSpecifier& container_specifier);
++
++// Returns the storage partition config for the given container specifier.
++std::optional<content::StoragePartitionConfig>
++GetStoragePartitionConfigForContainerSpecifier(
++    content::BrowserContext* browser_context,
++    const ContainerSpecifier& container_specifier);
++
++}  // namespace containers
++
++#endif  // CHROME_BROWSER_CONTAINERS_CONTAINER_SPECIFIER_UTILS_H_
+--- a/chrome/browser/sessions/session_restore.cc
++++ b/chrome/browser/sessions/session_restore.cc
+@@ -41,6 +41,7 @@
+ #include "chrome/browser/after_startup_task_utils.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/buildflags.h"
++#include "chrome/browser/containers/container_specifier_utils.h"
+ #include "chrome/browser/prefs/session_startup_pref.h"
+ #include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
+ #include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
+@@ -1462,6 +1463,9 @@ class SessionRestoreImpl : public Browse
+                                ? WindowOpenDisposition::kNewForegroundTab
+                                : WindowOpenDisposition::kNewBackgroundTab;
+       params.tabstrip_add_types = add_types;
++      params.storage_partition_config =
++          containers::GetStoragePartitionConfigForContainerSpecifier(
++              browser->GetProfile(), startup_tab.container);
+       is_first_tab = false;
+       Navigate(&params);
+     }
+--- a/chrome/browser/ui/startup/startup_browser_creator_impl.cc
++++ b/chrome/browser/ui/startup/startup_browser_creator_impl.cc
+@@ -21,6 +21,7 @@
+ #include "build/build_config.h"
+ #include "chrome/browser/apps/platform_apps/install_chrome_app.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/containers/container_specifier_utils.h"
+ #include "chrome/browser/custom_handlers/protocol_handler_registry_factory.h"
+ #include "chrome/browser/defaults.h"
+ #include "chrome/browser/first_run/first_run.h"
+@@ -492,6 +493,9 @@ BrowserWindowInterface* StartupBrowserCr
+     }
+ #endif  // BUILDFLAG(ENABLE_RLZ)
+ 
++    params.storage_partition_config =
++        containers::GetStoragePartitionConfigForContainerSpecifier(
++            browser->GetProfile(), tab.container);
+     Navigate(&params);
+     first_tab = false;
+   }
+--- a/chrome/browser/ui/startup/startup_tab.cc
++++ b/chrome/browser/ui/startup/startup_tab.cc
+@@ -9,4 +9,9 @@ StartupTab::StartupTab(const GURL& url,
+ StartupTab::StartupTab(const GURL& url, bool is_untrusted_launch)
+     : url(url), is_untrusted_launch(is_untrusted_launch) {}
+ 
++StartupTab::StartupTab(const StartupTab&) = default;
++StartupTab& StartupTab::operator=(const StartupTab&) = default;
++StartupTab::StartupTab(StartupTab&&) noexcept = default;
++StartupTab& StartupTab::operator=(StartupTab&&) noexcept = default;
++
+ StartupTab::~StartupTab() = default;
+--- a/chrome/browser/ui/startup/startup_tab.h
++++ b/chrome/browser/ui/startup/startup_tab.h
+@@ -7,6 +7,7 @@
+ 
+ #include <vector>
+ 
++#include "components/containers/core/browser/container_specifier.h"
+ #include "url/gurl.h"
+ 
+ // Represents tab data at startup.
+@@ -21,6 +22,10 @@ struct StartupTab {
+ 
+   explicit StartupTab(const GURL& url, Type type = Type::kNormal);
+   StartupTab(const GURL& url, bool is_untrusted_launch);
++  StartupTab(const StartupTab&);
++  StartupTab& operator=(const StartupTab&);
++  StartupTab(StartupTab&&) noexcept;
++  StartupTab& operator=(StartupTab&&) noexcept;
+   ~StartupTab();
+ 
+   // The url to load.
+@@ -31,6 +36,9 @@ struct StartupTab {
+   // True if this tab was launched from an untrusted external custom protocol
+   // (e.g., google-chrome://) that was stripped on startup.
+   bool is_untrusted_launch = false;
++
++  // Containers: the container to open the tab in, if any.
++  containers::ContainerSpecifier container;
+ };
+ 
+ using StartupTabs = std::vector<StartupTab>;
+--- a/chrome/browser/ui/startup/startup_tab_provider.cc
++++ b/chrome/browser/ui/startup/startup_tab_provider.cc
+@@ -16,6 +16,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/threading/thread_restrictions.h"
+ #include "build/build_config.h"
++#include "chrome/browser/containers/containers_service_factory.h"
+ #include "chrome/browser/first_run/first_run.h"
+ #include "chrome/browser/prefs/session_startup_pref.h"
+ #include "chrome/browser/profile_resetter/triggered_profile_resetter.h"
+@@ -38,6 +39,7 @@
+ #include "chrome/browser/ui/webui/settings/reset_settings_handler.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/common/url_constants.h"
++#include "components/containers/core/browser/command_line_container.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/search_engines/util.h"
+ #include "components/signin/public/base/signin_switches.h"
+@@ -167,6 +169,18 @@ StartupTabs StartupTabProviderImpl::GetC
+     }
+   }
+ 
++  // Containers: every command line tab opens in the --container one.
++  if (auto* containers_service =
++          profile ? ContainersServiceFactory::GetForProfile(profile) : nullptr;
++      containers_service && !result.empty()) {
++    const containers::ContainerSpecifier container =
++        containers::GetContainerSpecifierForCommandLineTabs(command_line,
++                                                            containers_service);
++    for (auto& tab : result) {
++      tab.container = container;
++    }
++  }
++
+   return result;
+ }
+ 
