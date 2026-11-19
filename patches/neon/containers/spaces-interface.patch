@@ -5,6 +5,10 @@ chrome/browser/neon/containers_api.h. It maps onto the Brave port, so that if
 Helium imports Brave containers, only containers_api.cc changes. Neon code,
 GPL-3.0.
 
+IsAvailable() is false for off-the-record profiles (the port's service runs
+there, Neon does not offer it), and OpenTabInContainer() requires a container
+that exists and a lowercase id.
+
 --- a/chrome/browser/BUILD.gn
 +++ b/chrome/browser/BUILD.gn
 @@ -1169,6 +1169,7 @@ source_set("core") {
@@ -50,7 +54,7 @@ GPL-3.0.
 +}
 --- /dev/null
 +++ b/chrome/browser/neon/containers_api.cc
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,215 @@
 +// Copyright 2026 The Neon Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -62,6 +66,7 @@ GPL-3.0.
 +#include "base/check.h"
 +#include "base/feature_list.h"
 +#include "base/functional/bind.h"
++#include "base/strings/string_util.h"
 +#include "chrome/browser/containers/containers_service_factory.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
@@ -85,7 +90,10 @@ GPL-3.0.
 +using containers::mojom::ContainerOperationError;
 +
 +containers::ContainersService* GetService(Profile* profile) {
-+  if (!profile ||
++  // The containers port also runs in off-the-record profiles (Brave's factory
++  // uses WithRegular(kOwnInstance)), but Neon offers containers, and so
++  // spaces, in regular profiles only.
++  if (!profile || profile->IsOffTheRecord() ||
 +      !base::FeatureList::IsEnabled(containers::features::kContainers)) {
 +    return nullptr;
 +  }
@@ -213,8 +221,13 @@ GPL-3.0.
 +    return nullptr;
 +  }
 +  Profile* profile = browser->GetProfile();
-+  if (!GetService(profile) ||
-+      !containers::IsValidStoragePartitionKeyComponent(id)) {
++  auto* service = GetService(profile);
++  // Ids are lowercase UUIDs. An uppercase id would pass the character check,
++  // but the containers+<id>: prefix is lowercased when the session is saved,
++  // so the tab would restore into another partition. A stale id would
++  // silently create a new partition.
++  if (!service || !containers::IsValidStoragePartitionKeyComponent(id) ||
++      id != base::ToLowerASCII(id) || !service->GetRuntimeContainerById(id)) {
 +    return nullptr;
 +  }
 +
@@ -259,7 +272,7 @@ GPL-3.0.
 +}  // namespace neon::containers_api
 --- /dev/null
 +++ b/chrome/browser/neon/containers_api.h
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,111 @@
 +// Copyright 2026 The Neon Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -314,8 +327,10 @@ GPL-3.0.
 +  void OnContainersListChanged() final;
 +};
 +
-+// Whether containers are available for |profile|. False for off-the-record and
-+// system profiles, and when the Containers feature is disabled.
++// Whether containers are available for |profile|. False for off-the-record
++// profiles (the port itself runs there, Neon does not offer it), for system
++// profiles and when the Containers feature is disabled. Every other function
++// here behaves as if no container existed when this is false.
 +bool IsAvailable(Profile* profile);
 +
 +// The user's containers, in their stored order.
@@ -347,8 +362,11 @@ GPL-3.0.
 +bool DeleteContainer(Profile* profile, std::string_view id);
 +
 +// Opens |url| in a new tab of |browser| inside container |id| at |index| (-1
-+// for the end). Returns the new tab's contents, or nullptr if |id| is not a
-+// valid container id or containers are unavailable.
++// for the end). WebUI pages such as the new tab page open in the container
++// too. about:blank does not: a SiteInstance without a site cannot hold a
++// container partition safely, so a blank tab opens in the default partition.
++// Returns the new tab's contents, or nullptr if containers are unavailable or
++// no container |id| exists (GetContainer). Ids are lowercase.
 +content::WebContents* OpenTabInContainer(BrowserWindowInterface* browser,
 +                                         const GURL& url,
 +                                         std::string_view id,

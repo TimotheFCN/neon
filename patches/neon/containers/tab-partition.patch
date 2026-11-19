@@ -31,6 +31,14 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+Neon changes to the port: a container tab restored on a WebUI page (new tab
+page, settings, history) gets a SiteInstance with no site, fixed to its
+container's partition, as noopener windows do, instead of the default
+partition Brave restores it in. A restored about:blank anchors the partition
+on a site from the tab's own history, since a blank page committed in a
+SiteInstance without a site trips a BrowsingInstance CHECK on the next
+navigation.
+
 --- a/chrome/browser/chrome_content_browser_client.cc
 +++ b/chrome/browser/chrome_content_browser_client.cc
 @@ -255,6 +255,8 @@
@@ -99,7 +107,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
      "//components/sessions",
 --- /dev/null
 +++ b/chrome/browser/containers/containers_navigator_utils.cc
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,98 @@
 +// Copyright (c) 2026 The Brave Authors. All rights reserved.
 +// This Source Code Form is subject to the terms of the Mozilla Public
 +// License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -161,11 +169,36 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 +    return;
 +  }
 +
-+  // Skips WebUI URLs even when a container partition applies, since eagerly
-+  // assigning their SiteInstance here would undo https://crrev.com/c/8287626.
 +  const GURL& url = navigations[selected_navigation].virtual_url();
++  // Neon: Brave skips WebUI URLs here, so a container tab showing the new tab
++  // page, settings or history restored into the default partition, and what it
++  // loaded next stayed there. It gets a SiteInstance with no site yet, fixed
++  // to the container's partition, as noopener windows do; its WebUI navigation
++  // assigns the site and later navigations keep the partition.
 +  if (ChromeWebUIControllerFactory::GetInstance()->UseWebUIForURL(profile,
 +                                                                  url)) {
++    create_params->site_instance =
++        content::SiteInstance::CreateForFixedStoragePartition(
++            profile, GURL(), *storage_partition_config);
++    return;
++  }
++  // A URL without a site (about:blank) cannot use the same trick: once it
++  // commits in a SiteInstance that has no site, the next navigation fails a
++  // CHECK in BrowsingInstance (the instance reports the default partition).
++  // Anchor the partition on a site from the tab's own history instead.
++  if (!content::SiteInstance::ShouldAssignSiteForURL(url)) {
++    for (const auto& navigation : navigations) {
++      const GURL& other = navigation.virtual_url();
++      if (content::SiteInstance::ShouldAssignSiteForURL(other) &&
++          !ChromeWebUIControllerFactory::GetInstance()->UseWebUIForURL(
++              profile, other)) {
++        create_params->site_instance =
++            content::SiteInstance::CreateForFixedStoragePartition(
++                profile, other, *storage_partition_config);
++        return;
++      }
++    }
++    // Nothing to anchor it on: the tab restores in the default partition.
 +    return;
 +  }
 +  create_params->site_instance = tab_util::GetSiteInstanceForNewTab(
@@ -175,7 +208,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 +}  // namespace containers
 --- /dev/null
 +++ b/chrome/browser/containers/containers_navigator_utils.h
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,45 @@
 +// Copyright (c) 2026 The Brave Authors. All rights reserved.
 +// This Source Code Form is subject to the terms of the Mozilla Public
 +// License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -209,7 +242,9 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 +
 +// Sets |create_params->site_instance| for a tab restored from |navigations|
 +// when the selected navigation belongs to a container, so the restored tab is
-+// created in the container's storage partition. WebUI URLs are skipped.
++// created in the container's storage partition. WebUI pages get a
++// SiteInstance with no site yet, fixed to that partition; blank pages get one
++// for a site from the tab's history.
 +void MaybeSetContainerSiteInstance(
 +    Profile* profile,
 +    base::span<const sessions::SerializedNavigationEntry> navigations,
