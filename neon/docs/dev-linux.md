@@ -565,3 +565,48 @@ the next agent can build incrementally.
   ```
 
   Only do this when the patches above are already refreshed, so their content is unchanged.
+
+## Notes from M5 (all spaces as containers)
+
+- **`quilt refresh` drops files that have no change yet.** A file added to a patch with
+  `quilt add` before you edit it, then refreshed while still unchanged, is no longer tracked:
+  a later edit stays in the tree only, the build passes, and a clean apply of the series would
+  not compile. Add a file right before editing it, and check `quilt files PATCH` before
+  committing. M5 hit this once (`space_switcher_row.h`).
+- **Always `quilt refresh` before any pop or move.** Edits to files a patch tracks live only in
+  the tree until refreshed; `quilt pop` refuses an unrefreshed patch ("does not remove
+  cleanly"), which is the safe outcome, but a script that goes on from there leaves the series
+  half moved. Refresh the topmost Neon patch in place; a lower one that shares files with a
+  later Neon patch cannot be refreshed in place (see below).
+- **Refreshing a Neon patch that shares files with later Neon patches** without popping the
+  Linux patches: refresh the later ones, move them to the platform end with
+  `neon/quilt_place.py PATCH platform` (it only refuses when a patch it crosses shares a file),
+  pop them, move the patch you edit to the end too, refresh it, push the others back and move
+  everything back into the core block in order. Only the files of the moved patches get new
+  mtimes. Splitting a patch works the same way: pop it, cut the file sections out of the
+  `.patch` text, create the new patch with `quilt new`, `quilt add` its files, apply the cut
+  sections with `patch -p1`, refresh, then push the trimmed patch.
+- **Building an older tree for a fixture** costs two short builds when only Neon patches
+  differ: refresh and move the newer patches to the platform end, pop them, `neon_build`
+  (about a minute), make the fixture, push and move them back, build again.
+  `neon/tests/make_m4_profile.py` was made this way from the M4 build.
+- **Test windows are all the same size.** `--window-size` and `--window-position`, which the
+  checks pass, apply to every window the browser opens, popups included. A check that measures
+  where a popup opens must launch without them (`FreeSizeBrowser` in `all_containers_m5.py`).
+- **The empty part of the vertical sidebar is window caption.** A right click there opens the
+  window manager's menu (Minimize, Maximize...), not a view's context menu. The New Tab button
+  of the sidebar has a context menu; M5 adds "New space" to it.
+- **Blank pages and SiteInstances.** A SiteInstance without a site always reports the default
+  partition, and a browser-initiated about:blank commits in one even in a fixed-partition
+  BrowsingInstance, so the next navigation either hits the `CHECK` in
+  `BrowsingInstance::ComputeSiteInfoForURL` or leaves the container. Anchoring on a site does
+  not help (about:blank still gets its own SiteInstance). `containers/blank-tabs.patch` makes a
+  BrowsingInstance fixed to a non-default partition assign a site to such pages, as content
+  already does for `<webview>` guests.
+- **Cookies on disk** are the reliable proof of a partition: `Default/Cookies` is the default
+  partition, `Default/Storage/ext/containers/<hash>/Cookies` a container (hash: first 6 bytes
+  of SHA-256 of the id, upper-case hex). Values are encrypted with `--password-store=basic`,
+  names are not, so give each test cookie a distinct name. Read them after the browser exits.
+- `--load-extension` needs `--disable-features=DisableLoadExtensionCommandLineSwitch` on this
+  build. The test extension's service worker is a DevTools target of type `service_worker`;
+  `Runtime.evaluate` with `awaitPromise` runs `chrome.*` calls there.

@@ -16,24 +16,31 @@ when it ends. It does not use neon/browser.sh, because it restarts the browser o
 profile. Ports and the X display are picked free at start, so it does not collide with a
 browser started by neon/browser.sh.
 
+Since M5 every space is a container and no tab of a space uses the default partition, so
+containers are reached through spaces: a container that no space uses has its tabs reopened in a
+space. The checks seed one space per container.
+
 Phases:
 
-1. stock: no container in use. A page loads, a cookie is set, the browser restarts, the session
-   restores the tab and the cookie is still there.
-2. containers: two containers (Alpha, Beta) are seeded in the profile's prefs
-   (brave.containers.list). Tabs are opened on the same site in Alpha, Beta and the default
-   partition with `--container=<name> URL` (the first through the initial launch, the others by
-   running the binary again, which hands the command line to the running browser). Checks:
-   - each tab sees only its own cookie (different cookies on the same site),
+1. stock: a fresh profile. Its first space, Personal, has a container; a page loads there, a
+   cookie is set, the browser restarts, the session restores the tab and the cookie is still
+   there. The default partition holds no cookie of the page.
+2. containers: three containers (Alpha, Beta, Gamma) and a space for each are seeded in the
+   profile's prefs (brave.containers.list, neon.spaces.list). Tabs are opened on the same site
+   in Alpha, Beta and Gamma with `--container=<name> URL` (the first through the initial
+   launch, the others by running the binary again, which hands the command line to the
+   running browser), and a link from another app without a container. Checks:
+   - each tab sees only its own cookie (different cookies on the same site), and the link
+     from another app opens in the visible space,
    - the Alpha tab keeps its container across same-site, cross-site (browser- and
      renderer-initiated) navigation, window.open with opener, noopener window.open, a
      target=_blank link click and a ctrl+click on a link (link opened in a new tab),
    - the partition directories exist under Storage/ext/containers/.
 3. restart: the browser is closed over DevTools (Browser.close) and started again on the same
-   profile without URLs. The session files must hold container tabs as containers+<id>:<url>.
+   profile without URLs. The session files must hold every tab as containers+<id>:<url>.
    Every restored tab is activated and must show its container's cookie.
-4. disabled: the browser is started once more with --disable-features=Containers. The default
-   tab restores; container tabs must not load their site in the default partition.
+4. disabled: the browser is started once more with --disable-features=Containers. Container
+   tabs must not load their site in the default partition.
 
 Needs python3-websocket (in the dev image).
 """
@@ -65,7 +72,16 @@ ALPHA = {'id': '6f1c2d3e-0a1b-4c2d-8e3f-a1b2c3d4e5f6', 'name': 'Alpha', 'icon': 
          'background_color': -13669408}
 BETA = {'id': '0b9a8c7d-6e5f-4a3b-9c2d-1e0f9a8b7c6d', 'name': 'Beta', 'icon': 3,
         'background_color': -2543579}
+GAMMA = {'id': '3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f', 'name': 'Gamma', 'icon': 2,
+         'background_color': -16744448}
 COOKIE_AGE = 30 * 24 * 3600
+
+
+def space_for(container, letter):
+    """A space of the neon.spaces.list pref using |container|."""
+    return {'id': f'5e6f7a8b-0000-4000-8000-00000000000{letter.lower()}',
+            'name': letter, 'icon': letter.lower(), 'color': container['background_color'],
+            'container_id': container['id']}
 
 failures = []
 
@@ -324,7 +340,7 @@ def set_cookie(page, value):
 # --- Phases ------------------------------------------------------------------------------------
 
 def phase_stock(ctx):
-    print('== stock: no container in use', flush=True)
+    print('== stock: a fresh profile browses in its first space', flush=True)
     profile = tempfile.mkdtemp(prefix='neon-m1-stock-')
     ctx['dirs'].append(profile)
     write_prefs(profile, {'session': {'restore_on_startup': 1}})
@@ -335,10 +351,19 @@ def phase_stock(ctx):
     p = find_page(b, 'n=stock')
     p.wait_loaded('n=stock')
     set_cookie(p, 'S')
-    check(p.cookie() == 'who=S', 'stock: cookie set in the default partition')
+    check(p.cookie() == 'who=S', 'stock: cookie set in the first space')
     b.close()
-    check(not os.path.exists(os.path.join(profile, 'Default', 'Storage', 'ext', 'containers')),
-          'stock: no container partition was created')
+    spaces = read_prefs(profile).get('neon', {}).get('spaces', {}).get('list', [])
+    check(len(spaces) == 1 and spaces[0].get('container_id'),
+          f'stock: the profile has one space, with a container ({spaces})')
+    cid = spaces[0].get('container_id', '') if spaces else ''
+    root = os.path.join(profile, 'Default', 'Storage', 'ext', 'containers')
+    dirs = sorted(os.listdir(root)) if os.path.isdir(root) else []
+    check(dirs == [os.path.basename(partition_dir(profile, cid))],
+          f'stock: the only container partition is that space\'s ({dirs})')
+    check(b'who' not in open(os.path.join(profile, 'Default', 'Cookies'), 'rb').read()
+          if os.path.exists(os.path.join(profile, 'Default', 'Cookies')) else True,
+          'stock: the default partition holds no cookie of the page')
     b.start()
     p = find_page(b, 'n=stock')
     p.activate()
@@ -352,7 +377,10 @@ def phase_containers(ctx):
     profile = tempfile.mkdtemp(prefix='neon-m1-containers-')
     ctx['dirs'].append(profile)
     write_prefs(profile, {'session': {'restore_on_startup': 1},
-                          'brave': {'containers': {'list': [ALPHA, BETA]}}})
+                          'brave': {'containers': {'list': [ALPHA, BETA, GAMMA]}},
+                          'neon': {'spaces': {'list': [space_for(ALPHA, 'A'),
+                                                       space_for(BETA, 'B'),
+                                                       space_for(GAMMA, 'G')]}}})
     b = Browser(ctx['helium'], profile, ctx['display'], free_port(), ctx['log'])
     ctx['browsers'].append(b)
     site, other = ctx['site'], ctx['other_site']
@@ -363,7 +391,8 @@ def phase_containers(ctx):
     check(b.remote('--container=Beta', f'{site}/page?n=b') == 0, 'second launch hands off Beta tab')
     bt = find_page(b, 'n=b')
     bt.wait_loaded('n=b')
-    check(b.remote(f'{site}/page?n=d') == 0, 'second launch hands off default tab')
+    check(b.remote('--container=Gamma', f'{site}/page?n=d') == 0,
+          'second launch hands off Gamma tab')
     d = find_page(b, 'n=d')
     d.wait_loaded('n=d')
 
@@ -371,7 +400,14 @@ def phase_containers(ctx):
         set_cookie(page, value)
     check(a.cookie() == 'who=A', 'Alpha tab sees only its own cookie')
     check(bt.cookie() == 'who=B', 'Beta tab sees only its own cookie')
-    check(d.cookie() == 'who=D', 'default tab sees only its own cookie')
+    check(d.cookie() == 'who=D', 'Gamma tab sees only its own cookie')
+    # A link from another app has no container: it opens in the visible space (Gamma's, the
+    # last one opened), not in the default partition.
+    check(b.remote(f'{site}/page?n=other-app') == 0, 'second launch hands off a plain link')
+    oa = find_page(b, 'n=other-app')
+    oa.wait_loaded('n=other-app')
+    check(oa.cookie() == 'who=D', f'a link from another app opens in the visible space '
+          f'({oa.cookie()!r})')
 
     # Same-tab navigation, same site and cross-site.
     a.navigate(f'{site}/page?n=a-same')
@@ -389,7 +425,7 @@ def phase_containers(ctx):
     a.wait_loaded('n=a-home')
     check(a.cookie() == 'who=A', 'Alpha is back on the first site with its cookie')
     d.navigate(f'{other}/page?n=d-other')
-    check(d.cookie() == '', 'default tab does not see the cookie Alpha set on the second site')
+    check(d.cookie() == '', 'Gamma tab does not see the cookie Alpha set on the second site')
     d.navigate(f'{site}/page?n=d')
 
     # New windows and tabs opened from the Alpha tab.
@@ -417,9 +453,9 @@ def phase_containers(ctx):
     ctrl.wait_loaded('n=a-home-ctrl')
     check(ctrl.cookie() == 'who=A', 'ctrl+click (link opened in a new tab) stays in Alpha')
 
-    # Beta and the default tab are unaffected.
+    # Beta and Gamma are unaffected.
     check(bt.cookie() == 'who=B', 'Beta tab still has its own cookie')
-    check(d.cookie() == 'who=D', 'default tab still has its own cookie')
+    check(d.cookie() == 'who=D', 'Gamma tab still has its own cookie')
 
     check(os.path.isdir(partition_dir(profile, ALPHA['id'])),
           'Alpha partition directory exists under Storage/ext/containers')
@@ -436,9 +472,8 @@ def phase_containers(ctx):
     check(f'containers+{ALPHA["id"]}:{site}/page?n=a-home'.encode() in session and
           f'containers+{BETA["id"]}:{site}/page?n=b'.encode() in session,
           'session file stores container tabs as containers+<id>:<url>')
-    check(re.search(rb'containers\+[0-9a-z-]+:' + re.escape(f'{site}/page?n=d'.encode()),
-                    session) is None and f'{site}/page?n=d'.encode() in session,
-          'session file stores the default tab without a prefix')
+    check(f'containers+{GAMMA["id"]}:{site}/page?n=d'.encode() in session,
+          'session file stores the Gamma tab with its prefix')
     b.start()
     expected = {'n=a-home': 'who=A', 'n=b': 'who=B', 'n=d': 'who=D',
                 'n=a-noopener': 'who=A', 'n=a-home-blank': 'who=A',
@@ -471,8 +506,7 @@ def phase_containers(ctx):
     b.start('--disable-features=Containers')
     time.sleep(3)
     urls = [t['url'] for t in b.pages()]
-    check(any(f'{site}/page?n=d' in u for u in urls), 'disabled: default tab restored')
-    leaked = [u for u in urls if u.startswith(site) and 'n=d' not in u]
+    leaked = [u for u in urls if u.startswith(site)]
     check(not leaked, f'disabled: no container tab restored as a plain URL {leaked}')
     for t in b.pages():
         if 'n=b' in t['url'] or 'n=a' in t['url']:

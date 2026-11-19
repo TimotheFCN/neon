@@ -1,0 +1,136 @@
+Neon containers: blank pages stay in their container.
+
+A page without a site (about:blank) commits in a SiteInstance without a site,
+and such a SiteInstance always reports the default storage partition. A blank
+tab opened in a container, a tab of a container left on about:blank (the new
+tab page, then about:blank typed), or a restored blank tab therefore ran in the
+default partition, and its next navigation either left the container or hit
+the CHECK in BrowsingInstance::ComputeSiteInfoForURL.
+
+- content: a BrowsingInstance fixed to a non-default storage partition assigns
+  a site to such pages, as it already does for <webview> guests, so the page
+  keeps the partition (browsing_instance.cc, one condition).
+- tab_util: a new tab on a page without a site in a container gets a
+  SiteInstance for the empty URL fixed to the container, as noopener windows
+  do; a restored blank tab with no site in its history gets the same.
+- A new tab whose source page is in the default partition (an extension page
+  in the global window) opens where a tab with no source page would, in the
+  visible space, instead of in the default partition.
+
+--- a/chrome/browser/containers/containers_navigator_utils.cc
++++ b/chrome/browser/containers/containers_navigator_utils.cc
+@@ -98,9 +98,17 @@ GetStoragePartitionConfigToInherit(const
+   }
+ 
+   if (params.source_site_instance) {
+-    return containers::MaybeInheritStoragePartition(
+-        params.source_site_instance->GetSecurityPrincipal()
+-            .GetStoragePartitionConfig());
++    std::optional<content::StoragePartitionConfig> config =
++        containers::MaybeInheritStoragePartition(
++            params.source_site_instance->GetSecurityPrincipal()
++                .GetStoragePartitionConfig());
++    // Neon: a page of the default partition (an extension page in the global
++    // window, a page that has not been moved to its space yet) opening a
++    // link in a new tab: the default partition is no space's, so the tab
++    // opens where a tab with no source page would.
++    if (config) {
++      return config;
++    }
+   }
+ 
+   // Neon: an extension page (an extension's options or welcome page, opened
+@@ -159,8 +167,8 @@ void MaybeSetContainerSiteInstance(
+         return;
+       }
+     }
+-    // Nothing to anchor it on: the tab restores in the default partition.
+-    return;
++    // Neon: nothing to anchor it on in its history. GetSiteInstanceForNewTab
++    // anchors it on a reserved site, as a new blank tab in a container.
+   }
+   create_params->site_instance = tab_util::GetSiteInstanceForNewTab(
+       profile, url, std::move(storage_partition_config));
+--- a/chrome/browser/containers/containers_navigator_utils.h
++++ b/chrome/browser/containers/containers_navigator_utils.h
+@@ -26,7 +26,8 @@ namespace containers {
+ // Returns the Containers storage partition a new tab created by |params|
+ // should use: |params.storage_partition_config| when it is a Containers
+ // partition, otherwise the partition of |params.source_site_instance| when that
+-// is one, otherwise (Neon) the partition of the innermost
++// is one (Neon: a source page in the default partition counts as no source
++// page), otherwise (Neon) the partition of the innermost
+ // ScopedNewTabStoragePartition, otherwise the container the new tab container
+ // provider picks for |params.browser|. Returns std::nullopt in every other case
+ // and when Containers is disabled. Neon: an extension page that nothing above
+@@ -69,7 +70,8 @@ class ScopedNewTabStoragePartition {
+ // when the selected navigation belongs to a container, so the restored tab is
+ // created in the container's storage partition. WebUI pages get a
+ // SiteInstance with no site yet, fixed to that partition; blank pages get one
+-// for a site from the tab's history.
++// for a site from the tab's history, or (Neon) for a reserved site when the
++// history has none (see tab_util::GetSiteInstanceForNewTab()).
+ void MaybeSetContainerSiteInstance(
+     Profile* profile,
+     base::span<const sessions::SerializedNavigationEntry> navigations,
+--- a/chrome/browser/neon/containers_api.h
++++ b/chrome/browser/neon/containers_api.h
+@@ -103,8 +103,8 @@ void ForgetContainerInClosedTabs(Profile
+ 
+ // Opens |url| in a new tab of |browser| inside container |id| at |index| (-1
+ // for the end). WebUI pages such as the new tab page open in the container
+-// too. about:blank does not: a SiteInstance without a site cannot hold a
+-// container partition safely, so a blank tab opens in the default partition.
++// too, and so does about:blank, anchored on a reserved site (see
++// tab_util::GetSiteInstanceForNewTab()).
+ // Returns the new tab's contents, or nullptr if containers are unavailable or
+ // no container |id| exists (GetContainer). Ids are lowercase.
+ content::WebContents* OpenTabInContainer(BrowserWindowInterface* browser,
+--- a/chrome/browser/tab_contents/tab_util.cc
++++ b/chrome/browser/tab_contents/tab_util.cc
+@@ -66,8 +66,20 @@ scoped_refptr<SiteInstance> GetSiteInsta
+   // appears that it is more useful to have such links open in a new process,
+   // so we create new tabs in a new BrowsingInstance.
+   // Create a new SiteInstance for the |url| unless it is not desirable.
+-  if (!SiteInstance::ShouldAssignSiteForURL(url))
++  if (!SiteInstance::ShouldAssignSiteForURL(url)) {
++    // Containers (Neon): a page without a site, such as about:blank, would
++    // commit in a SiteInstance without a site, which runs in the default
++    // partition whatever partition it was created for, and the tab's next
++    // navigation would leave the container. A SiteInstance created for the
++    // empty URL does get a site, an empty one that carries the container's
++    // partition, as noopener windows do: the blank page commits there, and
++    // later navigations keep the partition.
++    if (storage_partition_config) {
++      return SiteInstance::CreateForFixedStoragePartition(
++          profile, GURL(), *storage_partition_config);
++    }
+     return nullptr;
++  }
+ 
+   return CreateForURLWithOptionalFixedStoragePartition(
+       profile, url, storage_partition_config);
+--- a/content/browser/browsing_instance.cc
++++ b/content/browser/browsing_instance.cc
+@@ -78,8 +78,20 @@ scoped_refptr<SiteInstanceImpl> Browsing
+   // Some URLs should leave the SiteInstance's site unassigned, though if
+   // `instance` is for a guest, we should always set the site to ensure that it
+   // carries guest information contained within SiteInfo.
++  //
++  // Containers (Neon): the same goes for a BrowsingInstance fixed to another
++  // storage partition than the default one. A SiteInstance without a site
++  // runs in the default partition, so a blank page committed there, and what
++  // the tab loads next, would leave the container.
++  const std::optional<StoragePartitionConfig>& partition_config =
++      url_info.storage_partition_config.has_value()
++          ? url_info.storage_partition_config
++          : storage_partition_config_;
++  const bool keeps_fixed_partition = is_fixed_storage_partition_ &&
++                                     partition_config.has_value() &&
++                                     !partition_config->is_default();
+   if (SiteInstanceImpl::ShouldAssignSiteForUrlInfo(url_info) ||
+-      isolation_context_.is_guest()) {
++      isolation_context_.is_guest() || keeps_fixed_partition) {
+     if (base::FeatureList::IsEnabled(features::kPrecomputeSiteInfo)) {
+       instance->SetSiteInfoAndOriginalUrl(site_info, url_info.url);
+     } else {

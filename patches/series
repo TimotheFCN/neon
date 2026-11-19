@@ -405,3 +405,7 @@ neon/spaces/groups.patch
 neon/spaces/management-ui.patch
 neon/spaces/settings-page.patch
 neon/spaces/move-to-space.patch
+neon/extensions/global-window.patch
+neon/containers/blank-tabs.patch
+neon/spaces/all-containers.patch
+neon/extensions/tab-target.patch

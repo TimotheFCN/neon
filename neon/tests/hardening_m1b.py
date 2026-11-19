@@ -19,7 +19,7 @@ free display and free ports, and stops all of them at the end.
 How state is observed, without test hooks in the browser:
 
 - A tab's partition is read from the cookie its container holds on 127.0.0.1 (who=D for the
-  default space, who=A, who=B), from the page itself or, for requests that are not pages
+  first space D, who=A, who=B), from the page itself or, for requests that are not pages
   (downloads, the favicon of a restored tab), from the Cookie header the test server logs.
 - The visible space is the space of the page whose document.visibilityState is "visible".
 - Keys go to the browser window as real X key events (xdotool), so they take the same path as a
@@ -36,8 +36,9 @@ Phases (see each function for the paths it covers):
    a space's tabs stay together next to groups.
 3. split: a new split tab is in the split tab's container, with spaces on and off; the split's
    tab picker only offers tabs of its space.
-4. extensions: chrome.tabs.create, chrome.windows.create (normal and popup) follow the visible
-   space; an extension's own pages keep sharing storage with its background page.
+4. extensions: chrome.tabs.create and chrome.windows.create (normal) follow the visible space;
+   an extension's popup window and its own pages are global (M5): popup windows in the default
+   partition, and the pages keep sharing storage with the background page.
 5. tabs: reopen closed tab and window (in memory and after a restart), duplicate, view source,
    discard and Helium's Hibernate, move tab to new window, drag a tab out and into another
    window, tab search into a hidden space, a blocked popup opened from its bubble, noopener
@@ -45,7 +46,7 @@ Phases (see each function for the paths it covers):
    manager, a download, document picture-in-picture, DevTools, the task manager, print
    preview, and a pinned tab across a space switch and a restart.
 6. leaks: cookies, localStorage, IndexedDB, Cache Storage, service workers and HTTP auth set in
-   space A are not readable from B or the default space.
+   space A are not readable from B or the first space D.
 
 Uses the uBlock Origin that Helium bundles as the extension (driven from its background page),
 and Helium's custom shortcuts pref for commands without a default shortcut.
@@ -764,8 +765,10 @@ def phase_split(ctx):
 
 
 def phase_extensions(ctx):
-    """Defect 5: tabs and windows that extensions open follow the visible space of the target
-    window; an extension's own pages stay in its (default) partition."""
+    """Defect 5: tabs and normal windows that extensions open follow the visible space of the
+    target window. Since M5 an extension's popup window and its own pages are global: they open
+    in popup windows, in the default partition, outside any space, and the extension's pages
+    keep sharing storage with its background page."""
     print('== extensions', flush=True)
     b = start_spaces(ctx, 'extensions')
     for space, keys in (('A', 'alt+shift+2'), ('B', 'alt+shift+3')):
@@ -774,16 +777,18 @@ def phase_extensions(ctx):
         ext(b, f'chrome.tabs.create({{url: "{url(ctx, n, space)}"}}).then(t => t.id)')
         expect_in(ctx, b, f'chrome.tabs.create while {space} shows', f'n={n}', space)
     key(ctx, 'alt+shift+2')
-    for kind, extra in (('window', ''), ('popup', ', type: "popup"')):
+    for kind, extra, want in (('window', '', 'A'), ('popup', ', type: "popup"', 'none')):
         n = f'ext-{kind}'
         ext(b, f'chrome.windows.create({{url: "{url(ctx, n, "A")}"{extra}}}).then(w => w.id)')
         p = m1.find_page(b, f'n={n}')
         p.wait_loaded(f'n={n}')
-        check(space_of(p) == 'A', f'chrome.windows.create ({kind}) while A shows: A '
+        where = 'A' if want == 'A' else 'the default partition (global)'
+        check(space_of(p) == want, f'chrome.windows.create ({kind}) while A shows: {where} '
               f'({space_of(p)})')
         p.eval('window.close()')
         settle(1)
-    # The extension's own page: shares localStorage with its background page.
+    # The extension's own page: shares localStorage with its background page, in a popup
+    # window of its own.
     bg = ext_bg(b)
     bg.eval('localStorage.setItem("neon-m1b", "bg"); 1')
     for how, js in (('chrome.tabs.create', 'chrome.tabs.create({url: chrome.runtime.getURL('
@@ -796,11 +801,17 @@ def phase_extensions(ctx):
             p = find_new(b, 'dashboard.html', before)
             time.sleep(1)
             got = p.eval('localStorage.getItem("neon-m1b")')
+            kind = bg.eval('chrome.windows.getAll({populate: true}).then(ws => ws.filter(w => '
+                           'w.tabs.some(t => (t.url || "").includes("dashboard.html")))'
+                           '.map(w => w.type))')
         except (TimeoutError, RuntimeError) as e:
-            got = str(e)
+            got, kind, p = str(e), None, None
         check(got == 'bg', f'{how}: the extension page shares storage with its background page '
               f'({got})')
-        key(ctx, 'ctrl+w')
+        check(kind == ['popup'], f'{how}: it opens in a popup window, outside any space ({kind})')
+        if p:
+            p.eval('window.close()')
+            settle(1)
     b.close()
 
 
@@ -1179,7 +1190,7 @@ READ_FROM = {
 
 
 def phase_leaks(ctx):
-    """Nothing stored by a site in space A is readable by the same site in space B or the default
+    """Nothing stored by a site in space A is readable by the same site in space B or the first
     space: cookies, localStorage, IndexedDB, Cache Storage, service workers, HTTP auth."""
     print('== leaks', flush=True)
     b = start_spaces(ctx, 'leaks')

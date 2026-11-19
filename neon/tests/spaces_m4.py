@@ -28,7 +28,7 @@ How state is observed:
   to it first (type_unicode).
 - The space list as the settings page shows it is read from its DOM, and the saved list from the
   Preferences file (the browser writes it about ten seconds after a change).
-- A tab's space is read from its cookies (who=D in the default partition, one per container),
+- A tab's space is read from its cookies (who=D in the first space, one per container),
   as in the M2 check. Storage on disk is read from the container's partition directory.
 - The page a window shows is the page whose document.visibilityState is "visible", mapped to its
   window with Browser.getWindowForTarget. Pinned state comes from chrome.tabs in the bundled
@@ -45,9 +45,10 @@ The one phase, main, in order:
    tab page; typing names it; an icon and a colour are picked. A typed URL in that new tab page
    loads in the new container.
 2. "New space" in the row's context menu does the same; an emoji is typed as its icon.
-3. The default space's menu has a disabled Delete; Edit on another space renames it.
-4. Dragging an icon reorders both rows; the default space cannot be dragged; Ctrl+Alt+Up/Down
-   follow the new order.
+3. Every space's menu has Edit, Delete and New space, the first space's too (M5: there is no
+   default space); Edit on another space renames it.
+4. Dragging an icon reorders both rows, the first space's icon too; Ctrl+Alt+Up/Down follow the
+   new order.
 5. Settings > Appearance > Spaces lists the spaces; renaming, recolouring, moving, picking an
    icon, adding and deleting there update both sidebars, and renames and additions in the
    sidebar show in the page. The two toggles hide the row and turn swiping off.
@@ -56,10 +57,10 @@ The one phase, main, in order:
 8. Delete from the second window's row while the first window shows the space: the confirmation
    counts its tabs in all windows, they close, the first window moves to the space before it,
    and the container's cookies, local storage and IndexedDB are gone from disk at once.
-9. The remaining spaces are deleted down to the default one (stock sidebar); a saved tab group's
-   container entry goes with its space.
+9. The other spaces are deleted down to the first one (the row hides with a single space); a
+   saved tab group's container entry goes with its space.
 10. Restart: the deleted containers' directories and their entries in the containers prefs are
-   gone, and a new space starts without cookies.
+   gone, the last space cannot be deleted in settings, and a new space starts without cookies.
 
 The browser log must hold no CHECK failure or crash.
 
@@ -93,6 +94,7 @@ LOG_DIR = m1.LOG_DIR
 failures = m1.failures
 
 DEFAULT, SPACE_A, SPACE_B = m2.DEFAULT, m2.SPACE_A, m2.SPACE_B
+D = DEFAULT['id']   # the first space, "Default" (a container space since M5)
 COLORS = m2.COLORS
 HEX = m2.HEX
 SCREEN = (2560, 1000)   # two browser windows side by side
@@ -815,7 +817,7 @@ def phase_main(ctx):
     # change.
     first = window_ids_by_x(ctx)[0]
     raise_window(ctx, 0)
-    click(ctx, center(button(b, 'default')[0]), settle_time=1)
+    click(ctx, center(button(b, D)[0]), settle_time=1)
     key(ctx, 'ctrl+n')
     wait_for(lambda: len(browser_windows(ctx)) == 2, 15)
     second = [w for w in window_ids_by_x(ctx) if w != first]
@@ -825,7 +827,7 @@ def phase_main(ctx):
     settle(1.5)
     check(len(browser_windows(ctx)) == 2 and len(rows(b)) == 2,
           f'two windows with a switcher row each ({len(rows(b))} rows)')
-    check(orders(b) == [['default', A]] * 2, f'both rows show D, A {orders(b)}')
+    check(orders(b) == [[D, A]] * 2, f'both rows show D, A {orders(b)}')
     raise_window(ctx, 0)
 
     # --- 1. Create with "+" -----------------------------------------------------------------------
@@ -900,11 +902,11 @@ def phase_main(ctx):
           f'Play is saved with the typed emoji and its colour {p_pref}')
 
     # --- 3. Edit and delete entries of an icon's context menu ----------------------------------------
-    bounds, _ = button(b, 'default')
+    bounds, _ = button(b, D)
     click(ctx, center(bounds), button=3, settle_time=1)
     items = menu_items(b)
-    check(items and [e for _, e in items[-1]] == [True, False, True],
-          f'the default space\'s menu has Edit, a disabled Delete and New space {items}')
+    check(items and [e for _, e in items[-1]] == [True, True, True],
+          f'the first space\'s menu has Edit, an enabled Delete and New space {items}')
     key(ctx, 'Escape')
     bounds, _ = button(b, A)
     click(ctx, center(bounds), button=3, settle_time=1)
@@ -926,16 +928,21 @@ def phase_main(ctx):
     src, _ = button(b, P)
     dst, _ = button(b, A)
     drag(ctx, center(src), center(dst))
-    want = ['default', P, A, W]
+    want = [D, P, A, W]
     check(wait_orders(b, want) == [want] * 2, f'dragging Play onto Alpha reorders both rows '
           f'{orders(b)} (was {order})')
-    src, _ = button(b, 'default')
+    src, _ = button(b, D)
     last, _ = button(b, W)
     drag(ctx, center(src), (last[0] + 40, last[1] + 14))
-    check(wait_orders(b, want, timeout=2) == [want] * 2,
-          f'the default space cannot be dragged {orders(b)}')
+    moved = [P, A, W, D]
+    check(wait_orders(b, moved) == [moved] * 2,
+          f'the first space can be dragged to the end too {orders(b)}')
+    src, _ = button(b, D)
+    first, _ = button(b, P)
+    drag(ctx, center(src), (first[0] - 6, first[1] + 14))
+    check(wait_orders(b, want) == [want] * 2, f'and back to the front {orders(b)}')
     raise_window(ctx, 0)
-    click(ctx, center(button(b, 'default')[0]), settle_time=1)
+    click(ctx, center(button(b, D)[0]), settle_time=1)
     wait_visible(b, lambda h: name_of(h) == 'd1')
     seq = []
     for _ in range(3):
@@ -977,7 +984,7 @@ def phase_main(ctx):
     check_tint(ctx, b, A, RED, 'colour picked in settings')
     # Move Play down.
     click(ctx, settings_point(ctx, b, sp, row_sel(P, '.move-down')))
-    want = ['default', A, P, W]
+    want = [D, A, P, W]
     check(wait_orders(b, want) == [want] * 2, f'moving down in settings reorders the sidebars '
           f'{orders(b)}')
     # The sidebar's changes show in settings at once.
@@ -1004,7 +1011,7 @@ def phase_main(ctx):
     check('1 open tab will close' in (text or ''), f'the settings dialog counts the tabs ({text!r})')
     save_shot(ctx, 'settings-delete-dialog.png', crop=crop_window(1))
     click(ctx, settings_point(ctx, b, sp, '#confirmDelete'), settle_time=1.5)
-    want = ['default', A, P, W]
+    want = [D, A, P, W]
     check(wait_orders(b, want) == [want] * 2, f'deleting in settings removes the space from both '
           f'sidebars {orders(b)}')
     href, _ = visible(b, 0)
@@ -1055,13 +1062,13 @@ def phase_main(ctx):
     pre = [(s['id'], s['name'], s['icon'], unsigned(s['color'])) for s in pref_spaces(profile)]
     stop(ctx, b)
     saved = [(s['id'], s['name'], s['icon'], unsigned(s['color'])) for s in pref_spaces(profile)]
-    check([i for i, *_ in saved] == ['default', A, P, W, N6] and saved[3][1] == 'Desk' and
+    check([i for i, *_ in saved] == [D, A, P, W, N6] and saved[3][1] == 'Desk' and
           saved[2][2] == 'vector:pets' and saved[1][3] == RED,
           f'the space list is saved on exit {saved}')
     b = start(ctx, 'main', None, profile=profile)
     settle(4)
     place_second_window(b)
-    want = ['default', A, P, W, N6]
+    want = [D, A, P, W, N6]
     check(wait_orders(b, want, timeout=15) == [want] * 2,
           f'after a restart both windows show the same order {orders(b)}')
     check(names(b, W) == ['Desk', 'Desk'] and names(b, P) == ['Play', 'Play'],
@@ -1150,7 +1157,7 @@ def phase_main(ctx):
           f'in all windows ({msg})')
     save_shot(ctx, 'delete-confirmation.png', crop=(LEFT, SCREEN[1] - 360, LEFT + 640, SCREEN[1]))
     click(ctx, center(dialog_button(b, 'Delete')), settle_time=2)
-    want = ['default', A, W, N6]
+    want = [D, A, W, N6]
     check(wait_orders(b, want) == [want] * 2, f'Play is gone from both rows {orders(b)}')
     left = [t['url'] for t in b.pages() if any(f'n={n}' in t['url'] for n in ('p1', 'a1', 'a2'))]
     check(not left, f'its tabs closed in every window ({left})')
@@ -1201,14 +1208,14 @@ def phase_main(ctx):
         check(any(tabs_text in m for m in msg), f'{label}: the confirmation says "{tabs_text}" '
               f'({msg})')
         click(ctx, center(dialog_button(b, 'Delete')), settle_time=2)
-    check(not rows(b, timeout=2), 'with only the default space left the row is gone (stock sidebar)')
+    check(not rows(b, timeout=2), 'with only the first space left the row is hidden')
     group = wait_prefs(profile, lambda pr: SPACE_A['container_id'] not in pr.get('neon', {}).get(
         'spaces', {}).get('saved_group_containers', {}).values())
     check(bool(group), 'deleting Alpha dropped its saved group container entry')
     pages_left = [name_of(t['url']) or t['url'] for t in b.pages()
                   if not t['url'].startswith('chrome://settings')]
     check('d1' in pages_left and not any(n in pages_left for n in ('a3', 'w1')),
-          f'only the default space\'s tabs are left ({pages_left})')
+          f'only the first space\'s tabs are left ({pages_left})')
     save_shot(ctx, 'stock-after-deleting-all.png', crop=crop_window(0))
     dirs = {sid: m1.partition_dir(profile, c) for sid, c in (
         (P, p_container), (A, SPACE_A['container_id']), (W, pref_space(profile, W) and
@@ -1235,7 +1242,7 @@ def phase_main(ctx):
     forgotten = wait_prefs(profile, lambda pr: not (remembered(pr) & deleted), timeout=30)
     check(bool(forgotten), f'and neither the containers list nor the used containers remember '
           f'them ({sorted(remembered(read_prefs(profile)) & deleted)})')
-    check(not rows(b, timeout=2), 'the sidebar is still the stock one')
+    check(not rows(b, timeout=2), 'the row is still hidden (one space)')
     # A new space after all that starts empty.
     raise_window(ctx, 1)
     sp = settings_target(b)
@@ -1245,6 +1252,15 @@ def phase_main(ctx):
         sp = wait_for(lambda: settings_target(b), 15)
     sp.wait_loaded('settings')
     settle(1)
+    sp.eval(DEEP_JS)
+    last = sp.eval('''(() => {
+      const page = neonSpacesPage();
+      if (!page) return null;
+      return Array.from(page.shadowRoot.querySelectorAll('.space-row .delete')).map(d =>
+          [d.disabled, d.title]);
+    })()''')
+    check(last and len(last) == 1 and last[0][0] and 'last space' in last[0][1],
+          f'the last space cannot be deleted in settings ({last})')
     click(ctx, settings_point(ctx, b, sp, '#addSpace'), settle_time=1.5)
     check(len(rows(b)) == 2, 'a space added from settings brings the rows back')
     raise_window(ctx, 0)

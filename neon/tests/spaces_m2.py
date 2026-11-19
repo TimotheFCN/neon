@@ -19,7 +19,7 @@ display and free ports, and stops all of them at the end.
 How state is observed, without test hooks in the browser:
 
 - A tab's space is read from its cookies: each space's container holds its own cookie
-  (who=D for the default space, who=A, who=B). A new tab page is navigated first, which is
+  (who=D for the first space, who=A, who=B). A new tab page is navigated first, which is
   exactly the "next navigation loads in the space's container" check.
 - The active tab of a window is the page whose document.visibilityState is "visible".
 - What the sidebar shows is read from screenshots: every test page has a solid favicon in its
@@ -31,7 +31,7 @@ How state is observed, without test hooks in the browser:
 
 Phases:
 
-1. spaces: two spaces (A, B) besides the default one, vertical layout. New tabs from other
+1. spaces: two spaces (A, B) besides the first one (D), vertical layout. New tabs from other
    apps, Ctrl+T, the new tab button, links and Ctrl+N land in the visible space; switching by
    Ctrl+Alt+Up/Down and Alt+Shift+N; tab navigation, MRU cycling, Ctrl+1..9, close other tabs,
    close tabs to the right and the tab picked after a close stay in the space; closing the last
@@ -39,7 +39,8 @@ Phases:
 2. restart: restore twice (the second time without activating restored tabs first), visible
    space and per-space last active tab, a new tab page left in space A, Back and Forward.
 3. last-tab: closing every tab of every space closes the window.
-4. stock: only the default space defined: all tabs show and space shortcuts do nothing.
+4. stock: a single space: all tabs show and space shortcuts do nothing. Tabs opened in
+   containers that no space uses are reopened in that space (M5).
 5. classic: two spaces but the classic layout: all tabs show, shortcuts do nothing.
 
 Needs python3-websocket, python3-pil and xdotool (all in the dev image).
@@ -98,7 +99,11 @@ SPACE_A = {'id': '1a2b3c4d-0000-4000-8000-00000000000a', 'name': 'A', 'icon': 'a
            'color': -65536, 'container_id': ALPHA['id']}
 SPACE_B = {'id': '1a2b3c4d-0000-4000-8000-00000000000b', 'name': 'B', 'icon': 'b',
            'color': -16776961, 'container_id': BETA['id']}
-DEFAULT = {'id': 'default', 'name': 'Default', 'icon': '', 'color': 0, 'container_id': ''}
+GAMMA = m1.GAMMA
+# The first space. Before M5 it was the default space, in the default partition; since every
+# space is a container, it is an ordinary space (container Gamma) that keeps the old name.
+DEFAULT = {'id': '1a2b3c4d-0000-4000-8000-00000000000d', 'name': 'Default', 'icon': '',
+           'color': 0, 'container_id': GAMMA['id']}
 
 COLORS = {'D': (0, 160, 0), 'A': (230, 0, 0), 'B': (0, 0, 230)}
 HEX = {k: '%02x%02x%02x' % v for k, v in COLORS.items()}
@@ -176,7 +181,7 @@ def prefs_for(spaces, layout=2, mru=False):
         'session': {'restore_on_startup': 1},
         'helium': {'browser': {'layout': layout, 'mru_tab_cycling': mru,
                                'custom_accelerators': CUSTOM_ACCELERATORS}},
-        'brave': {'containers': {'list': [ALPHA, BETA]}},
+        'brave': {'containers': {'list': [ALPHA, BETA, GAMMA]}},
         'neon': {'spaces': {'list': spaces}},
     }
 
@@ -691,13 +696,34 @@ def phase_layout_off(ctx, name, spaces, layout):
     profile = new_profile(ctx, name, prefs_for(spaces, layout))
     b = start(ctx, profile, '--container=Alpha', url(ctx, 'a1', 'A'))
     b.ctx_site = ctx.site
-    m1.find_page(b, 'n=a1').wait_loaded('n=a1')
+
+    def wait_page(n):
+        # A tab reopened in a space replaces the tab first opened: look again.
+        for _ in range(3):
+            try:
+                m1.find_page(b, f'n={n}').wait_loaded(f'n={n}', timeout=10)
+                return
+            except (TimeoutError, RuntimeError):
+                time.sleep(1)
+    wait_page('a1')
     b.remote('--container=Beta', url(ctx, 'b1', 'B'))
-    m1.find_page(b, 'n=b1').wait_loaded('n=b1')
+    wait_page('b1')
     b.remote(url(ctx, 'd1', 'D'))
     d1 = m1.find_page(b, 'n=d1')
     d1.wait_loaded('n=d1')
-    check(d1.eval('document.cookie') == '', f'{name}: other-app link opens in the default partition')
+    if len(spaces) == 1:
+        # Alpha and Beta belong to no space: their tabs were reopened in the only space.
+        m1.set_cookie(d1, 'D')
+        for n in ('a1', 'b1'):
+            t = m1.find_page(b, f'n={n}')
+            t.activate()
+            t.wait_loaded(f'n={n}')
+            check(space_of_page(t) == 'D', f'{name}: the tab opened in a container no space uses '
+                  f'is reopened in the space ({n}: {space_of_page(t)})')
+        d1.activate()
+    else:
+        check(d1.eval('document.cookie') == '',
+              f'{name}: other-app link opens in the visible space\'s container')
     ctx.window = window_ids(ctx)[0]
     key(ctx, 'ctrl+t')
     href, p = wait_active(b, lambda h: h and h.startswith('chrome://'))
@@ -705,7 +731,7 @@ def phase_layout_off(ctx, name, spaces, layout):
         p.call('Page.navigate', {'url': url(ctx, 'd2', 'D')})
         p.wait_loaded('n=d2')
         m1.set_cookie(p, 'D')
-        check(space_of_page(p) == 'D', f'{name}: Ctrl+T opens in the default partition')
+        check(space_of_page(p) == 'D', f'{name}: Ctrl+T opens in the space of the active tab')
     key(ctx, 'alt+shift+2')
     key(ctx, 'ctrl+alt+Up')
     href, _ = active(b)
