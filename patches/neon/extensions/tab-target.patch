@@ -1,0 +1,130 @@
+Neon: a tab an extension opens from a tab lands in that tab's space (M5).
+
+chrome.tabs.create with openerTabId opens the tab in the opener's container.
+Other tabs an extension opens land in the space visible in the target window
+(the new tab container provider), and extension pages in the global window
+(extensions/global-window.patch).
+
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1170,6 +1170,7 @@ source_set("core") {
+     "//chrome/browser/metrics:expired_histograms_array",
+     "//chrome/browser/navigation_predictor",
+     "//chrome/browser/neon:containers_api",
++    "//chrome/browser/neon:extension_tab_target",
+     "//chrome/browser/neon:global_context",
+     "//chrome/browser/neon/spaces",
+     "//chrome/browser/ui/neon/global",
+--- a/chrome/browser/extensions/api/tabs/tabs_api.cc
++++ b/chrome/browser/extensions/api/tabs/tabs_api.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/browser/extensions/open_tab_helper.h"
+ #include "chrome/browser/extensions/tab_helper.h"
+ #include "chrome/browser/extensions/window_controller.h"
++#include "chrome/browser/neon/extension_tab_target.h"
+ #include "chrome/browser/picture_in_picture/picture_in_picture_window_manager.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom-forward.h"
+@@ -1126,6 +1127,8 @@ void TabsCreateFunction::OpenTabInBrowse
+   options.index = index_;
+   options.split_with_tab_id = split_with_tab_id_;
+ 
++  // Neon: a tab opened from a tab lands in that tab's space.
++  const auto neon_opener_space = neon::ScopeExtensionTabToOpener(opener_tab);
+   base::expected<content::WebContents*, std::string> result =
+       OpenTabHelper::OpenTab(validated_url_, browser, *this, options);
+   if (!result.has_value()) {
+--- a/chrome/browser/neon/BUILD.gn
++++ b/chrome/browser/neon/BUILD.gn
+@@ -47,3 +47,20 @@ source_set("global_context") {
+     "//url",
+   ]
+ }
++
++# Where a tab that an extension opens lands. See extension_tab_target.h.
++source_set("extension_tab_target") {
++  sources = [
++    "extension_tab_target.cc",
++    "extension_tab_target.h",
++  ]
++
++  public_deps = [ "//chrome/browser/containers" ]
++
++  deps = [
++    "//base",
++    "//components/containers/content/browser",
++    "//components/containers/core/common",
++    "//content/public/browser",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/neon/extension_tab_target.cc
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/neon/extension_tab_target.h"
++
++#include "base/feature_list.h"
++#include "chrome/browser/containers/containers_navigator_utils.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
++#include "components/containers/core/common/features.h"
++#include "content/public/browser/security_principal.h"
++#include "content/public/browser/site_instance.h"
++#include "content/public/browser/storage_partition_config.h"
++#include "content/public/browser/web_contents.h"
++
++namespace neon {
++
++std::unique_ptr<containers::ScopedNewTabStoragePartition>
++ScopeExtensionTabToOpener(content::WebContents* opener) {
++  if (!opener ||
++      !base::FeatureList::IsEnabled(containers::features::kContainers)) {
++    return nullptr;
++  }
++  const content::StoragePartitionConfig& config =
++      opener->GetSiteInstance()->GetSecurityPrincipal()
++          .GetStoragePartitionConfig();
++  if (!containers::IsContainersStoragePartition(config)) {
++    return nullptr;
++  }
++  return std::make_unique<containers::ScopedNewTabStoragePartition>(config);
++}
++
++}  // namespace neon
+--- /dev/null
++++ b/chrome/browser/neon/extension_tab_target.h
+@@ -0,0 +1,32 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_NEON_EXTENSION_TAB_TARGET_H_
++#define CHROME_BROWSER_NEON_EXTENSION_TAB_TARGET_H_
++
++#include <memory>
++
++#include "chrome/browser/containers/containers_navigator_utils.h"
++
++namespace content {
++class WebContents;
++}  // namespace content
++
++// Where a tab that an extension opens for the user lands (chrome.tabs.create):
++// - an extension page goes to the global window
++//   (chrome/browser/neon/global_context.h);
++// - a tab opened with an opener tab goes to the opener's space;
++// - any other tab goes to the space visible in the target window, as a tab
++//   opened without a source page does (the new tab container provider).
++namespace neon {
++
++// For a tab |opener| opens on behalf of an extension: while the returned
++// scope lives, a new tab without a source page opens in |opener|'s
++// container. Null when |opener| is null or in no container.
++std::unique_ptr<containers::ScopedNewTabStoragePartition>
++ScopeExtensionTabToOpener(content::WebContents* opener);
++
++}  // namespace neon
++
++#endif  // CHROME_BROWSER_NEON_EXTENSION_TAB_TARGET_H_
