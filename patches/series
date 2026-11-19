@@ -390,3 +390,4 @@ neon/containers/session-persistence.patch
 neon/containers/browser-service.patch
 neon/containers/tab-partition.patch
 neon/containers/command-line.patch
+neon/containers/spaces-interface.patch

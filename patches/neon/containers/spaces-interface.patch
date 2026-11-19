@@ -1,0 +1,368 @@
+Neon containers port (M1), part 7 of 7: spaces interface.
+
+The one seam Neon spaces use to talk to containers:
+chrome/browser/neon/containers_api.h. It maps onto the Brave port, so that if
+Helium imports Brave containers, only containers_api.cc changes. Neon code,
+GPL-3.0.
+
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1169,6 +1169,7 @@ source_set("core") {
+     "//chrome/browser/metrics",
+     "//chrome/browser/metrics:expired_histograms_array",
+     "//chrome/browser/navigation_predictor",
++    "//chrome/browser/neon:containers_api",
+     "//chrome/browser/net",
+     "//chrome/browser/notifications",
+     "//chrome/browser/notifications:system_notification_helper",
+--- /dev/null
++++ b/chrome/browser/neon/BUILD.gn
+@@ -0,0 +1,30 @@
++# Copyright 2026 The Neon Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++# The interface Neon spaces use to talk to containers. See containers_api.h.
++source_set("containers_api") {
++  sources = [
++    "containers_api.cc",
++    "containers_api.h",
++  ]
++
++  public_deps = [
++    "//components/containers/core/browser",
++    "//skia",
++  ]
++
++  deps = [
++    "//base",
++    "//chrome/browser/containers",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/navigator",
++    "//chrome/browser/ui/tabs:tab_enums",
++    "//components/containers/content/browser",
++    "//components/containers/core/common",
++    "//content/public/browser",
++    "//ui/base",
++    "//url",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/neon/containers_api.cc
+@@ -0,0 +1,206 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/neon/containers_api.h"
++
++#include <utility>
++
++#include "base/check.h"
++#include "base/feature_list.h"
++#include "base/functional/bind.h"
++#include "chrome/browser/containers/containers_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/tabs/tab_enums.h"
++#include "components/containers/content/browser/storage_partition_utils.h"
++#include "components/containers/core/browser/containers_service.h"
++#include "components/containers/core/browser/containers_settings_handler.h"
++#include "components/containers/core/common/features.h"
++#include "components/containers/core/mojom/containers.mojom.h"
++#include "content/public/browser/storage_partition_config.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "url/gurl.h"
++
++namespace neon::containers_api {
++
++namespace {
++
++using containers::mojom::ContainerOperationError;
++
++containers::ContainersService* GetService(Profile* profile) {
++  if (!profile ||
++      !base::FeatureList::IsEnabled(containers::features::kContainers)) {
++    return nullptr;
++  }
++  return ContainersServiceFactory::GetForProfile(profile);
++}
++
++ContainerInfo ToInfo(const containers::mojom::ContainerPtr& container) {
++  return {container->id, container->name, container->background_color,
++          static_cast<int>(container->icon)};
++}
++
++containers::mojom::ContainerPtr MakeContainer(std::string_view id,
++                                              std::string_view name,
++                                              SkColor color,
++                                              int icon) {
++  return containers::mojom::Container::New(
++      std::string(id), std::string(name),
++      static_cast<containers::mojom::Icon>(icon), color);
++}
++
++// ContainersSettingsHandler is a mojo interface, but its implementation answers
++// synchronously. This collects the answer.
++struct Result {
++  bool called = false;
++  std::optional<ContainerOperationError> error;
++};
++
++base::OnceCallback<void(std::optional<ContainerOperationError>)> Collect(
++    Result* result) {
++  return base::BindOnce(
++      [](Result* result, std::optional<ContainerOperationError> error) {
++        result->called = true;
++        result->error = error;
++      },
++      base::Unretained(result));
++}
++
++}  // namespace
++
++void Observer::OnContainersListChanged() {
++  OnContainersChanged();
++}
++
++bool IsAvailable(Profile* profile) {
++  return GetService(profile) != nullptr;
++}
++
++std::vector<ContainerInfo> ListContainers(Profile* profile) {
++  std::vector<ContainerInfo> result;
++  if (auto* service = GetService(profile)) {
++    for (const auto& container : service->GetContainers()) {
++      result.push_back(ToInfo(container));
++    }
++  }
++  return result;
++}
++
++std::optional<ContainerInfo> GetContainer(Profile* profile,
++                                          std::string_view id) {
++  auto* service = GetService(profile);
++  if (!service) {
++    return std::nullopt;
++  }
++  if (auto container = service->GetRuntimeContainerById(id)) {
++    return ToInfo(container);
++  }
++  return std::nullopt;
++}
++
++std::optional<std::string> CreateContainer(Profile* profile,
++                                           std::string_view name,
++                                           SkColor color,
++                                           int icon) {
++  auto* service = GetService(profile);
++  if (!service) {
++    return std::nullopt;
++  }
++  containers::ContainersSettingsHandler handler(profile->GetPrefs());
++  Result result;
++  handler.AddContainer(MakeContainer("", name, color, icon), Collect(&result));
++  CHECK(result.called);
++  if (result.error) {
++    return std::nullopt;
++  }
++  // AddContainer appends the new container, with a fresh id, to the list.
++  auto containers = service->GetContainers();
++  CHECK(!containers.empty());
++  return containers.back()->id;
++}
++
++bool UpdateContainer(Profile* profile,
++                     std::string_view id,
++                     std::string_view name,
++                     SkColor color,
++                     int icon) {
++  if (!GetService(profile) || id.empty()) {
++    return false;
++  }
++  containers::ContainersSettingsHandler handler(profile->GetPrefs());
++  Result result;
++  handler.UpdateContainer(MakeContainer(id, name, color, icon),
++                          Collect(&result));
++  CHECK(result.called);
++  return !result.error;
++}
++
++bool DeleteContainer(Profile* profile, std::string_view id) {
++  if (!GetService(profile) || id.empty()) {
++    return false;
++  }
++  containers::ContainersSettingsHandler handler(profile->GetPrefs());
++  Result result;
++  handler.RemoveContainer(std::string(id), Collect(&result));
++  CHECK(result.called);
++  return !result.error;
++}
++
++content::WebContents* OpenTabInContainer(BrowserWindowInterface* browser,
++                                         const GURL& url,
++                                         std::string_view id,
++                                         int index,
++                                         bool foreground,
++                                         bool pinned) {
++  if (!browser) {
++    return nullptr;
++  }
++  Profile* profile = browser->GetProfile();
++  if (!GetService(profile) ||
++      !containers::IsValidStoragePartitionKeyComponent(id)) {
++    return nullptr;
++  }
++
++  NavigateParams params(browser, url, ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
++  params.storage_partition_config = content::StoragePartitionConfig::Create(
++      profile, containers::kContainersStoragePartitionDomain, std::string(id),
++      profile->IsOffTheRecord());
++  params.disposition = foreground ? WindowOpenDisposition::kNewForegroundTab
++                                  : WindowOpenDisposition::kNewBackgroundTab;
++  params.tabstrip_index = index;
++  int add_types = foreground ? AddTabTypes::ADD_ACTIVE : AddTabTypes::ADD_NONE;
++  if (index >= 0) {
++    add_types |= AddTabTypes::ADD_FORCE_INDEX;
++  }
++  if (pinned) {
++    add_types |= AddTabTypes::ADD_PINNED;
++  }
++  params.tabstrip_add_types = add_types;
++  Navigate(&params);
++  return params.navigated_or_inserted_contents;
++}
++
++std::string GetTabContainerId(content::WebContents* web_contents) {
++  if (!base::FeatureList::IsEnabled(containers::features::kContainers)) {
++    return std::string();
++  }
++  return containers::GetContainerIdForWebContents(web_contents);
++}
++
++void AddObserver(Profile* profile, Observer* observer) {
++  if (auto* service = GetService(profile)) {
++    service->AddObserver(observer);
++  }
++}
++
++void RemoveObserver(Profile* profile, Observer* observer) {
++  if (auto* service = GetService(profile)) {
++    service->RemoveObserver(observer);
++  }
++}
++
++}  // namespace neon::containers_api
+--- /dev/null
++++ b/chrome/browser/neon/containers_api.h
+@@ -0,0 +1,106 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_NEON_CONTAINERS_API_H_
++#define CHROME_BROWSER_NEON_CONTAINERS_API_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "components/containers/core/browser/containers_service_observer.h"
++#include "third_party/skia/include/core/SkColor.h"
++
++class BrowserWindowInterface;
++class GURL;
++class Profile;
++
++namespace content {
++class WebContents;
++}  // namespace content
++
++// The one interface Neon spaces use to talk to containers. Everything behind it
++// maps onto the Brave containers port (components/containers and
++// chrome/browser/containers), so that if Helium imports Brave's containers
++// itself, only containers_api.cc has to change.
++//
++// A container is a persistent storage partition inside the profile: its own
++// cookies, cache and site storage. The default partition (no container) is
++// not a container and has the empty id.
++namespace neon::containers_api {
++
++struct ContainerInfo {
++  // Lowercase UUID. Also the storage partition name.
++  std::string id;
++  std::string name;
++  // Opaque color, and a value of Brave's containers::mojom::Icon. Kept so that
++  // prefs stay compatible; spaces may ignore the icon.
++  SkColor color = SK_ColorBLACK;
++  int icon = 0;
++};
++
++// Notified when the containers list changes, including changes made by
++// another window.
++class Observer : public containers::ContainersServiceObserver {
++ public:
++  virtual void OnContainersChanged() = 0;
++
++ private:
++  // containers::ContainersServiceObserver:
++  void OnContainersListChanged() final;
++};
++
++// Whether containers are available for |profile|. False for off-the-record and
++// system profiles, and when the Containers feature is disabled.
++bool IsAvailable(Profile* profile);
++
++// The user's containers, in their stored order.
++std::vector<ContainerInfo> ListContainers(Profile* profile);
++
++// The container with |id|. Also finds containers that were removed from the
++// list but are still used by a tab or a saved session.
++std::optional<ContainerInfo> GetContainer(Profile* profile,
++                                          std::string_view id);
++
++// Adds a container at the end of the list and returns its new id, or
++// std::nullopt if |name| is blank or |color| is not opaque.
++std::optional<std::string> CreateContainer(Profile* profile,
++                                           std::string_view name,
++                                           SkColor color,
++                                           int icon = 0);
++
++// Renames or recolors a container. Returns false if it does not exist or the
++// values are invalid.
++bool UpdateContainer(Profile* profile,
++                     std::string_view id,
++                     std::string_view name,
++                     SkColor color,
++                     int icon = 0);
++
++// Removes a container from the list. Its storage is deleted at a later start,
++// once no open tab, saved session or closed-tab entry uses it, so close the
++// container's tabs first. Returns false if it does not exist.
++bool DeleteContainer(Profile* profile, std::string_view id);
++
++// Opens |url| in a new tab of |browser| inside container |id| at |index| (-1
++// for the end). Returns the new tab's contents, or nullptr if |id| is not a
++// valid container id or containers are unavailable.
++content::WebContents* OpenTabInContainer(BrowserWindowInterface* browser,
++                                         const GURL& url,
++                                         std::string_view id,
++                                         int index = -1,
++                                         bool foreground = true,
++                                         bool pinned = false);
++
++// The container of |web_contents|, or the empty string for the default
++// partition. Works for discarded tabs too.
++std::string GetTabContainerId(content::WebContents* web_contents);
++
++void AddObserver(Profile* profile, Observer* observer);
++void RemoveObserver(Profile* profile, Observer* observer);
++
++}  // namespace neon::containers_api
++
++#endif  // CHROME_BROWSER_NEON_CONTAINERS_API_H_
