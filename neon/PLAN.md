@@ -52,8 +52,8 @@ across spaces on purpose.
 | R2 | Spaces design: data model, sidebar pager, persistence | done | |
 | M1 | Containers core: a tab can live in a named persistent container | done | M0, R1 |
 | M1b | Containers hardening: fix the review findings on the port | todo | M2 |
-| M2 | Spaces model: tabs grouped by space, one visible space, switch by command | doing | M1, R2 |
-| M3 | Sidebar pager: space switcher row, slide animation, scroll gesture | todo | M2 |
+| M2 | Spaces model: tabs grouped by space, one visible space, switch by command | done | M1, R2 |
+| M3 | Sidebar pager: space switcher row, slide animation, scroll gesture | doing | M2 |
 | M4 | Space management: create, rename, icon, colour, delete, reorder, settings page | todo | M2 |
 | M5 | Per-space pinned tabs, and site rules that route a URL to a space | todo | M3 |
 | M6 | macOS: build from `neon-macos`, finger-tracked swipe, per-space glass tint | blocked | Mac access |
@@ -133,7 +133,33 @@ three were handed to the M2 agent because they sit in the new-tab code it is cha
 | 7 | Helium's deferred pinned startup tabs ignore the container | M5, with per-space pins |
 | 8 | The M1 check never tests lazy restore, reopen closed tab or window, Back and Forward after restart, discard and reload | M2 for the first three, M1b for the rest |
 
-### M2 to M5
+Findings 1 to 3 are fixed (commit `09af908b`). The suggested fix for blank tabs was unsafe: a
+blank page committed in a SiteInstance with a fixed partition and no site crashes on its next
+navigation. A restored blank tab now anchors its container on a site from its own history, and a
+brand-new `about:blank` tab opens in the default space. Any restore fix for findings 4 to 6 must
+respect the same limit.
+
+### M2: Spaces model (done)
+
+Five patches under `patches/neon/spaces/` (service, window-controller, model-filter,
+strip-filter, commands), about 1,600 new lines and about 100 hook lines.
+`neon/tests/spaces_m2.py` proves the ten behaviours with real key events. New tabs get their
+space through a provider the spaces layer registers with the containers seam, which needed no
+new Chromium hook.
+
+Left open by M2, to be picked up where noted:
+
+- Pinned tabs are hidden per space by the same layout hook but no test pins a tab (M5).
+- Shift-click range selection and Ctrl+Shift+PgDn are not filtered by space (M3).
+- A change to the space list at runtime does not relay out the sidebar until the active tab
+  changes (M4).
+- Keeping a space's tabs together is skipped in a section that contains a group or split, and
+  groups that mix containers are not ungrouped (M1b, with the saved groups fix).
+- macOS shortcuts are not wired, and Ctrl+Alt+Up/Down may clash with GNOME (M6).
+- Tabs in a container that no space uses count as the default space.
+- Not tested: dragging tabs between windows, tab search, tabs opened by extensions, bookmarks.
+
+### M3 to M5
 
 The patch list for each is in `neon/docs/spaces-design.md`. Each milestone ends with the feature
 working in the Linux build, its patches in `patches/neon/`, and a test or scripted check that
