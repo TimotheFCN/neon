@@ -12,6 +12,9 @@ space's tabs together within the pinned and unpinned tabs. space_tab_filter.h
 is the small hooks target the Chromium hooks in the next patches call.
 Neon code, GPL-3.0.
 
+M1b: the spaces commands start at 39500. They used Chromium's focus command
+ids, so Ctrl+L, Alt+D and F6 switched space instead of focusing the omnibox.
+
 --- a/chrome/browser/BUILD.gn
 +++ b/chrome/browser/BUILD.gn
 @@ -1171,6 +1171,7 @@ source_set("core") {
@@ -216,11 +219,11 @@ Neon code, GPL-3.0.
 +namespace neon::spaces {
 +
 +// Browser commands, outside chrome_command_ids.h so that adding them rebuilds
-+// little. Values are clear of Chromium's and Helium's ids.
-+inline constexpr int kNextSpaceCommand = 39000;
-+inline constexpr int kPreviousSpaceCommand = 39001;
++// little, and above Chromium's focus commands (39000 to 39009).
++inline constexpr int kNextSpaceCommand = 39500;
++inline constexpr int kPreviousSpaceCommand = 39501;
 +// "Go to space N" for N = 1..9: kSelectSpaceCommand + N - 1.
-+inline constexpr int kSelectSpaceCommand = 39010;
++inline constexpr int kSelectSpaceCommand = 39510;
 +inline constexpr int kSelectLastSpaceCommand = kSelectSpaceCommand + 8;
 +
 +// Every spaces command id, for enabling them in a browser.
