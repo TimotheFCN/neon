@@ -1,0 +1,620 @@
+Neon spaces (M6): the site data pages show one space at a time.
+
+"All sites" and the page of a site get a Space menu: each space, and "Outside
+spaces (extensions)" for the global context. It starts on the space the
+settings tab is in, is kept per settings tab, and picks the storage partition
+SiteSettingsHandler builds its BrowsingDataModel from, so the list, the usage
+and every delete act on that space only. Permissions are shared by all spaces:
+the site page says so next to them, and deleting a site from All sites, which
+also resets its permissions, says that this applies to every space.
+--- a/chrome/browser/resources/settings/BUILD.gn
++++ b/chrome/browser/resources/settings/BUILD.gn
+@@ -283,6 +283,8 @@ build_webui("build") {
+     "clear_browsing_data_dialog/neon_data_scope_browser_proxy.ts",
+     "clear_browsing_data_dialog/neon_space_scope.html.ts",
+     "clear_browsing_data_dialog/neon_space_scope.ts",
++    "site_settings/neon_site_data_space.html.ts",
++    "site_settings/neon_site_data_space.ts",
+     "clear_browsing_data_dialog/other_google_data_dialog.html.ts",
+     "clear_browsing_data_dialog/other_google_data_dialog.ts",
+     "controls/controlled_button.html.ts",
+@@ -638,6 +640,7 @@ build_webui("build") {
+     "clear_browsing_data_dialog/clear_browsing_data_dialog.css",
+     "clear_browsing_data_dialog/clear_browsing_data_time_picker.css",
+     "clear_browsing_data_dialog/neon_space_scope.css",
++    "site_settings/neon_site_data_space.css",
+     "clear_browsing_data_dialog/other_google_data_dialog.css",
+     "controls/collapse_radio_button.css",
+     "controls/controlled_button.css",
+--- a/chrome/browser/resources/settings/site_settings/all_sites.html
++++ b/chrome/browser/resources/settings/site_settings/all_sites.html
+@@ -68,6 +68,9 @@
+           $i18n{siteSettingsAllSitesSortMethodName}
+         </option>
+       </select>
++      <settings-neon-site-data-space id="neonSpace"
++          on-neon-site-data-space-change="onNeonSpaceChange_">
++      </settings-neon-site-data-space>
+     </div>
+     <div id="clearAllContainer">
+       <div id="clearLabel">
+@@ -149,7 +152,7 @@
+             <div id="permissionsBulletPoint" class="detail"
+                 hidden$="[[!showPermissionsBulletPoint_(actionMenuModel_)]]">
+               <cr-icon icon="privacy:page-info"></cr-icon>
+-              $i18n{siteSettingsRemoveSitePermissions}
++              $i18n{siteSettingsRemoveSitePermissions}[[neonPermissionsNote_(actionMenuModel_)]]
+             </div>
+           </div>
+           <div slot="button-container">
+--- a/chrome/browser/resources/settings/site_settings/all_sites.ts
++++ b/chrome/browser/resources/settings/site_settings/all_sites.ts
+@@ -21,6 +21,7 @@ import './all_sites_icons.html.js';
+ import './clear_storage_dialog_shared.css.js';
+ import './cr_lazy_render.js';
+ import './site_entry.js';
++import './neon_site_data_space.js';
+ 
+ import {WebUiListenerMixin} from '/shared/settings/web_ui_listener_mixin.js';
+ import type {CrActionMenuElement} from 'chrome://resources/cr_elements/cr_action_menu/cr_action_menu.js';
+@@ -40,6 +41,7 @@ import {Router} from '../router.js';
+ import {SettingsViewMixin} from '../settings_page/settings_view_mixin.js';
+ 
+ import {getTemplate} from './all_sites.html.js';
++import {isNeonSiteDataScoped} from './neon_site_data_space.js';
+ import {AllSitesAction2, AllSitesDialog, ContentSetting, SortMethod} from './constants.js';
+ import type {CrLazyRenderElement} from './cr_lazy_render.js';
+ import type {OriginInfo, SiteGroup} from './site_settings_browser_proxy.js';
+@@ -265,6 +267,24 @@ export class AllSitesElement extends All
+   }
+ 
+   /**
++   * Neon: the page now shows another space's data. Permission-only entries
++   * come back with the new list.
++   */
++  private onNeonSpaceChange_() {
++    this.siteGroupMap = new Map();
++    this.forceListUpdate_();
++    this.populateList_();
++  }
++
++  /**
++   * Neon: the permissions the remove dialog resets belong to every space.
++   */
++  private neonPermissionsNote_(): string {
++    return isNeonSiteDataScoped() ?
++        ' in every space, since all spaces share them' : '';
++  }
++
++  /**
+    * Integrate sites using storage into the existing sites map, as there
+    * may be overlap between the existing sites.
+    * @param list The list of sites using storage.
+--- /dev/null
++++ b/chrome/browser/resources/settings/site_settings/neon_site_data_space.css
+@@ -0,0 +1,31 @@
++/* Copyright 2026 The Neon Authors
++ * You can use, redistribute, and/or modify this source code under
++ * the terms of the GPL-3.0 license that can be found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #import=chrome://resources/cr_elements/md_select_lit.css.js
++ * #include=md-select-lit
++ * #css_wrapper_metadata_end */
++
++:host {
++  align-items: center;
++  display: inline-flex;
++}
++
++:host(:not([mode=note])) {
++  margin-inline-start: 24px;
++}
++
++:host([mode=note]) {
++  margin-inline-start: 12px;
++}
++
++.note {
++  color: var(--cr-secondary-text-color);
++  font-weight: normal;
++}
++
++#space {
++  margin-inline-start: 1em;
++}
+--- /dev/null
++++ b/chrome/browser/resources/settings/site_settings/neon_site_data_space.html.ts
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++import {html} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import type {SettingsNeonSiteDataSpaceElement} from './neon_site_data_space.js';
++
++export function getHtml(this: SettingsNeonSiteDataSpaceElement) {
++  // clang-format off
++  return html`<!--_html_template_start_-->
++${this.scope_?.available && this.mode === 'note' ? html`
++  <span class="note">Shared by all spaces</span>
++` : ''}
++${this.scope_?.available && this.mode !== 'note' ? html`
++  <label id="label" for="space">Space</label>
++  <select id="space" class="md-select" @change="${this.onChange_}">
++    ${(this.scope_.choices || []).map(choice => html`
++      <option value="${choice.id}"
++          ?selected="${choice.id === this.scope_!.selected}">
++        ${choice.name}
++      </option>
++    `)}
++  </select>
++` : ''}
++<!--_html_template_end_-->`;
++  // clang-format on
++}
+--- /dev/null
++++ b/chrome/browser/resources/settings/site_settings/neon_site_data_space.ts
+@@ -0,0 +1,96 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++/**
++ * @fileoverview 'settings-neon-site-data-space' picks which space's data the
++ * site data pages show ("All sites" and the page of one site). Each space
++ * keeps its cookies and site storage apart; permissions are shared by all
++ * spaces. The choice is kept per settings tab by
++ * chrome/browser/ui/neon/spaces/site_data_scope.cc, and every instance of
++ * this element shows it. Fires 'neon-site-data-space-change' after a change,
++ * once the browser uses the new space. Shows nothing without spaces.
++ * With mode="note" it only says that permissions are shared by all spaces.
++ */
++
++import {sendWithPromise} from 'chrome://resources/js/cr.js';
++import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++
++import {getCss} from './neon_site_data_space.css.js';
++import {getHtml} from './neon_site_data_space.html.js';
++
++export interface NeonSiteDataScope {
++  available: boolean;
++  // Container ids; the empty id is the global context.
++  choices?: Array<{id: string, name: string}>;
++  selected?: string;
++}
++
++// Shared by every instance in the page.
++let scope: NeonSiteDataScope|null = null;
++const instances = new Set<SettingsNeonSiteDataSpaceElement>();
++
++// Whether the site data pages show one space's data.
++export function isNeonSiteDataScoped(): boolean {
++  return !!scope?.available;
++}
++
++function update(next: NeonSiteDataScope) {
++  scope = next;
++  instances.forEach(element => element.scope_ = next);
++}
++
++export class SettingsNeonSiteDataSpaceElement extends CrLitElement {
++  static get is() {
++    return 'settings-neon-site-data-space';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      scope_: {type: Object},
++      mode: {type: String},
++    };
++  }
++
++  accessor scope_: NeonSiteDataScope|null = scope;
++  accessor mode: 'select'|'note' = 'select';
++
++  override connectedCallback() {
++    super.connectedCallback();
++    instances.add(this);
++    sendWithPromise<NeonSiteDataScope>('neonSiteDataGetScope').then(update);
++  }
++
++  override disconnectedCallback() {
++    super.disconnectedCallback();
++    instances.delete(this);
++  }
++
++  protected async onChange_(e: Event) {
++    const id = (e.target as HTMLSelectElement).value;
++    update(await sendWithPromise<NeonSiteDataScope>(
++        'neonSiteDataSetScope', id));
++    this.fire('neon-site-data-space-change', {id});
++  }
++}
++
++declare global {
++  interface HTMLElementEventMap {
++    'neon-site-data-space-change': CustomEvent<{id: string}>;
++  }
++
++  interface HTMLElementTagNameMap {
++    'settings-neon-site-data-space': SettingsNeonSiteDataSpaceElement;
++  }
++}
++
++customElements.define(
++    SettingsNeonSiteDataSpaceElement.is, SettingsNeonSiteDataSpaceElement);
+--- a/chrome/browser/resources/settings/site_settings/site_details.html
++++ b/chrome/browser/resources/settings/site_settings/site_details.html
+@@ -16,6 +16,8 @@
+       }
+ 
+       #usageHeader {
++        align-items: center;
++        display: flex;
+         padding: 0 var(--cr-section-padding);
+       }
+ 
+@@ -90,6 +92,9 @@
+     <div id="usage">
+       <div id="usageHeader">
+         <h2 class="first">$i18n{siteSettingsUsage}</h2>
++        <settings-neon-site-data-space
++            on-neon-site-data-space-change="onNeonSpaceChange_">
++        </settings-neon-site-data-space>
+       </div>
+       <div class="list-frame">
+         <div class="list-item" id="noStorage"
+@@ -137,7 +142,10 @@
+     </div>
+ 
+     <div class="cr-row first">
+-      <h2 class="flex">$i18n{siteSettingsPermissions}</h2>
++      <h2 class="flex">$i18n{siteSettingsPermissions}
++        <settings-neon-site-data-space mode="note">
++        </settings-neon-site-data-space>
++      </h2>
+       <cr-button id="resetSettingsButton" class="header-aligned-button"
+           role="button" aria-disabled="false"
+           on-click="onConfirmClearSettings_">
+--- a/chrome/browser/resources/settings/site_settings/site_details.ts
++++ b/chrome/browser/resources/settings/site_settings/site_details.ts
+@@ -26,6 +26,7 @@ import './action_link.css.js';
+ import './all_sites_icons.html.js';
+ import './clear_storage_dialog_shared.css.js';
+ import './site_details_permission.js';
++import './neon_site_data_space.js';
+ 
+ import {PrefServiceObserverMixin} from '/shared/settings/prefs2/pref_service_observer_mixin.js';
+ import {WebUiListenerMixin} from '/shared/settings/web_ui_listener_mixin.js';
+@@ -412,6 +413,15 @@ export class SiteDetailsElement extends
+   }
+ 
+   /**
++   * Neon: the usage section now shows another space's data.
++   */
++  private onNeonSpaceChange_() {
++    this.storedData_ = '';
++    this.numCookies_ = '';
++    this.websiteUsageProxy_.fetchUsageTotal(this.origin_);
++  }
++
++  /**
+    * Confirms the clearing of storage for an origin.
+    */
+   private onConfirmClearStorage_(e: Event) {
+--- a/chrome/browser/ui/neon/spaces/BUILD.gn
++++ b/chrome/browser/ui/neon/spaces/BUILD.gn
+@@ -127,3 +127,22 @@ source_set("data") {
+     "//url",
+   ]
+ }
++
++# Which space's data the site data pages of chrome://settings show.
++source_set("site_data") {
++  sources = [
++    "site_data_scope.cc",
++    "site_data_scope.h",
++  ]
++
++  public_deps = [
++    "//base",
++    "//content/public/browser",
++  ]
++
++  deps = [
++    "//chrome/browser/neon:containers_api",
++    "//chrome/browser/neon/spaces",
++    "//chrome/browser/profiles:profile",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/site_data_scope.cc
+@@ -0,0 +1,156 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/neon/spaces/site_data_scope.h"
++
++#include <optional>
++#include <string>
++
++#include "base/functional/bind.h"
++#include "chrome/browser/neon/containers_api.h"
++#include "chrome/browser/neon/spaces/space.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "chrome/browser/neon/spaces/spaces_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "content/public/browser/storage_partition.h"
++#include "content/public/browser/storage_partition_config.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_user_data.h"
++#include "content/public/browser/web_ui.h"
++
++namespace neon::spaces {
++
++namespace {
++
++// The container a settings tab's site data pages show, once the user picked
++// one. Empty for the global context.
++class SiteDataScopeData
++    : public content::WebContentsUserData<SiteDataScopeData> {
++ public:
++  ~SiteDataScopeData() override = default;
++
++  std::string container_id;
++
++ private:
++  friend class content::WebContentsUserData<SiteDataScopeData>;
++  explicit SiteDataScopeData(content::WebContents* contents)
++      : content::WebContentsUserData<SiteDataScopeData>(*contents) {}
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(SiteDataScopeData);
++
++Profile* GetProfile(content::WebUI* web_ui) {
++  return Profile::FromBrowserContext(
++      web_ui->GetWebContents()->GetBrowserContext());
++}
++
++SpacesService* GetService(Profile* profile) {
++  return containers_api::IsAvailable(profile)
++             ? SpacesServiceFactory::GetForProfile(profile)
++             : nullptr;
++}
++
++// Whether |container_id| is still a choice: a space's container, or the
++// global context.
++bool IsChoice(SpacesService* service, const std::string& container_id) {
++  return container_id.empty() || service->GetSpaceForContainer(container_id);
++}
++
++// The chosen container, or std::nullopt without spaces.
++std::optional<std::string> GetChosenContainer(content::WebUI* web_ui) {
++  SpacesService* service = GetService(GetProfile(web_ui));
++  if (!service || service->spaces().empty()) {
++    return std::nullopt;
++  }
++  content::WebContents* contents = web_ui->GetWebContents();
++  if (SiteDataScopeData* data = SiteDataScopeData::FromWebContents(contents);
++      data && IsChoice(service, data->container_id)) {
++    return data->container_id;
++  }
++  // The space the settings tab is in, else the first space.
++  const std::string tab_container =
++      containers_api::GetTabContainerId(contents);
++  if (!tab_container.empty() && service->GetSpaceForContainer(tab_container)) {
++    return tab_container;
++  }
++  return service->spaces().front().container_id;
++}
++
++}  // namespace
++
++content::StoragePartition* GetSiteDataStoragePartition(
++    content::WebUI* web_ui) {
++  std::optional<std::string> container_id = GetChosenContainer(web_ui);
++  if (!container_id) {
++    return nullptr;
++  }
++  Profile* profile = GetProfile(web_ui);
++  std::optional<content::StoragePartitionConfig> config =
++      containers_api::GetStoragePartitionConfig(profile, *container_id);
++  return config ? profile->GetStoragePartition(*config) : nullptr;
++}
++
++bool IsSiteDataScoped(content::WebUI* web_ui) {
++  return GetChosenContainer(web_ui).has_value();
++}
++
++SiteDataScopeHandler::SiteDataScopeHandler(Profile* profile)
++    : profile_(profile) {}
++
++SiteDataScopeHandler::~SiteDataScopeHandler() = default;
++
++void SiteDataScopeHandler::RegisterMessages() {
++  web_ui()->RegisterMessageCallback(
++      "neonSiteDataGetScope",
++      base::BindRepeating(&SiteDataScopeHandler::HandleGetScope,
++                          base::Unretained(this)));
++  web_ui()->RegisterMessageCallback(
++      "neonSiteDataSetScope",
++      base::BindRepeating(&SiteDataScopeHandler::HandleSetScope,
++                          base::Unretained(this)));
++}
++
++base::DictValue SiteDataScopeHandler::GetScope() {
++  base::DictValue scope;
++  std::optional<std::string> chosen = GetChosenContainer(web_ui());
++  SpacesService* service = GetService(profile_);
++  if (!chosen || !service) {
++    scope.Set("available", false);
++    return scope;
++  }
++  base::ListValue choices;
++  for (const Space& space : service->spaces()) {
++    choices.Append(base::DictValue()
++                       .Set("id", space.container_id)
++                       .Set("name", space.name));
++  }
++  choices.Append(base::DictValue()
++                     .Set("id", std::string())
++                     .Set("name", "Outside spaces (extensions)"));
++  scope.Set("available", true);
++  scope.Set("choices", std::move(choices));
++  scope.Set("selected", *chosen);
++  return scope;
++}
++
++void SiteDataScopeHandler::HandleGetScope(const base::ListValue& args) {
++  AllowJavascript();
++  ResolveJavascriptCallback(args[0], GetScope());
++}
++
++void SiteDataScopeHandler::HandleSetScope(const base::ListValue& args) {
++  // [callback id, container id]
++  AllowJavascript();
++  SpacesService* service = GetService(profile_);
++  if (service && args.size() == 2 && args[1].is_string() &&
++      IsChoice(service, args[1].GetString())) {
++    SiteDataScopeData::CreateForWebContents(web_ui()->GetWebContents());
++    SiteDataScopeData::FromWebContents(web_ui()->GetWebContents())
++        ->container_id = args[1].GetString();
++  }
++  ResolveJavascriptCallback(args[0], GetScope());
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/site_data_scope.h
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NEON_SPACES_SITE_DATA_SCOPE_H_
++#define CHROME_BROWSER_UI_NEON_SPACES_SITE_DATA_SCOPE_H_
++
++#include "base/memory/raw_ptr.h"
++#include "base/values.h"
++#include "content/public/browser/web_ui_message_handler.h"
++
++class Profile;
++
++namespace content {
++class StoragePartition;
++class WebUI;
++}  // namespace content
++
++// Which space's data the site data pages of chrome://settings show ("All
++// sites" and the page of one site). Each space keeps its cookies and site
++// storage in its own container, while permissions belong to the profile and
++// are shared by every space. The pages show one space at a time, chosen per
++// settings tab; deleting a site's data there deletes it in that space only.
++namespace neon::spaces {
++
++// The partition the site data pages of |web_ui| read and delete from: the
++// chosen space's container, the default partition (the global context of
++// extensions and browser pages) if that was chosen, or by default the
++// container of the space the settings tab is in. nullptr without spaces,
++// where the pages keep reading the default partition.
++content::StoragePartition* GetSiteDataStoragePartition(content::WebUI* web_ui);
++
++// Whether the site data pages of |web_ui| show one space's data.
++bool IsSiteDataScoped(content::WebUI* web_ui);
++
++// neonSiteDataGetScope: the choices ({id: container id, empty for the global
++// context; name}) and the current one. neonSiteDataSetScope: picks one; the
++// pages then fetch their lists again.
++class SiteDataScopeHandler : public content::WebUIMessageHandler {
++ public:
++  explicit SiteDataScopeHandler(Profile* profile);
++  SiteDataScopeHandler(const SiteDataScopeHandler&) = delete;
++  SiteDataScopeHandler& operator=(const SiteDataScopeHandler&) = delete;
++  ~SiteDataScopeHandler() override;
++
++  // content::WebUIMessageHandler:
++  void RegisterMessages() override;
++
++ private:
++  base::DictValue GetScope();
++  void HandleGetScope(const base::ListValue& args);
++  void HandleSetScope(const base::ListValue& args);
++
++  raw_ptr<Profile> profile_;
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_NEON_SPACES_SITE_DATA_SCOPE_H_
+--- a/chrome/browser/ui/webui/settings/BUILD.gn
++++ b/chrome/browser/ui/webui/settings/BUILD.gn
+@@ -214,6 +214,7 @@ source_set("impl") {
+     "//chrome/app:command_ids",
+     "//chrome/browser/ui/neon/spaces:data",
+     "//chrome/browser/ui/neon/spaces:settings",
++    "//chrome/browser/ui/neon/spaces:site_data",
+     "//chrome/app:generated_resources",
+     "//chrome/app/vector_icons",
+     "//chrome/browser:browser_features",
+--- a/chrome/browser/ui/webui/settings/settings_ui.cc
++++ b/chrome/browser/ui/webui/settings/settings_ui.cc
+@@ -65,6 +65,7 @@
+ #include "chrome/browser/ui/webui/sanitized_image/sanitized_image_source.h"
+ #include "chrome/browser/ui/webui/settings/about_handler.h"
+ #include "chrome/browser/ui/webui/settings/accessibility_main_handler.h"
++#include "chrome/browser/ui/neon/spaces/site_data_scope.h"
+ #include "chrome/browser/ui/neon/spaces/space_data_handler.h"
+ #include "chrome/browser/ui/neon/spaces/spaces_settings_handler.h"
+ #include "chrome/browser/ui/webui/settings/appearance_handler.h"
+@@ -282,6 +283,8 @@ SettingsUI::SettingsUI(content::WebUI* w
+       std::make_unique<neon::spaces::SpacesSettingsHandler>(profile));
+   web_ui->AddMessageHandler(
+       std::make_unique<neon::spaces::SpaceDataHandler>(profile));
++  web_ui->AddMessageHandler(
++      std::make_unique<neon::spaces::SiteDataScopeHandler>(profile));
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+   AddSettingsPageUIHandler(std::make_unique<LanguagesHandler>(profile));
+--- a/chrome/browser/ui/webui/settings/site_settings_handler.cc
++++ b/chrome/browser/ui/webui/settings/site_settings_handler.cc
+@@ -57,6 +57,7 @@
+ #include "chrome/browser/serial/serial_chooser_context.h"
+ #include "chrome/browser/serial/serial_chooser_context_factory.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/neon/spaces/site_data_scope.h"
+ #include "chrome/browser/ui/page_info/page_info_infobar_delegate.h"
+ #include "chrome/browser/ui/tab_contents/tab_contents_iterator.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -2305,6 +2306,19 @@ void SiteSettingsHandler::RebuildModel()
+   // the models exist, could remove the requirement for this.
+   browsing_data_model_.reset();
+ 
++  // Neon: the data of the space the page shows (see site_data_scope.h).
++  if (content::StoragePartition* partition =
++          neon::spaces::GetSiteDataStoragePartition(web_ui());
++      partition && !partition->GetConfig().is_default()) {
++    BrowsingDataModel::BuildFromNonDefaultStoragePartition(
++        partition,
++        ChromeBrowsingDataModelDelegate::CreateForStoragePartition(profile_,
++                                                                   partition),
++        base::BindOnce(&SiteSettingsHandler::BrowsingDataModelCreated,
++                       weak_ptr_factory_.GetWeakPtr()));
++    return;
++  }
++
+   BrowsingDataModel::BuildFromDisk(
+       profile_, ChromeBrowsingDataModelDelegate::CreateForProfile(profile_),
+       base::BindOnce(&SiteSettingsHandler::BrowsingDataModelCreated,

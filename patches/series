@@ -412,3 +412,4 @@ neon/extensions/tab-target.patch
 neon/containers/clear-browsing-data.patch
 neon/containers/devtools.patch
 neon/spaces/data-scope.patch
+neon/spaces/site-data-page.patch
