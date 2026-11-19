@@ -50,8 +50,8 @@ across spaces on purpose.
 | M0 | Linux dev build of stock Helium 0.22.1 from `neon-linux`, running under Xvfb | done | |
 | R1 | Containers port study: map Brave's implementation onto Helium's patch layout | done | |
 | R2 | Spaces design: data model, sidebar pager, persistence | done | |
-| M1 | Containers core: a tab can live in a named persistent container | doing | M0, R1 |
-| M2 | Spaces model: tabs grouped by space, one visible space, switch by command | todo | M1, R2 |
+| M1 | Containers core: a tab can live in a named persistent container | done | M0, R1 |
+| M2 | Spaces model: tabs grouped by space, one visible space, switch by command | doing | M1, R2 |
 | M3 | Sidebar pager: space switcher row, slide animation, scroll gesture | todo | M2 |
 | M4 | Space management: create, rename, icon, colour, delete, reorder, settings page | todo | M2 |
 | M5 | Per-space pinned tabs, and site rules that route a URL to a space | todo | M3 |
@@ -109,6 +109,12 @@ Done when, in the Linux build:
 - Closing and restarting the browser restores each tab into its container with its cookies.
 - A scripted check proves all three and is committed under `neon/tests/`.
 - `neon/THIRD_PARTY.md` records the Brave import.
+
+M1 landed as seven patches: 3,490 lines of new files and 382 hook lines in 32 Chromium files.
+`neon/tests/containers_m1.py` proves the criteria above. Left for later milestones: a new tab
+page or blank tab opened "in a container" still lands in the default partition (M2 must solve
+this for new tabs in a space), and deleting a container's storage, temporary containers and
+reopening a closed tab compile but have never been run.
 
 ### M2 to M5
 

@@ -502,3 +502,18 @@ the next agent can build incrementally.
 - Timestamps in the browser log are UTC, the host is on Paris time.
 - The browser logs a few harmless errors under Xvfb: no D-Bus login manager, and blocked requests
   to `helium-services-are-disabled.qjz9zk` (Helium's placeholder for its services).
+- `patches/series` contains blank lines. Never build a series file by line count (`head -n`),
+  it silently drops entries, and a later `he merge` then deletes the patch files that fell off.
+  If that happens, the applied list in `build/src/.pc/applied-patches` is the source of truth.
+- `neon/quilt_place.py PATCH core` puts a new patch at the end of the core block, after any
+  earlier Neon patches, so Neon patches stay in the order they were created.
+- To edit an earlier Neon patch that shares a file with a later one: move the later patches to
+  the platform end with `quilt_place.py ... platform`, pop them, refresh the earlier patch, push,
+  and move them back. This avoids popping the Linux patches, which forces a huge rebuild.
+- The dev container uses host networking, so Xvfb display numbers are shared with the host and
+  with other agents. Pick a free display instead of assuming `:99`.
+- Running the browser binary a second time on a profile that is already open hands its command
+  line to the running browser. Scripts use this to open a tab in a container:
+  `--container=<name> URL`.
+- Rebuild cost by what you touch: a `.cc` file takes 10 to 30 seconds, a `chrome/browser` header
+  3 to 7 minutes, a `content/public` header about 15 minutes. Batch header edits.
