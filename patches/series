@@ -391,3 +391,8 @@ neon/containers/browser-service.patch
 neon/containers/tab-partition.patch
 neon/containers/command-line.patch
 neon/containers/spaces-interface.patch
+neon/spaces/service.patch
+neon/spaces/window-controller.patch
+neon/spaces/model-filter.patch
+neon/spaces/strip-filter.patch
+neon/spaces/commands.patch

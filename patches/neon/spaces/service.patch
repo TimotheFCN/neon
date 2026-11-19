@@ -1,0 +1,642 @@
+Neon spaces (M2), part 1 of 5: service.
+
+The space list of a profile: an ordered list of spaces (id, name, icon,
+colour, container id) in the local pref neon.spaces.list. The first space is
+the default one, which uses the default storage partition, always exists and
+cannot be deleted. SpacesService creates, updates, reorders and deletes
+spaces (each new space gets a container through neon::containers_api) and
+notifies observers. Regular profiles only, so incognito has no spaces.
+Neon code, GPL-3.0.
+
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1170,6 +1170,7 @@ source_set("core") {
+     "//chrome/browser/metrics:expired_histograms_array",
+     "//chrome/browser/navigation_predictor",
+     "//chrome/browser/neon:containers_api",
++    "//chrome/browser/neon/spaces",
+     "//chrome/browser/net",
+     "//chrome/browser/notifications",
+     "//chrome/browser/notifications:system_notification_helper",
+--- /dev/null
++++ b/chrome/browser/neon/spaces/BUILD.gn
+@@ -0,0 +1,31 @@
++# Copyright 2026 The Neon Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++# The space list of a profile: which spaces exist, in which order, and which
++# container each one uses. Window and tab behaviour lives in
++# //chrome/browser/ui/neon/spaces.
++source_set("spaces") {
++  sources = [
++    "space.cc",
++    "space.h",
++    "spaces_service.cc",
++    "spaces_service.h",
++    "spaces_service_factory.cc",
++    "spaces_service_factory.h",
++  ]
++
++  public_deps = [
++    "//base",
++    "//chrome/browser/profiles:profile",
++    "//components/keyed_service/core",
++    "//skia",
++  ]
++
++  deps = [
++    "//chrome/browser/containers",
++    "//chrome/browser/neon:containers_api",
++    "//components/pref_registry",
++    "//components/prefs",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/neon/spaces/space.cc
+@@ -0,0 +1,74 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/neon/spaces/space.h"
++
++#include <utility>
++
++namespace neon::spaces {
++
++namespace {
++
++constexpr char kIdKey[] = "id";
++constexpr char kNameKey[] = "name";
++constexpr char kIconKey[] = "icon";
++constexpr char kColorKey[] = "color";
++constexpr char kContainerIdKey[] = "container_id";
++
++}  // namespace
++
++Space::Space() = default;
++Space::Space(std::string id,
++             std::string name,
++             std::string icon,
++             SkColor color,
++             std::string container_id)
++    : id(std::move(id)),
++      name(std::move(name)),
++      icon(std::move(icon)),
++      color(color),
++      container_id(std::move(container_id)) {}
++Space::Space(const Space&) = default;
++Space& Space::operator=(const Space&) = default;
++Space::Space(Space&&) = default;
++Space& Space::operator=(Space&&) = default;
++Space::~Space() = default;
++
++bool Space::operator==(const Space&) const = default;
++
++base::DictValue Space::ToDict() const {
++  base::DictValue dict;
++  dict.Set(kIdKey, id);
++  dict.Set(kNameKey, name);
++  dict.Set(kIconKey, icon);
++  // Stored as a signed int, like Brave's containers background_color.
++  dict.Set(kColorKey, static_cast<int>(color));
++  dict.Set(kContainerIdKey, container_id);
++  return dict;
++}
++
++// static
++std::optional<Space> Space::FromDict(const base::DictValue& dict) {
++  const std::string* id = dict.FindString(kIdKey);
++  if (!id || id->empty()) {
++    return std::nullopt;
++  }
++  Space space;
++  space.id = *id;
++  if (const std::string* name = dict.FindString(kNameKey)) {
++    space.name = *name;
++  }
++  if (const std::string* icon = dict.FindString(kIconKey)) {
++    space.icon = *icon;
++  }
++  if (std::optional<int> color = dict.FindInt(kColorKey)) {
++    space.color = static_cast<SkColor>(*color);
++  }
++  if (const std::string* container_id = dict.FindString(kContainerIdKey)) {
++    space.container_id = *container_id;
++  }
++  return space;
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/neon/spaces/space.h
+@@ -0,0 +1,56 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_NEON_SPACES_SPACE_H_
++#define CHROME_BROWSER_NEON_SPACES_SPACE_H_
++
++#include <optional>
++#include <string>
++
++#include "base/values.h"
++#include "third_party/skia/include/core/SkColor.h"
++
++namespace neon::spaces {
++
++// The id of the default space, the one that uses the default storage
++// partition. It always exists and is always first.
++inline constexpr char kDefaultSpaceId[] = "default";
++
++// A space: a page of the sidebar with its own tabs, backed by a container (its
++// own cookies and site storage). The default space has no container.
++struct Space {
++  Space();
++  Space(std::string id,
++        std::string name,
++        std::string icon,
++        SkColor color,
++        std::string container_id);
++  Space(const Space&);
++  Space& operator=(const Space&);
++  Space(Space&&);
++  Space& operator=(Space&&);
++  ~Space();
++
++  bool is_default() const { return id == kDefaultSpaceId; }
++
++  // Stored as a dict in the neon.spaces.list pref.
++  base::DictValue ToDict() const;
++  // Returns std::nullopt if |dict| is not a valid space.
++  static std::optional<Space> FromDict(const base::DictValue& dict);
++
++  bool operator==(const Space&) const;
++
++  // Stable id: kDefaultSpaceId or a lowercase UUID.
++  std::string id;
++  std::string name;
++  // An emoji or the name of an icon. Shown by the switcher (M3).
++  std::string icon;
++  SkColor color = SK_ColorTRANSPARENT;
++  // The container the space's tabs live in. Empty for the default space.
++  std::string container_id;
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_NEON_SPACES_SPACE_H_
+--- /dev/null
++++ b/chrome/browser/neon/spaces/spaces_service.cc
+@@ -0,0 +1,224 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/neon/spaces/spaces_service.h"
++
++#include <algorithm>
++#include <set>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_util.h"
++#include "base/uuid.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/pref_registry/pref_registry_syncable.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++
++namespace neon::spaces {
++
++namespace {
++
++Space MakeDefaultSpace() {
++  return Space(kDefaultSpaceId, "Default", std::string(), SK_ColorTRANSPARENT,
++               std::string());
++}
++
++bool IsValidContainerId(std::string_view id) {
++  return !id.empty() && std::ranges::all_of(id, [](char c) {
++    return base::IsAsciiLower(c) || base::IsAsciiDigit(c) || c == '-';
++  });
++}
++
++}  // namespace
++
++SpacesService::SpacesService(Profile* profile) : profile_(profile) {
++  pref_change_registrar_.Init(profile_->GetPrefs());
++  pref_change_registrar_.Add(
++      kSpacesListPref,
++      base::BindRepeating(&SpacesService::Load, base::Unretained(this)));
++  containers_api::AddObserver(profile_, this);
++  Load();
++}
++
++SpacesService::~SpacesService() = default;
++
++void SpacesService::Shutdown() {
++  // The containers service shuts down after this one; it must not be reached
++  // from the destructor.
++  containers_api::RemoveObserver(profile_, this);
++  pref_change_registrar_.RemoveAll();
++}
++
++// static
++void SpacesService::RegisterProfilePrefs(
++    user_prefs::PrefRegistrySyncable* registry) {
++  registry->RegisterListPref(kSpacesListPref);
++}
++
++const Space* SpacesService::GetSpace(std::string_view id) const {
++  for (const Space& space : spaces_) {
++    if (space.id == id) {
++      return &space;
++    }
++  }
++  return nullptr;
++}
++
++Space* SpacesService::FindSpace(std::string_view id) {
++  return const_cast<Space*>(std::as_const(*this).GetSpace(id));
++}
++
++std::optional<size_t> SpacesService::GetSpaceIndex(std::string_view id) const {
++  for (size_t i = 0; i < spaces_.size(); ++i) {
++    if (spaces_[i].id == id) {
++      return i;
++    }
++  }
++  return std::nullopt;
++}
++
++const std::string& SpacesService::GetSpaceIdForContainer(
++    std::string_view container_id) const {
++  if (!container_id.empty()) {
++    for (const Space& space : spaces_) {
++      if (space.container_id == container_id) {
++        return space.id;
++      }
++    }
++  }
++  return spaces_.front().id;
++}
++
++std::optional<std::string> SpacesService::CreateSpace(std::string_view name,
++                                                      std::string_view icon,
++                                                      SkColor color) {
++  std::optional<std::string> container_id = containers_api::CreateContainer(
++      profile_, name, SkColorSetA(color, SK_AlphaOPAQUE));
++  if (!container_id) {
++    return std::nullopt;
++  }
++  Space space(base::Uuid::GenerateRandomV4().AsLowercaseString(),
++              std::string(name), std::string(icon), color, *container_id);
++  std::string id = space.id;
++  spaces_.push_back(std::move(space));
++  Save();
++  return id;
++}
++
++bool SpacesService::UpdateSpace(std::string_view id,
++                                std::string_view name,
++                                std::string_view icon,
++                                SkColor color) {
++  Space* space = FindSpace(id);
++  if (!space) {
++    return false;
++  }
++  if (!space->is_default()) {
++    containers_api::UpdateContainer(profile_, space->container_id, name,
++                                    SkColorSetA(color, SK_AlphaOPAQUE));
++  }
++  space->name = std::string(name);
++  space->icon = std::string(icon);
++  space->color = color;
++  Save();
++  return true;
++}
++
++bool SpacesService::MoveSpace(std::string_view id, size_t index) {
++  std::optional<size_t> from = GetSpaceIndex(id);
++  if (!from || *from == 0) {
++    return false;
++  }
++  const size_t to = std::clamp<size_t>(index, 1, spaces_.size() - 1);
++  Space space = std::move(spaces_[*from]);
++  spaces_.erase(spaces_.begin() + *from);
++  spaces_.insert(spaces_.begin() + to, std::move(space));
++  Save();
++  return true;
++}
++
++bool SpacesService::DeleteSpace(std::string_view id) {
++  std::optional<size_t> index = GetSpaceIndex(id);
++  if (!index || *index == 0) {
++    return false;
++  }
++  const std::string container_id = spaces_[*index].container_id;
++  spaces_.erase(spaces_.begin() + *index);
++  Save();
++  containers_api::DeleteContainer(profile_, container_id);
++  return true;
++}
++
++void SpacesService::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void SpacesService::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++void SpacesService::OnContainersChanged() {
++  Load();
++}
++
++void SpacesService::Load() {
++  std::vector<Space> spaces;
++  Space default_space = MakeDefaultSpace();
++  std::set<std::string> ids = {kDefaultSpaceId};
++  std::set<std::string> container_ids;
++  const bool containers_available = containers_api::IsAvailable(profile_);
++  for (const base::Value& value :
++       profile_->GetPrefs()->GetList(kSpacesListPref)) {
++    if (!value.is_dict()) {
++      continue;
++    }
++    std::optional<Space> space = Space::FromDict(value.GetDict());
++    if (!space) {
++      continue;
++    }
++    if (space->is_default()) {
++      // Keeps the user's name, icon and colour; the default space always uses
++      // the default partition.
++      default_space.name = space->name;
++      default_space.icon = space->icon;
++      default_space.color = space->color;
++      continue;
++    }
++    // A space needs a container that exists. Without containers (feature off)
++    // only the default space is left.
++    if (!containers_available || ids.contains(space->id) ||
++        !IsValidContainerId(space->container_id) ||
++        container_ids.contains(space->container_id) ||
++        !containers_api::GetContainer(profile_, space->container_id)) {
++      continue;
++    }
++    ids.insert(space->id);
++    container_ids.insert(space->container_id);
++    spaces.push_back(std::move(*space));
++  }
++  spaces.insert(spaces.begin(), std::move(default_space));
++
++  if (spaces == spaces_) {
++    return;
++  }
++  spaces_ = std::move(spaces);
++  for (Observer& observer : observers_) {
++    observer.OnSpacesChanged();
++  }
++}
++
++void SpacesService::Save() {
++  base::ListValue list;
++  for (const Space& space : spaces_) {
++    list.Append(space.ToDict());
++  }
++  // Writing the pref calls Load(), which finds the list it already has.
++  profile_->GetPrefs()->SetList(kSpacesListPref, std::move(list));
++  for (Observer& observer : observers_) {
++    observer.OnSpacesChanged();
++  }
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/neon/spaces/spaces_service.h
+@@ -0,0 +1,107 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_NEON_SPACES_SPACES_SERVICE_H_
++#define CHROME_BROWSER_NEON_SPACES_SPACES_SERVICE_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
++#include "chrome/browser/neon/containers_api.h"
++#include "chrome/browser/neon/spaces/space.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "components/prefs/pref_change_registrar.h"
++
++class Profile;
++
++namespace user_prefs {
++class PrefRegistrySyncable;
++}  // namespace user_prefs
++
++namespace neon::spaces {
++
++// Profile pref: the ordered space list, a list of Space dicts. The first entry
++// is the default space. Local to the device, not synced.
++inline constexpr char kSpacesListPref[] = "neon.spaces.list";
++
++// The ordered list of spaces of a profile. Each space but the default one owns
++// a container. A tab belongs to the space of its container, see
++// GetSpaceIdForContainer(). Exists for regular profiles only, so incognito has
++// no spaces.
++class SpacesService : public KeyedService,
++                      public containers_api::Observer {
++ public:
++  class Observer : public base::CheckedObserver {
++   public:
++    // The list, the order or a space's name, icon or colour changed.
++    virtual void OnSpacesChanged() = 0;
++  };
++
++  explicit SpacesService(Profile* profile);
++  SpacesService(const SpacesService&) = delete;
++  SpacesService& operator=(const SpacesService&) = delete;
++  ~SpacesService() override;
++
++  static void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
++
++  // KeyedService:
++  void Shutdown() override;
++
++  // The spaces in display order. Never empty: the default space comes first.
++  const std::vector<Space>& spaces() const { return spaces_; }
++  const Space* GetSpace(std::string_view id) const;
++  // The position of space |id| in spaces(), or std::nullopt.
++  std::optional<size_t> GetSpaceIndex(std::string_view id) const;
++
++  // The space whose container is |container_id|. The default partition (empty
++  // id) and containers that no space uses map to the default space.
++  const std::string& GetSpaceIdForContainer(
++      std::string_view container_id) const;
++
++  // Adds a space at the end with a new container of its own. Returns its id,
++  // or std::nullopt if the container could not be created (blank name).
++  std::optional<std::string> CreateSpace(std::string_view name,
++                                         std::string_view icon,
++                                         SkColor color);
++  // Changes a space's name, icon and colour. Returns false if it does not
++  // exist.
++  bool UpdateSpace(std::string_view id,
++                   std::string_view name,
++                   std::string_view icon,
++                   SkColor color);
++  // Moves space |id| to |index|. The default space stays first, so |index| is
++  // clamped to 1 or more. Returns false if |id| is unknown or the default.
++  bool MoveSpace(std::string_view id, size_t index);
++  // Removes space |id| and its container. The default space cannot be
++  // removed. Close the space's tabs first: tabs left open fall back to the
++  // default space, and the container's storage is deleted at a later start
++  // once nothing uses it.
++  bool DeleteSpace(std::string_view id);
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++ private:
++  // containers_api::Observer:
++  void OnContainersChanged() override;
++
++  // Reads the pref into |spaces_| and notifies observers if it changed.
++  void Load();
++  void Save();
++  Space* FindSpace(std::string_view id);
++
++  raw_ptr<Profile> profile_;
++  std::vector<Space> spaces_;
++  PrefChangeRegistrar pref_change_registrar_;
++  base::ObserverList<Observer> observers_;
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_NEON_SPACES_SPACES_SERVICE_H_
+--- /dev/null
++++ b/chrome/browser/neon/spaces/spaces_service_factory.cc
+@@ -0,0 +1,50 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/neon/spaces/spaces_service_factory.h"
++
++#include "chrome/browser/containers/containers_service_factory.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_selections.h"
++
++namespace neon::spaces {
++
++// static
++SpacesServiceFactory* SpacesServiceFactory::GetInstance() {
++  static base::NoDestructor<SpacesServiceFactory> instance;
++  return instance.get();
++}
++
++// static
++SpacesService* SpacesServiceFactory::GetForProfile(Profile* profile) {
++  return static_cast<SpacesService*>(
++      GetInstance()->GetServiceForBrowserContext(profile, /*create=*/true));
++}
++
++SpacesServiceFactory::SpacesServiceFactory()
++    : ProfileKeyedServiceFactory(
++          "NeonSpacesService",
++          ProfileSelections::Builder()
++              .WithRegular(ProfileSelection::kOriginalOnly)
++              .WithGuest(ProfileSelection::kNone)
++              .WithSystem(ProfileSelection::kNone)
++              .Build()) {
++  DependsOn(ContainersServiceFactory::GetInstance());
++}
++
++SpacesServiceFactory::~SpacesServiceFactory() = default;
++
++void SpacesServiceFactory::RegisterProfilePrefs(
++    user_prefs::PrefRegistrySyncable* registry) {
++  SpacesService::RegisterProfilePrefs(registry);
++}
++
++std::unique_ptr<KeyedService>
++SpacesServiceFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  return std::make_unique<SpacesService>(Profile::FromBrowserContext(context));
++}
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/neon/spaces/spaces_service_factory.h
+@@ -0,0 +1,41 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_NEON_SPACES_SPACES_SERVICE_FACTORY_H_
++#define CHROME_BROWSER_NEON_SPACES_SPACES_SERVICE_FACTORY_H_
++
++#include <memory>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++class Profile;
++
++namespace neon::spaces {
++
++class SpacesService;
++
++// Regular profiles only: incognito, guest and system profiles have no spaces.
++class SpacesServiceFactory : public ProfileKeyedServiceFactory {
++ public:
++  static SpacesServiceFactory* GetInstance();
++  // Null for profiles without spaces.
++  static SpacesService* GetForProfile(Profile* profile);
++
++ private:
++  friend base::NoDestructor<SpacesServiceFactory>;
++
++  SpacesServiceFactory();
++  ~SpacesServiceFactory() override;
++
++  // ProfileKeyedServiceFactory:
++  void RegisterProfilePrefs(
++      user_prefs::PrefRegistrySyncable* registry) override;
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_NEON_SPACES_SPACES_SERVICE_FACTORY_H_
+--- a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -142,6 +142,7 @@
+ #include "chrome/browser/navigation_predictor/navigation_predictor_keyed_service_factory.h"
+ #include "chrome/browser/navigation_predictor/search_engine_preconnector.h"
+ #include "chrome/browser/navigation_predictor/search_engine_preconnector_keyed_service_factory.h"
++#include "chrome/browser/neon/spaces/spaces_service_factory.h"
+ #include "chrome/browser/net/dns_probe_service_factory.h"
+ #include "chrome/browser/net/profile_network_context_service_factory.h"
+ #include "chrome/browser/new_tab_page/microsoft_auth/microsoft_auth_service_factory.h"
+@@ -1171,6 +1172,7 @@ void ChromeBrowserMainExtraPartsProfiles
+   web_app::IwaPermissionsPolicyCacheFactory::GetInstance();
+ #endif  // !BUILDFLAG(IS_ANDROID)
+   NavigationPredictorKeyedServiceFactory::GetInstance();
++  neon::spaces::SpacesServiceFactory::GetInstance();
+ #if BUILDFLAG(CHROME_ROOT_STORE_CERT_MANAGEMENT_UI)
+   net::ServerCertificateDatabaseServiceFactory::GetInstance();
+ #endif

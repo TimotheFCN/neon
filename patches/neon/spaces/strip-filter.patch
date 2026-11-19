@@ -1,0 +1,126 @@
+Neon spaces (M2), part 4 of 5: strip filter.
+
+The vertical tab strip shows only the visible space's tabs, pinned and
+unpinned: hidden tabs are left out of the layouts like tabs outside a focused
+group, and the containers lay out again when the active tab moves to another
+space. Other layouts are unaffected (spaces are off there).
+
+--- a/chrome/browser/ui/views/tabs/common/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
+@@ -117,6 +117,7 @@ source_set("impl") {
+     "//chrome/browser/ui/actions:actions_headers",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/color:color_headers",
++    "//chrome/browser/ui/neon/spaces:hooks",
+     "//chrome/browser/ui/startup",
+     "//chrome/browser/ui/tab_contents",
+     "//chrome/browser/ui/tabs",
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view_vertical_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view_vertical_layout.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/pinned_tab_container_view_vertical_layout.h"
+ 
++#include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
++
+ #include <algorithm>
+ #include <cmath>
+ 
+@@ -32,7 +34,10 @@ gfx::Size PinnedTabContainerViewVertical
+   // The minimum size should be enough to show a row and a half, if needed.
+   auto collapse_state = PinnedTabContainerView().GetTabStripCollapseState();
+   const int num_children =
+-      PinnedTabContainerView().collection_node_->GetDirectChildren().size();
++      PinnedTabContainerView().collection_node_->GetDirectChildren().size() -
++      neon::spaces::CountHiddenChildViews(
++          PinnedTabContainerView().collection_node_.get(),
++          PinnedTabContainerView().collection_node_->GetDirectChildren());
+   const float min_rows = std::min(
+       (collapse_state != tabs::VerticalTabStripCollapseState::kExpanded ? 1.5f
+                                                                         : 1.0f),
+@@ -59,7 +64,10 @@ PinnedTabContainerViewVerticalLayout::Ca
+ 
+   int x = 0;
+   int y = 0;
+-  int children_on_row = children.size();
++  int children_on_row =
++      children.size() - neon::spaces::CountHiddenChildViews(
++                            PinnedTabContainerView().collection_node_.get(),
++                            children);
+ 
+   if (children_on_row == 0) {
+     layouts.host_size = gfx::Size(0, 0);
+@@ -115,7 +123,10 @@ PinnedTabContainerViewVerticalLayout::Ca
+ 
+     auto drag_data =
+         PinnedTabContainerView().GetVisualDataForDraggedView(*child);
+-    const bool should_show_child = !(drag_data && drag_data->should_hide);
++    const bool should_show_child =
++        !(drag_data && drag_data->should_hide) &&
++        !neon::spaces::IsChildViewHidden(
++            PinnedTabContainerView().collection_node_.get(), child);
+     if (!should_show_child) {
+       layouts.child_layouts.emplace_back(child, false, gfx::Rect());
+       continue;
+--- a/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/root_tab_collection_node.h"
+ 
++#include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
++
+ #include "base/stl_util.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -195,6 +197,7 @@ void RootTabCollectionNode::OnTabStripMo
+       changed_tabs.insert(selection.new_tab);
+     }
+     on_active_tab_changed_callback_list_.Notify(selection.new_tab);
++    neon::spaces::OnActiveTabChanged(this, selection.new_tab);
+   }
+ 
+   if (selection.selection_changed()) {
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view.h"
+ 
++#include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
++
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/tabs/tab_style.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+@@ -162,6 +164,10 @@ bool UnpinnedTabContainerView::LayoutMan
+       GetGroupIdForChild(child) != focused_group_id.value()) {
+     return false;
+   }
++  if (neon::spaces::IsChildViewHidden(
++          UnpinnedTabContainerView().collection_node_.get(), child)) {
++    return false;
++  }
+   return true;
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_vertical_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_vertical_layout.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_vertical_layout.h"
+ 
++#include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
++
+ #include <algorithm>
+ #include <optional>
+ 
+@@ -40,7 +42,8 @@ gfx::Size UnpinnedTabContainerViewVertic
+   int num_children = 0;
+   for (const auto* child :
+        UnpinnedTabContainerView().collection_node_->GetDirectChildren()) {
+-    bool should_show = true;
++    bool should_show = !neon::spaces::IsChildViewHidden(
++        UnpinnedTabContainerView().collection_node_.get(), child);
+     if (focused_group_id.has_value()) {
+       std::optional<tab_groups::TabGroupId> group_id =
+           GetGroupIdForChild(child);

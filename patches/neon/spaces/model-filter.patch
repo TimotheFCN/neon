@@ -1,0 +1,101 @@
+Neon spaces (M2), part 3 of 5: model filter.
+
+Keeps keyboard tab navigation inside the visible space, the way tab group
+focus mode does for the focused group: next and previous tab, Helium's MRU
+cycling, Ctrl+1..9, the tab activated after a close, and close other tabs,
+close tabs to the right and Helium's close tabs to the left. One call each
+into neon::spaces::IsTabHidden.
+
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -848,6 +848,7 @@ if (!is_android) {
+       ":ui_features",
+       ":url_identity",
+       "//base",
++      "//chrome/browser/ui/neon/spaces:hooks",
+       "//build:branding_buildflags",
+       "//chrome/app:command_ids",
+       "//chrome/app:generated_resources",
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/browser_commands.h"
+ 
++#include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
++
+ #include <algorithm>
+ #include <memory>
+ #include <numeric>
+@@ -605,6 +607,9 @@ bool IsTabSelectable(
+       model->IsGroupCollapsed(tab->GetGroup().value())) {
+     return false;
+   }
++  if (neon::spaces::IsTabHidden(model, tab)) {
++    return false;
++  }
+ 
+   // Do not select the tab if it is not part of the focused state.
+   if (focused_group.has_value() &&
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -414,6 +414,7 @@ if (!is_android) {
+       "//chrome/browser/ui/browser_window",
+       "//chrome/browser/ui/commerce",
+       "//chrome/browser/ui/helium:helium_layout_state_controller",
++      "//chrome/browser/ui/neon/spaces:hooks",
+       "//chrome/browser/ui/send_tab_to_self",
+       "//chrome/browser/ui/tabs/alert:tab_alert",
+       "//chrome/browser/ui/thumbnails",
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ 
++#include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
++
+ #include <algorithm>
+ #include <cstddef>
+ #include <cstdint>
+@@ -4094,6 +4096,9 @@ std::vector<tabs::TabHandle> TabStripMod
+     if (focused_group.has_value() && tab->GetGroup() != focused_group) {
+       continue;
+     }
++    if (neon::spaces::IsTabHidden(this, tab)) {
++      continue;
++    }
+ 
+     if (tab == invoked_tab || tab->IsPinned()) {
+       if (id == CommandCloseTabsToLeft && tab == invoked_tab) {
+@@ -4599,7 +4604,9 @@ void TabStripModel::SelectMRUTab(TabRela
+     }
+ 
+     for (int i = 0; i < count(); ++i) {
+-      mru_cycle_list_.push_back(i);
++      if (!neon::spaces::IsTabHidden(this, GetTabAtIndex(i))) {
++        mru_cycle_list_.push_back(i);
++      }
+     }
+ 
+     std::sort(mru_cycle_list_.begin(), mru_cycle_list_.end(),
+@@ -4656,6 +4663,9 @@ void TabStripModel::SelectRelativeTab(Ta
+     if (IsTabCollapsed(i)) {
+       return true;
+     }
++    if (neon::spaces::IsTabHidden(this, GetTabAtIndex(i))) {
++      return true;
++    }
+ 
+     // Do not select the tab if it is not part of the focused state.
+     return focused_group.has_value() &&
+@@ -6187,7 +6197,8 @@ std::optional<int> TabStripModel::Determ
+     // otherwise a legitimate selection, so it is kept separate from the
+     // visibility check below.
+     auto is_valid_for_focus = [this, &focused_group](int index) {
+-      if (!ContainsIndex(index)) {
++      if (!ContainsIndex(index) ||
++          neon::spaces::IsTabHidden(this, GetTabAtIndex(index))) {
+         return false;
+       }
+       return !focused_group.has_value() ||
