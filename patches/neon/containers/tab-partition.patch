@@ -39,6 +39,12 @@ on a site from the tab's own history, since a blank page committed in a
 SiteInstance without a site trips a BrowsingInstance CHECK on the next
 navigation.
 
+Neon also lets spaces pick the container of new tabs that have no opener,
+source page or explicit container (Ctrl+T, the new tab button, links from
+other apps): GetStoragePartitionConfigToInherit asks a provider set with
+SetNewTabContainerProvider, where Brave master consults its "open new tabs
+in" setting (brave-core #40693).
+
 --- a/chrome/browser/chrome_content_browser_client.cc
 +++ b/chrome/browser/chrome_content_browser_client.cc
 @@ -255,6 +255,8 @@
@@ -107,7 +113,7 @@ navigation.
      "//components/sessions",
 --- /dev/null
 +++ b/chrome/browser/containers/containers_navigator_utils.cc
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,127 @@
 +// Copyright (c) 2026 The Brave Authors. All rights reserved.
 +// This Source Code Form is subject to the terms of the Mozilla Public
 +// License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -124,6 +130,7 @@ navigation.
 +#include <utility>
 +
 +#include "base/feature_list.h"
++#include "base/no_destructor.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/tab_contents/tab_util.h"
 +#include "chrome/browser/ui/navigator/browser_navigator_params.h"
@@ -136,6 +143,34 @@ navigation.
 +#include "content/public/browser/site_instance.h"
 +
 +namespace containers {
++
++namespace {
++
++NewTabContainerProvider& GetNewTabContainerProvider() {
++  static base::NoDestructor<NewTabContainerProvider> provider;
++  return *provider;
++}
++
++// Neon: the container for a new tab with no opener, source page or explicit
++// container, as picked by the provider (spaces). Mirrors where Brave master
++// consults its "open new tabs in" setting.
++std::optional<content::StoragePartitionConfig>
++GetNewTabTargetStoragePartitionConfig(const NavigateParams& params) {
++  const NewTabContainerProvider& provider = GetNewTabContainerProvider();
++  if (!provider || !params.browser) {
++    return std::nullopt;
++  }
++  // Only a Containers partition applies.
++  const std::optional<content::StoragePartitionConfig> config =
++      provider.Run(params.browser.get());
++  return MaybeInheritStoragePartition(config);
++}
++
++}  // namespace
++
++void SetNewTabContainerProvider(NewTabContainerProvider provider) {
++  GetNewTabContainerProvider() = std::move(provider);
++}
 +
 +std::optional<content::StoragePartitionConfig>
 +GetStoragePartitionConfigToInherit(const NavigateParams& params) {
@@ -154,7 +189,7 @@ navigation.
 +            .GetStoragePartitionConfig());
 +  }
 +
-+  return std::nullopt;
++  return GetNewTabTargetStoragePartitionConfig(params);
 +}
 +
 +void MaybeSetContainerSiteInstance(
@@ -208,7 +243,7 @@ navigation.
 +}  // namespace containers
 --- /dev/null
 +++ b/chrome/browser/containers/containers_navigator_utils.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,59 @@
 +// Copyright (c) 2026 The Brave Authors. All rights reserved.
 +// This Source Code Form is subject to the terms of the Mozilla Public
 +// License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -220,9 +255,11 @@ navigation.
 +#include <optional>
 +
 +#include "base/containers/span.h"
++#include "base/functional/callback.h"
 +#include "content/public/browser/storage_partition_config.h"
 +#include "content/public/browser/web_contents.h"
 +
++class BrowserWindowInterface;
 +class Profile;
 +struct NavigateParams;
 +
@@ -235,10 +272,22 @@ navigation.
 +// Returns the Containers storage partition a new tab created by |params|
 +// should use: |params.storage_partition_config| when it is a Containers
 +// partition, otherwise the partition of |params.source_site_instance| when that
-+// is one. Returns std::nullopt in every other case and when Containers is
-+// disabled.
++// is one, otherwise the container the new tab container provider picks for
++// |params.browser|. Returns std::nullopt in every other case and when
++// Containers is disabled.
 +std::optional<content::StoragePartitionConfig>
 +GetStoragePartitionConfigToInherit(const NavigateParams& params);
++
++// Neon: picks the storage partition of a new tab that has no opener, no source
++// page and no explicit container: Ctrl+T, the new tab button, links from other
++// apps, bookmarks. Brave master answers the same question with its "open new
++// tabs in" setting (brave-core #40693, GetNewTabTargetStoragePartitionConfig).
++// Neon lets spaces answer it through neon::containers_api, so a new tab opens
++// in the window's visible space. std::nullopt means the default partition.
++using NewTabContainerProvider =
++    base::RepeatingCallback<std::optional<content::StoragePartitionConfig>(
++        BrowserWindowInterface* browser)>;
++void SetNewTabContainerProvider(NewTabContainerProvider provider);
 +
 +// Sets |create_params->site_instance| for a tab restored from |navigations|
 +// when the selected navigation belongs to a container, so the restored tab is
