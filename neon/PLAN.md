@@ -51,9 +51,9 @@ across spaces on purpose.
 | R1 | Containers port study: map Brave's implementation onto Helium's patch layout | done | |
 | R2 | Spaces design: data model, sidebar pager, persistence | done | |
 | M1 | Containers core: a tab can live in a named persistent container | done | M0, R1 |
-| M1b | Containers hardening: fix the review findings on the port | todo | M2 |
+| M1b | Containers hardening: fix the review findings on the port | doing | M2 |
 | M2 | Spaces model: tabs grouped by space, one visible space, switch by command | done | M1, R2 |
-| M3 | Sidebar pager: space switcher row, slide animation, scroll gesture | doing | M2 |
+| M3 | Sidebar pager: space switcher row, slide animation, scroll gesture | done | M2 |
 | M4 | Space management: create, rename, icon, colour, delete, reorder, settings page | todo | M2 |
 | M5 | Per-space pinned tabs, and site rules that route a URL to a space | todo | M3 |
 | M6 | macOS: build from `neon-macos`, finger-tracked swipe, per-space glass tint | blocked | Mac access |
@@ -159,7 +159,26 @@ Left open by M2, to be picked up where noted:
 - Tabs in a container that no space uses count as the default space.
 - Not tested: dragging tabs between windows, tab search, tabs opened by extensions, bookmarks.
 
-### M3 to M5
+### M3: Sidebar pager (done)
+
+Several live tab strips on one tab model work on this tree, so the pager uses real pages and no
+snapshots. Four patches (pager, switcher-row, swipe, range-filter): about 2,900 new lines, with
+Chromium hooks in `base_tab_strip_region_view.cc`, `root_tab_collection_node`, `tab_view.cc` and
+`tab_strip_model.cc`. `neon/tests/spaces_m3.py` drives clicks and a synthetic touchpad through a
+real X server and checks frames in the middle of each transition.
+
+Left open by M3:
+
+- Typing a URL into the new tab page of a non-default space loads it outside that space. Found
+  by the M3 agent, not fixed. This is the first item of M1b.
+- Each window builds three full copies of every tab view, and a switch costs about 40 ms of
+  layout with 90 tabs. Measure on real hardware before optimising.
+- The swipe was only run on X11 with a synthetic touchpad. Wayland and macOS paths compile but
+  have never run. The macOS patch feeds `SpacesSwipeTracker` with native phases (M6).
+- Screen readers and the accessibility tree were not tested with peek pages.
+- Labels in the switcher row and its menu are English only.
+
+### M4 and M5
 
 The patch list for each is in `neon/docs/spaces-design.md`. Each milestone ends with the feature
 working in the Linux build, its patches in `patches/neon/`, and a test or scripted check that
