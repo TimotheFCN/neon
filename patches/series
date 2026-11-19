@@ -408,3 +408,6 @@ neon/spaces/move-to-space.patch
 neon/containers/blank-tabs.patch
 neon/extensions/global-window.patch
 neon/containers/blank-tabs.patch
+neon/extensions/global-window.patch
+neon/containers/blank-tabs.patch
+neon/spaces/all-containers.patch

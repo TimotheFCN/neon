@@ -1,0 +1,1226 @@
+Neon spaces: every space is a container (M5).
+
+The default storage partition is no longer a space. A new profile starts with
+one container-backed space, "Personal"; the default space of an older profile
+becomes a space with a container of its own (renamed Personal if it still had
+the name "Default"). Any space can be renamed, moved and deleted except the
+last one, in the switcher row, the edit bubble and the settings page.
+
+New tabs get a space's container whenever the profile has spaces, in every
+layout and with a single space; the pager, hiding and switching still need two
+spaces in the vertical layout. A tab whose page lands outside every space's
+container (a tab of an older profile, a container that no space uses, a
+restored tab whose container is gone) is reopened by its URL in its space, at
+its place; an extension page in such a tab moves to the global window.
+Nothing is copied out of the default partition.
+
+With a single space the switcher row stays hidden, so the New Tab button's
+context menu gets "New space" (command id 39520).
+
+--- a/chrome/browser/neon/spaces/space.h
++++ b/chrome/browser/neon/spaces/space.h
+@@ -13,12 +13,15 @@
+ 
+ namespace neon::spaces {
+ 
+-// The id of the default space, the one that uses the default storage
+-// partition. It always exists and is always first.
+-inline constexpr char kDefaultSpaceId[] = "default";
++// The id of the default space of profiles from before every space had a
++// container (Neon M1 to M4): the first space, in the default storage
++// partition. SpacesService turns such an entry into a space with a container
++// of its own.
++inline constexpr char kLegacyDefaultSpaceId[] = "default";
+ 
+ // A space: a page of the sidebar with its own tabs, backed by a container (its
+-// own cookies and site storage). The default space has no container.
++// own cookies and site storage). Every space has a container; the default
++// storage partition is the global context, which no space shows.
+ struct Space {
+   Space();
+   Space(std::string id,
+@@ -32,8 +35,6 @@ struct Space {
+   Space& operator=(Space&&);
+   ~Space();
+ 
+-  bool is_default() const { return id == kDefaultSpaceId; }
+-
+   // Stored as a dict in the neon.spaces.list pref.
+   base::DictValue ToDict() const;
+   // Returns std::nullopt if |dict| is not a valid space.
+@@ -41,13 +42,13 @@ struct Space {
+ 
+   bool operator==(const Space&) const;
+ 
+-  // Stable id: kDefaultSpaceId or a lowercase UUID.
++  // Stable id: a lowercase UUID.
+   std::string id;
+   std::string name;
+   // An emoji or the name of an icon. Shown by the switcher (M3).
+   std::string icon;
+   SkColor color = SK_ColorTRANSPARENT;
+-  // The container the space's tabs live in. Empty for the default space.
++  // The container the space's tabs live in.
+   std::string container_id;
+ };
+ 
+--- a/chrome/browser/neon/spaces/spaces_service.cc
++++ b/chrome/browser/neon/spaces/spaces_service.cc
+@@ -8,7 +8,9 @@
+ #include <set>
+ #include <utility>
+ 
++#include "base/auto_reset.h"
+ #include "base/functional/bind.h"
++#include "base/no_destructor.h"
+ #include "base/strings/string_util.h"
+ #include "base/uuid.h"
+ #include "chrome/browser/neon/spaces/space_style.h"
+@@ -21,10 +23,11 @@ namespace neon::spaces {
+ 
+ namespace {
+ 
+-Space MakeDefaultSpace() {
+-  return Space(kDefaultSpaceId, "Default", std::string(), SK_ColorTRANSPARENT,
+-               std::string());
+-}
++// The name of the space a new profile starts with.
++constexpr char kFirstSpaceName[] = "Personal";
++// The name the default space of older profiles had unless the user renamed
++// it. "Default" now means the global context, so such a space is renamed.
++constexpr char kLegacyDefaultSpaceName[] = "Default";
+ 
+ bool IsValidContainerId(std::string_view id) {
+   return !id.empty() && std::ranges::all_of(id, [](char c) {
+@@ -83,31 +86,56 @@ std::optional<size_t> SpacesService::Get
+   return std::nullopt;
+ }
+ 
+-const std::string& SpacesService::GetSpaceIdForContainer(
++const Space* SpacesService::GetSpaceForContainer(
+     std::string_view container_id) const {
+-  if (!container_id.empty()) {
+-    for (const Space& space : spaces_) {
+-      if (space.container_id == container_id) {
+-        return space.id;
+-      }
++  if (container_id.empty()) {
++    return nullptr;
++  }
++  for (const Space& space : spaces_) {
++    if (space.container_id == container_id) {
++      return &space;
+     }
+   }
+-  return spaces_.front().id;
++  return nullptr;
+ }
+ 
+-std::optional<std::string> SpacesService::CreateSpace(std::string_view name,
+-                                                      std::string_view icon,
+-                                                      SkColor color) {
++const std::string& SpacesService::GetSpaceIdForContainer(
++    std::string_view container_id) const {
++  static const base::NoDestructor<std::string> kNoSpace;
++  if (const Space* space = GetSpaceForContainer(container_id)) {
++    return space->id;
++  }
++  return spaces_.empty() ? *kNoSpace : spaces_.front().id;
++}
++
++std::optional<Space> SpacesService::MakeSpace(std::string_view name,
++                                              std::string_view icon,
++                                              SkColor color) {
+   std::optional<std::string> container_id = containers_api::CreateContainer(
+       profile_, name, SkColorSetA(color, SK_AlphaOPAQUE));
+   if (!container_id) {
+     return std::nullopt;
+   }
+-  Space space(base::Uuid::GenerateRandomV4().AsLowercaseString(),
+-              std::string(name), NormalizeSpaceIcon(icon), color,
+-              *container_id);
+-  std::string id = space.id;
+-  spaces_.push_back(std::move(space));
++  return Space(base::Uuid::GenerateRandomV4().AsLowercaseString(),
++               std::string(name), NormalizeSpaceIcon(icon), color,
++               *container_id);
++}
++
++std::optional<std::string> SpacesService::CreateSpace(std::string_view name,
++                                                      std::string_view icon,
++                                                      SkColor color) {
++  std::optional<Space> space;
++  {
++    // Creating the container reloads the list; the new space is not in the
++    // pref yet, so that reload must not replace |spaces_|.
++    base::AutoReset<bool> loading(&loading_, true);
++    space = MakeSpace(name, icon, color);
++  }
++  if (!space) {
++    return std::nullopt;
++  }
++  std::string id = space->id;
++  spaces_.push_back(std::move(*space));
+   Save();
+   return id;
+ }
+@@ -147,10 +175,13 @@ bool SpacesService::UpdateSpace(std::str
+ 
+ bool SpacesService::MoveSpace(std::string_view id, size_t index) {
+   std::optional<size_t> from = GetSpaceIndex(id);
+-  if (!from || *from == 0) {
++  if (!from) {
+     return false;
+   }
+-  const size_t to = std::clamp<size_t>(index, 1, spaces_.size() - 1);
++  const size_t to = std::min(index, spaces_.size() - 1);
++  if (to == *from) {
++    return true;
++  }
+   Space space = std::move(spaces_[*from]);
+   spaces_.erase(spaces_.begin() + *from);
+   spaces_.insert(spaces_.begin() + to, std::move(space));
+@@ -160,7 +191,7 @@ bool SpacesService::MoveSpace(std::strin
+ 
+ bool SpacesService::DeleteSpace(std::string_view id) {
+   std::optional<size_t> index = GetSpaceIndex(id);
+-  if (!index || *index == 0) {
++  if (!index || spaces_.size() <= 1) {
+     return false;
+   }
+   const std::string container_id = spaces_[*index].container_id;
+@@ -183,32 +214,38 @@ void SpacesService::OnContainersChanged(
+ }
+ 
+ void SpacesService::Load() {
++  if (loading_) {
++    return;
++  }
++  base::AutoReset<bool> loading(&loading_, true);
+   std::vector<Space> spaces;
+-  Space default_space = MakeDefaultSpace();
+-  std::set<std::string> ids = {kDefaultSpaceId};
++  std::set<std::string> ids;
+   std::set<std::string> container_ids;
++  // Without containers (feature off) there are no spaces. The pref is left
++  // alone, so they come back with containers.
+   const bool containers_available = containers_api::IsAvailable(profile_);
++  std::optional<Space> legacy_default;
++  bool changed = false;
+   for (const base::Value& value :
+        profile_->GetPrefs()->GetList(kSpacesListPref)) {
+-    if (!value.is_dict()) {
++    if (!containers_available || !value.is_dict()) {
+       continue;
+     }
+     std::optional<Space> space = Space::FromDict(value.GetDict());
+     if (!space) {
+       continue;
+     }
+-    if (space->is_default()) {
+-      // Keeps the user's name, icon and colour; the default space always uses
+-      // the default partition.
+-      default_space.name = space->name;
+-      default_space.icon = space->icon;
+-      default_space.color = space->color;
++    if (space->id == kLegacyDefaultSpaceId) {
++      // The first space of an older profile, in the default partition. It
++      // becomes a space like the others, keeping its name, icon and colour.
++      if (!legacy_default && spaces.empty()) {
++        legacy_default = std::move(space);
++      }
++      changed = true;
+       continue;
+     }
+-    // A space needs a container that exists. Without containers (feature off)
+-    // only the default space is left.
+-    if (!containers_available || ids.contains(space->id) ||
+-        !IsValidContainerId(space->container_id) ||
++    // A space needs a container that exists.
++    if (ids.contains(space->id) || !IsValidContainerId(space->container_id) ||
+         container_ids.contains(space->container_id) ||
+         !containers_api::GetContainer(profile_, space->container_id)) {
+       continue;
+@@ -217,12 +254,35 @@ void SpacesService::Load() {
+     container_ids.insert(space->container_id);
+     spaces.push_back(std::move(*space));
+   }
+-  spaces.insert(spaces.begin(), std::move(default_space));
++  if (containers_available && (legacy_default || spaces.empty())) {
++    // A new profile starts with one space; an older one keeps its first
++    // space's look. Its tabs, still in the default partition, are reopened in
++    // this space by the window controller.
++    std::optional<Space> first =
++        legacy_default
++            ? MakeSpace(legacy_default->name.empty() ||
++                                legacy_default->name == kLegacyDefaultSpaceName
++                            ? kFirstSpaceName
++                            : legacy_default->name,
++                        legacy_default->icon, legacy_default->color)
++            : MakeSpace(kFirstSpaceName, std::string(),
++                        GetNewSpaceColor(spaces));
++    if (first) {
++      spaces.insert(spaces.begin(), std::move(*first));
++      changed = true;
++    }
++  }
+ 
+-  if (spaces == spaces_) {
++  if (spaces == spaces_ && !changed) {
+     return;
+   }
+   spaces_ = std::move(spaces);
++  if (changed) {
++    // Writes the migrated list, which notifies observers. The pref observer
++    // calls Load() again, which returns at once (|loading_|).
++    Save();
++    return;
++  }
+   for (Observer& observer : observers_) {
+     observer.OnSpacesChanged();
+   }
+--- a/chrome/browser/neon/spaces/spaces_service.h
++++ b/chrome/browser/neon/spaces/spaces_service.h
+@@ -26,23 +26,29 @@ class PrefRegistrySyncable;
+ 
+ namespace neon::spaces {
+ 
+-// Profile pref: the ordered space list, a list of Space dicts. The first entry
+-// is the default space. Local to the device, not synced.
++// Profile pref: the ordered space list, a list of Space dicts. Local to the
++// device, not synced.
+ inline constexpr char kSpacesListPref[] = "neon.spaces.list";
+ // Whether the sidebar shows the row of space icons below the tabs.
+ inline constexpr char kShowSwitcherRowPref[] = "neon.spaces.show_switcher_row";
+ // Whether a sideways swipe or wheel over the sidebar switches spaces.
+ inline constexpr char kSwipeToSwitchPref[] = "neon.spaces.swipe_to_switch";
+ // The container each saved tab group's tabs were in when it was last open, by
+-// saved group id: a container id, or "" for the default partition. A closed
+-// saved group reopens there.
++// saved group id. A closed saved group reopens there.
+ inline constexpr char kSavedGroupContainersPref[] =
+     "neon.spaces.saved_group_containers";
+ 
+-// The ordered list of spaces of a profile. Each space but the default one owns
+-// a container. A tab belongs to the space of its container, see
+-// GetSpaceIdForContainer(). Exists for regular profiles only, so incognito has
+-// no spaces.
++// The ordered list of spaces of a profile. Each space owns a container, and a
++// tab belongs to the space of its container (GetSpaceForContainer()). The
++// default storage partition is the global context of the browser's own pages
++// and the extensions; no space uses it.
++//
++// The list is never empty while containers are available: a profile without
++// spaces gets a first one, "Personal", and the default space of an older
++// profile becomes a space with a container of its own (its open tabs are
++// reopened there, see SpacesWindowController). Without containers (feature
++// off) the list is empty and the browser behaves as stock Helium. Exists for
++// regular profiles only, so incognito has no spaces.
+ class SpacesService : public KeyedService,
+                       public containers_api::Observer {
+  public:
+@@ -62,14 +68,17 @@ class SpacesService : public KeyedServic
+   // KeyedService:
+   void Shutdown() override;
+ 
+-  // The spaces in display order. Never empty: the default space comes first.
++  // The spaces in display order. Empty only without containers.
+   const std::vector<Space>& spaces() const { return spaces_; }
+   const Space* GetSpace(std::string_view id) const;
+   // The position of space |id| in spaces(), or std::nullopt.
+   std::optional<size_t> GetSpaceIndex(std::string_view id) const;
+ 
+-  // The space whose container is |container_id|. The default partition (empty
+-  // id) and containers that no space uses map to the default space.
++  // The space whose container is |container_id|, or null: the default
++  // partition (empty id) and containers that no space uses have none.
++  const Space* GetSpaceForContainer(std::string_view container_id) const;
++  // The id of GetSpaceForContainer(), or else of the first space, or empty
++  // without spaces.
+   const std::string& GetSpaceIdForContainer(
+       std::string_view container_id) const;
+ 
+@@ -84,13 +93,13 @@ class SpacesService : public KeyedServic
+                    std::string_view name,
+                    std::string_view icon,
+                    SkColor color);
+-  // Moves space |id| to |index|. The default space stays first, so |index| is
+-  // clamped to 1 or more. Returns false if |id| is unknown or the default.
++  // Moves space |id| to |index|, clamped to the list. Returns false if |id| is
++  // unknown.
+   bool MoveSpace(std::string_view id, size_t index);
+-  // Removes space |id| and its container. The default space cannot be
+-  // removed. Close the space's tabs first: tabs left open fall back to the
+-  // default space, and the container's storage is deleted at a later start
+-  // once nothing uses it.
++  // Removes space |id| and its container. The last space cannot be removed.
++  // Close the space's tabs first: tabs left open are reopened in another
++  // space, and the container's storage is deleted at a later start once
++  // nothing uses it.
+   bool DeleteSpace(std::string_view id);
+ 
+   void AddObserver(Observer* observer);
+@@ -100,8 +109,14 @@ class SpacesService : public KeyedServic
+   // containers_api::Observer:
+   void OnContainersChanged() override;
+ 
+-  // Reads the pref into |spaces_| and notifies observers if it changed.
++  // Reads the pref into |spaces_| and notifies observers if it changed. Gives
++  // a legacy default space a container, and an empty list a first space.
+   void Load();
++  // A new space with a container of its own, or std::nullopt if the
++  // container could not be created.
++  std::optional<Space> MakeSpace(std::string_view name,
++                                 std::string_view icon,
++                                 SkColor color);
+   void Save();
+   Space* FindSpace(std::string_view id);
+ 
+@@ -109,6 +124,9 @@ class SpacesService : public KeyedServic
+   std::vector<Space> spaces_;
+   PrefChangeRegistrar pref_change_registrar_;
+   base::ObserverList<Observer> observers_;
++  // Set while Load() runs: creating a container there changes the containers
++  // list, which calls Load() again.
++  bool loading_ = false;
+ };
+ 
+ }  // namespace neon::spaces
+--- a/chrome/browser/resources/settings/appearance_page/neon_spaces_browser_proxy.ts
++++ b/chrome/browser/resources/settings/appearance_page/neon_spaces_browser_proxy.ts
+@@ -12,7 +12,8 @@ export interface NeonSpace {
+   name: string;
+   icon: string;
+   color: number;
+-  isDefault: boolean;
++  // False for the last space, which cannot be deleted.
++  deletable: boolean;
+   tabs: number;
+ }
+ 
+--- a/chrome/browser/resources/settings/appearance_page/neon_spaces_page.html.ts
++++ b/chrome/browser/resources/settings/appearance_page/neon_spaces_page.html.ts
+@@ -59,19 +59,19 @@ export function getHtml(this: SettingsNe
+           </span>
+           <cr-icon-button class="move-up" iron-icon="cr:keyboard-arrow-up"
+               title="Move up" aria-label="Move ${space.name} up"
+-              ?disabled="${space.isDefault || index <= 1}"
++              ?disabled="${index === 0}"
+               @click="${this.onMoveClick_}">
+           </cr-icon-button>
+           <cr-icon-button class="move-down" iron-icon="cr:keyboard-arrow-down"
+               title="Move down" aria-label="Move ${space.name} down"
+-              ?disabled="${space.isDefault || index === this.getSpaces_().length - 1}"
++              ?disabled="${index === this.getSpaces_().length - 1}"
+               @click="${this.onMoveClick_}">
+           </cr-icon-button>
+           <cr-icon-button class="delete" iron-icon="cr:delete"
+-              title="${space.isDefault ? 'The default space cannot be deleted' :
+-                                         'Delete space'}"
++              title="${space.deletable ? 'Delete space' :
++                                         'The last space cannot be deleted'}"
+               aria-label="Delete ${space.name}"
+-              ?disabled="${space.isDefault}"
++              ?disabled="${!space.deletable}"
+               @click="${this.onDeleteClick_}">
+           </cr-icon-button>
+         </div>
+--- a/chrome/browser/resources/settings/appearance_page/neon_spaces_page.ts
++++ b/chrome/browser/resources/settings/appearance_page/neon_spaces_page.ts
+@@ -254,8 +254,7 @@ export class SettingsNeonSpacesPageEleme
+     const delta =
+         (e.target as HTMLElement).classList.contains('move-up') ? -1 : 1;
+     const index = this.getSpaces_().indexOf(space) + delta;
+-    // The default space stays first.
+-    if (index < 1 || index >= this.getSpaces_().length) {
++    if (index < 0 || index >= this.getSpaces_().length) {
+       return;
+     }
+     this.browserProxy_.moveSpace(space.id, index);
+@@ -263,7 +262,7 @@ export class SettingsNeonSpacesPageEleme
+ 
+   protected async onDeleteClick_(e: Event) {
+     const space = this.spaceOf_(e);
+-    if (!space || space.isDefault) {
++    if (!space || !space.deletable) {
+       return;
+     }
+     this.deletingTabs_ = await this.browserProxy_.getTabCount(space.id);
+--- a/chrome/browser/ui/neon/spaces/BUILD.gn
++++ b/chrome/browser/ui/neon/spaces/BUILD.gn
+@@ -39,6 +39,8 @@ source_set("spaces") {
+     "space_management.h",
+     "spaces_window_controller.cc",
+     "spaces_window_controller.h",
++    "space_tab_tracker.cc",
++    "space_tab_tracker.h",
+     "spaces_window_manager.cc",
+     "spaces_window_manager.h",
+   ]
+@@ -55,6 +57,7 @@ source_set("spaces") {
+ 
+   deps = [
+     "//chrome/browser/neon:containers_api",
++    "//chrome/browser/neon:global_context",
+     "//chrome/browser/tab_group_sync:factories",
+     "//chrome/browser/ui/neon/global",
+     "//chrome/browser/ui:browser_tabstrip",
+--- a/chrome/browser/ui/neon/spaces/space_management.cc
++++ b/chrome/browser/ui/neon/spaces/space_management.cc
+@@ -80,12 +80,13 @@ bool DeleteSpace(Profile* profile, const
+   }
+   const Space* space = service->GetSpace(space_id);
+   std::optional<size_t> index = service->GetSpaceIndex(space_id);
+-  if (!space || !index || space->is_default()) {
++  // The last space stays: every window shows a space.
++  if (!space || !index || service->spaces().size() <= 1) {
+     return false;
+   }
+   const std::string container_id = space->container_id;
+-  // The default space is first and stays, so there is always a space before.
+-  const std::string neighbour = service->spaces()[*index - 1].id;
++  // Windows move to the space before, or after the first one.
++  const std::string neighbour = service->spaces()[*index ? *index - 1 : 1].id;
+ 
+   for (BrowserWindowInterface* browser : GetWindows(profile)) {
+     if (SpacesWindowController* controller =
+@@ -166,11 +167,6 @@ int ReopenTabsInSpace(const std::vector<
+       entry = contents->GetController().GetVisibleEntry();
+     }
+     GURL url = entry ? entry->GetURL() : GURL();
+-    // A blank page cannot open in a container (see containers_api.h); a new
+-    // tab page can.
+-    if (url.is_empty() || url.IsAboutBlank()) {
+-      url = GURL();
+-    }
+     controller->AddTabInSpace(space_id, url, /*foreground=*/first,
+                               tab->IsPinned());
+     first = false;
+--- a/chrome/browser/ui/neon/spaces/space_management.h
++++ b/chrome/browser/ui/neon/spaces/space_management.h
+@@ -26,7 +26,8 @@ int CountTabsInSpace(Profile* profile, c
+ std::optional<std::string> CreateSpace(Profile* profile);
+ 
+ // Deletes space |space_id| and everything in it:
+-// - every window showing it first moves to the space before it in the list,
++// - every window showing it first moves to the space before it in the list
++//   (after it, for the first space),
+ //   then every tab of the space closes, in all windows of the profile, without
+ //   unload handlers and without recently closed entries;
+ // - the space and its container are removed from the lists;
+@@ -34,7 +35,7 @@ std::optional<std::string> CreateSpace(P
+ //   directory is deleted at the next start;
+ // - saved state that refers to the container is dropped: recently closed
+ //   tabs and the saved tab group containers pref.
+-// The default space cannot be deleted. Returns false if nothing was deleted.
++// The last space cannot be deleted. Returns false if nothing was deleted.
+ bool DeleteSpace(Profile* profile, const std::string& space_id);
+ 
+ // Reopens |tabs| (tabs of one window) in space |space_id|: each tab's current
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/space_tab_tracker.cc
+@@ -0,0 +1,35 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/neon/spaces/space_tab_tracker.h"
++
++#include "chrome/browser/ui/neon/spaces/spaces_window_controller.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_handle.h"
++#include "content/public/browser/web_contents.h"
++
++namespace neon::spaces {
++
++SpaceTabTracker::SpaceTabTracker(content::WebContents* contents)
++    : content::WebContentsObserver(contents),
++      content::WebContentsUserData<SpaceTabTracker>(*contents) {}
++
++SpaceTabTracker::~SpaceTabTracker() = default;
++
++void SpaceTabTracker::DidFinishNavigation(content::NavigationHandle* handle) {
++  if (!handle->IsInPrimaryMainFrame() || !handle->HasCommitted() ||
++      handle->IsSameDocument()) {
++    return;
++  }
++  tabs::TabInterface* tab =
++      tabs::TabInterface::MaybeGetFromContents(web_contents());
++  if (SpacesWindowController* controller =
++          tab ? SpacesWindowController::FromTab(tab) : nullptr) {
++    controller->OnTabCommitted(tab);
++  }
++}
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(SpaceTabTracker);
++
++}  // namespace neon::spaces
+--- /dev/null
++++ b/chrome/browser/ui/neon/spaces/space_tab_tracker.h
+@@ -0,0 +1,56 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NEON_SPACES_SPACE_TAB_TRACKER_H_
++#define CHROME_BROWSER_UI_NEON_SPACES_SPACE_TAB_TRACKER_H_
++
++#include <string>
++
++#include "content/public/browser/web_contents_observer.h"
++#include "content/public/browser/web_contents_user_data.h"
++
++namespace neon::spaces {
++
++// Follows one tab of a normal window with spaces:
++// - remembers the space the tab was last in, so a tab whose page is outside
++//   every space's container for a moment (a blank page that left a WebUI
++//   page) stays in its space until it is reopened there;
++// - tells the window's SpacesWindowController when a page commits in the tab,
++//   so a tab whose page landed in the default partition is reopened in a
++//   space (see SpacesWindowController::RepairStrayTabs()).
++class SpaceTabTracker
++    : public content::WebContentsObserver,
++      public content::WebContentsUserData<SpaceTabTracker> {
++ public:
++  SpaceTabTracker(const SpaceTabTracker&) = delete;
++  SpaceTabTracker& operator=(const SpaceTabTracker&) = delete;
++  ~SpaceTabTracker() override;
++
++  // The space the tab was last in, or empty.
++  const std::string& space_id() const { return space_id_; }
++  void set_space_id(std::string space_id) { space_id_ = std::move(space_id); }
++
++  // Whether the tab replaced a tab that had landed outside every space. Such
++  // a tab is not replaced again, so a page that cannot load in a container
++  // does not reopen forever.
++  bool is_replacement() const { return is_replacement_; }
++  void set_is_replacement() { is_replacement_ = true; }
++
++ private:
++  friend content::WebContentsUserData<SpaceTabTracker>;
++
++  explicit SpaceTabTracker(content::WebContents* contents);
++
++  // content::WebContentsObserver:
++  void DidFinishNavigation(content::NavigationHandle* handle) override;
++
++  std::string space_id_;
++  bool is_replacement_ = false;
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++}  // namespace neon::spaces
++
++#endif  // CHROME_BROWSER_UI_NEON_SPACES_SPACE_TAB_TRACKER_H_
+--- a/chrome/browser/ui/neon/spaces/spaces_settings_handler.cc
++++ b/chrome/browser/ui/neon/spaces/spaces_settings_handler.cc
+@@ -131,7 +131,7 @@ base::DictValue SpacesSettingsHandler::G
+               .Set("name", space.name)
+               .Set("icon", space.icon)
+               .Set("color", ColorToValue(space.color))
+-              .Set("isDefault", space.is_default())
++              .Set("deletable", service_->spaces().size() > 1)
+               .Set("tabs", CountTabsInSpace(profile_, space.id)));
+     }
+   }
+--- a/chrome/browser/ui/neon/spaces/spaces_window_controller.cc
++++ b/chrome/browser/ui/neon/spaces/spaces_window_controller.cc
+@@ -12,10 +12,12 @@
+ 
+ #include "base/check.h"
+ #include "base/functional/bind.h"
++#include "base/logging.h"
+ #include "base/no_destructor.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/values.h"
+ #include "chrome/browser/neon/containers_api.h"
++#include "chrome/browser/neon/global_context.h"
+ #include "chrome/browser/neon/spaces/spaces_service.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
+@@ -23,7 +25,9 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/helium/helium_layout_state_controller.h"
++#include "chrome/browser/ui/neon/global/global_window.h"
+ #include "chrome/browser/ui/neon/spaces/space_tab_filter.h"
++#include "chrome/browser/ui/neon/spaces/space_tab_tracker.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
+@@ -36,6 +40,7 @@
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/common/url_constants.h"
+ #include "ui/gfx/range/range.h"
+@@ -235,8 +240,12 @@ void SpacesWindowController::InstallHook
+       base::BindRepeating(&GetContainerForNewTabIn));
+ }
+ 
++bool SpacesWindowController::HasSpaces() const {
++  return model_ && !service_->spaces().empty();
++}
++
+ bool SpacesWindowController::IsActive() const {
+-  return model_ && service_->spaces().size() > 1 &&
++  return HasSpaces() && service_->spaces().size() > 1 &&
+          browser_->GetProfile()->GetPrefs()->GetInteger(
+              prefs::kHeliumLayout) ==
+              std::to_underlying(HeliumLayoutType::kVertical);
+@@ -244,8 +253,20 @@ bool SpacesWindowController::IsActive()
+ 
+ const std::string& SpacesWindowController::GetSpaceIdOf(
+     content::WebContents* contents) const {
+-  return service_->GetSpaceIdForContainer(
+-      contents ? containers_api::GetTabContainerId(contents) : std::string());
++  if (!contents) {
++    return service_->GetSpaceIdForContainer(std::string());
++  }
++  if (const Space* space = service_->GetSpaceForContainer(
++          containers_api::GetTabContainerId(contents))) {
++    return space->id;
++  }
++  // A tab outside every space's container until it is reopened in its space.
++  if (const SpaceTabTracker* tracker =
++          SpaceTabTracker::FromWebContents(contents);
++      tracker && service_->GetSpace(tracker->space_id())) {
++    return tracker->space_id();
++  }
++  return service_->GetSpaceIdForContainer(std::string());
+ }
+ 
+ const std::string& SpacesWindowController::GetSpaceIdOf(
+@@ -402,15 +423,19 @@ void SpacesWindowController::RecordSaved
+ }
+ 
+ std::string SpacesWindowController::GetContainerForNewTab() const {
+-  if (opening_group_container_) {
++  if (!HasSpaces()) {
++    return std::string();
++  }
++  // A group saved in the default partition or in a container no space uses
++  // any more opens like any new tab.
++  if (opening_group_container_ &&
++      service_->GetSpaceForContainer(*opening_group_container_)) {
+     return *opening_group_container_;
+   }
+   if (pending_new_tab_space_) {
+-    const Space* space = service_->GetSpace(*pending_new_tab_space_);
+-    return space ? space->container_id : std::string();
+-  }
+-  if (!IsActive()) {
+-    return std::string();
++    if (const Space* space = service_->GetSpace(*pending_new_tab_space_)) {
++      return space->container_id;
++    }
+   }
+   if (model_->GetActiveTab()) {
+     return service_->GetSpace(GetVisibleSpaceId())->container_id;
+@@ -429,7 +454,124 @@ std::string SpacesWindowController::GetC
+         return false;
+       },
+       BrowserCollection::Order::kActivation);
+-  return container_id;
++  // The first window: the first space.
++  return container_id.empty() ? service_->spaces().front().container_id
++                              : container_id;
++}
++
++void SpacesWindowController::OnTabCommitted(tabs::TabInterface* tab) {
++  content::WebContents* contents = tab->GetContents();
++  if (!HasSpaces() || !contents) {
++    return;
++  }
++  if (const Space* space = service_->GetSpaceForContainer(
++          containers_api::GetTabContainerId(contents))) {
++    SpaceTabTracker::GetOrCreateForWebContents(contents)->set_space_id(
++        space->id);
++    return;
++  }
++  if (IsStrayTab(contents)) {
++    ScheduleStrayRepair();
++  }
++}
++
++void SpacesWindowController::TrackTab(content::WebContents* contents) {
++  if (!HasSpaces() || !contents) {
++    return;
++  }
++  SpaceTabTracker* tracker =
++      SpaceTabTracker::GetOrCreateForWebContents(contents);
++  if (const Space* space = service_->GetSpaceForContainer(
++          containers_api::GetTabContainerId(contents))) {
++    tracker->set_space_id(space->id);
++  } else if (!service_->GetSpace(tracker->space_id())) {
++    // Not in a space's container (yet): it belongs to the space that was
++    // visible when it arrived.
++    tracker->set_space_id(service_->GetSpace(last_visible_space_)
++                              ? last_visible_space_
++                              : service_->spaces().front().id);
++  }
++  if (IsStrayTab(contents)) {
++    ScheduleStrayRepair();
++  }
++}
++
++bool SpacesWindowController::IsStrayTab(content::WebContents* contents) const {
++  if (!HasSpaces() || !contents) {
++    return false;
++  }
++  // A tab that has not committed a page yet (a new tab being created, a
++  // noopener window whose SiteInstance gets its container's site when its
++  // page commits) is judged once it has one. Restored tabs have committed
++  // entries from the start.
++  content::NavigationEntry* entry =
++      contents->GetController().GetLastCommittedEntry();
++  if (!entry || entry->IsInitialEntry()) {
++    return false;
++  }
++  return !service_->GetSpaceForContainer(
++      containers_api::GetTabContainerId(contents));
++}
++
++void SpacesWindowController::ScheduleStrayRepair() {
++  if (stray_repair_scheduled_) {
++    return;
++  }
++  stray_repair_scheduled_ = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SpacesWindowController::RepairStrayTabs,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void SpacesWindowController::RepairStrayTabs() {
++  stray_repair_scheduled_ = false;
++  if (!model_ || model_->closing_all() || !HasSpaces()) {
++    return;
++  }
++  // From the end, so the indices of the tabs still to look at do not move.
++  for (int i = model_->count() - 1; i >= 0; --i) {
++    if (i >= model_->count()) {
++      continue;
++    }
++    content::WebContents* contents = model_->GetWebContentsAt(i);
++    if (!IsStrayTab(contents)) {
++      continue;
++    }
++    SpaceTabTracker* tracker =
++        SpaceTabTracker::GetOrCreateForWebContents(contents);
++    const GURL url =
++        contents->GetController().GetLastCommittedEntry()->GetURL();
++    if (global_context::IsGlobalContextURL(url)) {
++      global::MoveTabToGlobalWindow(browser_, i);
++      continue;
++    }
++    if (tracker->is_replacement()) {
++      LOG(WARNING) << "Neon: a tab reopened in a space left it again: "
++                   << url.possibly_invalid_spec();
++      continue;
++    }
++    const Space* space = service_->GetSpace(tracker->space_id());
++    if (!space) {
++      space = &service_->spaces().front();
++    }
++    const std::string space_id = space->id;
++    content::WebContents* replacement = containers_api::OpenTabInContainer(
++        browser_,
++        url.is_empty() ? GURL(chrome::kChromeUINewTabURL) : url,
++        space->container_id, i + 1,
++        /*foreground=*/model_->active_index() == i, model_->IsTabPinned(i));
++    if (!replacement) {
++      continue;
++    }
++    SpaceTabTracker* replacement_tracker =
++        SpaceTabTracker::GetOrCreateForWebContents(replacement);
++    replacement_tracker->set_space_id(space_id);
++    replacement_tracker->set_is_replacement();
++    const int index = model_->GetIndexOfWebContents(contents);
++    if (index != TabStripModel::kNoTab) {
++      model_->DetachAndDeleteWebContentsAt(index);
++    }
++  }
+ }
+ 
+ void SpacesWindowController::OnTabStripModelChanged(
+@@ -457,6 +599,11 @@ void SpacesWindowController::OnTabStripM
+                          IsUntouchedNewTabPage(removed.contents.get())));
+     }
+   }
++  if (change.type() == TabStripModelChange::kInserted) {
++    for (const auto& inserted : change.GetInsert()->contents) {
++      TrackTab(inserted.contents);
++    }
++  }
+   if (change.type() == TabStripModelChange::kInserted ||
+       change.type() == TabStripModelChange::kMoved) {
+     ScheduleRepair();
+@@ -524,8 +671,7 @@ content::WebContents* SpacesWindowContro
+     bool foreground,
+     bool pinned) {
+   // The tab has no opener, so it takes the container GetContainerForNewTab()
+-  // gives. A new tab page or a web page in a container is safe; about:blank
+-  // would open in the default partition (see containers_api.h).
++  // gives.
+   pending_new_tab_space_ = space_id;
+   content::WebContents* contents =
+       chrome::AddAndReturnTabAt(browser_, url, -1, foreground,
+--- a/chrome/browser/ui/neon/spaces/spaces_window_controller.h
++++ b/chrome/browser/ui/neon/spaces/spaces_window_controller.h
+@@ -48,10 +48,15 @@ namespace neon::spaces {
+ // - opens a new tab page in a space whose last tab was closed while other
+ //   spaces still have tabs,
+ // - keeps each space's tabs together within the pinned and the unpinned tabs,
+-//   so ranges of the visible tabs never include hidden ones.
++//   so ranges of the visible tabs never include hidden ones,
++// - reopens in a space any tab whose page lands in the default partition,
++//   which no space uses (RepairStrayTabs()).
+ //
+-// All of this is off (IsActive() false) outside the vertical layout and with
+-// only the default space, so the window then behaves like stock Helium.
++// Every space has a container, so new tabs get a space's container whenever
++// the profile has spaces (HasSpaces()), in every layout and with a single
++// space. Hiding, switching and the sidebar pager are on (IsActive()) in the
++// vertical layout with two spaces or more. Without spaces (containers off)
++// the window behaves like stock Helium.
+ class SpacesWindowController : public TabStripModelObserver,
+                                public SpacesService::Observer {
+  public:
+@@ -97,14 +102,19 @@ class SpacesWindowController : public Ta
+   BrowserWindowInterface* browser() const { return browser_; }
+   TabStripModel* model() const { return model_; }
+ 
+-  // Whether spaces apply to this window now: vertical layout and more than one
++  // Whether the profile has spaces, so every tab of this window belongs to
++  // one.
++  bool HasSpaces() const;
++  // Whether spaces show in this window now: vertical layout and more than one
+   // space.
+   bool IsActive() const;
+ 
+-  // The space of |contents| or |tab|, by its container.
++  // The space of |contents| or |tab|, by its container. A tab whose page is
++  // in no space's container (about to be reopened in a space) counts in the
++  // space it was last in, else in the first space. Empty without spaces.
+   const std::string& GetSpaceIdOf(content::WebContents* contents) const;
+   const std::string& GetSpaceIdOf(const tabs::TabInterface* tab) const;
+-  // The space of the active tab, or the default space with no active tab.
++  // The space of the active tab, or the first space with no active tab.
+   const std::string& GetVisibleSpaceId() const;
+ 
+   // Whether |tab| is in another space than the visible one. Always false when
+@@ -156,10 +166,14 @@ class SpacesWindowController : public Ta
+ 
+   // The container a new tab of this window opens in when it has no source
+   // page: the visible space's, or for a window without tabs yet the visible
+-  // space of the last active window. Empty for the default partition. While
+-  // a saved tab group reopens, the container its tabs were in.
++  // space of the last active window, else the first space's. While a saved
++  // tab group reopens, the container its tabs were in. Empty without spaces
++  // (the default partition).
+   std::string GetContainerForNewTab() const;
+ 
++  // A page committed in |tab| of this window (SpaceTabTracker).
++  void OnTabCommitted(tabs::TabInterface* tab);
++
+   // Saved tab group |saved_group| starts (a value) or stops (std::nullopt)
+   // opening its tabs in this window.
+   void SetOpeningSavedGroup(const std::optional<base::Uuid>& saved_group);
+@@ -196,6 +210,21 @@ class SpacesWindowController : public Ta
+ 
+   void ScheduleRepair();
+   void RepairContiguity();
++  // Starts following an inserted tab (SpaceTabTracker): its space is its
++  // container's, else the space that was visible.
++  void TrackTab(content::WebContents* contents);
++  // Whether |contents| has a page that is in no space's container: the
++  // default partition, or a container that no space uses.
++  bool IsStrayTab(content::WebContents* contents) const;
++  void ScheduleStrayRepair();
++  // Every tab of the window must show its page in a space's container. A tab
++  // that does not (a tab of a profile from before every space had a
++  // container, a restored tab whose container is gone, a blank page that left
++  // a WebUI page) is reopened: a global page (an extension page) in a global
++  // window, keeping the live page; any other page by its URL in a new tab of
++  // the tab's space, at its place. Nothing is copied out of the default
++  // partition, so the page loads with the space's cookies only.
++  void RepairStrayTabs();
+   // Remembers, in the profile, the container of each open saved tab group.
+   void RecordSavedGroupContainers();
+   // A tab group and a split each belong to one space. Takes the tabs of other
+@@ -220,6 +249,7 @@ class SpacesWindowController : public Ta
+   // The visible space as of the last model change.
+   std::string last_visible_space_;
+   bool repair_scheduled_ = false;
++  bool stray_repair_scheduled_ = false;
+   // The space each tab group belongs to.
+   std::map<tab_groups::TabGroupId, std::string> group_spaces_;
+   PrefChangeRegistrar pref_change_registrar_;
+--- a/chrome/browser/ui/views/neon/spaces/space_edit_bubble.cc
++++ b/chrome/browser/ui/views/neon/spaces/space_edit_bubble.cc
+@@ -441,7 +441,9 @@ void ShowDeleteSpaceConfirmation(views::
+                                  const std::string& space_id) {
+   SpacesService* service = SpacesServiceFactory::GetForProfile(profile);
+   const Space* space = service ? service->GetSpace(space_id) : nullptr;
+-  if (!anchor || !anchor->GetWidget() || !space || space->is_default()) {
++  // The last space cannot be deleted.
++  if (!anchor || !anchor->GetWidget() || !space ||
++      service->spaces().size() <= 1) {
+     return;
+   }
+   const int tabs = CountTabsInSpace(profile, space_id);
+--- a/chrome/browser/ui/views/neon/spaces/space_switcher_row.cc
++++ b/chrome/browser/ui/views/neon/spaces/space_switcher_row.cc
+@@ -9,6 +9,7 @@
+ #include <utility>
+ 
+ #include "base/functional/bind.h"
++#include "base/no_destructor.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+@@ -43,6 +44,12 @@ namespace neon::spaces {
+ 
+ namespace {
+ 
++// The rows of all windows, to find the one of a window.
++std::vector<SpaceSwitcherRow*>& Rows() {
++  static base::NoDestructor<std::vector<SpaceSwitcherRow*>> rows;
++  return *rows;
++}
++
+ constexpr int kRowHeight = 36;
+ constexpr int kButtonSize = 28;
+ constexpr int kIconSize = 18;
+@@ -197,6 +204,7 @@ SpaceSwitcherRow::SpaceSwitcherRow(Space
+   GetViewAccessibility().SetRole(ax::mojom::Role::kGroup);
+   GetViewAccessibility().SetName(u"Spaces");
+   set_context_menu_controller(this);
++  Rows().push_back(this);
+   pager_observation_.Observe(pager_);
+   if (Profile* profile = pager_->GetProfile()) {
+     pref_change_registrar_.Init(profile->GetPrefs());
+@@ -208,7 +216,31 @@ SpaceSwitcherRow::SpaceSwitcherRow(Space
+   Rebuild();
+ }
+ 
+-SpaceSwitcherRow::~SpaceSwitcherRow() = default;
++SpaceSwitcherRow::~SpaceSwitcherRow() {
++  std::erase(Rows(), this);
++}
++
++// static
++bool SpaceSwitcherRow::HandleNewSpaceMenu(BrowserWindowInterface* browser,
++                                          bool execute) {
++  for (SpaceSwitcherRow* row : Rows()) {
++    SpacesWindowController* controller = row->pager_->controller();
++    if (!controller || controller->browser() != browser) {
++      continue;
++    }
++    if (!controller->HasSpaces()) {
++      return false;
++    }
++    if (execute) {
++      // The menu runs nested; create the space once it is gone.
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&SpaceSwitcherRow::CreateSpace,
++                                    row->weak_factory_.GetWeakPtr()));
++    }
++    return true;
++  }
++  return false;
++}
+ 
+ Profile* SpaceSwitcherRow::GetProfile() const {
+   return pager_->GetProfile();
+@@ -522,8 +554,9 @@ bool SpaceSwitcherRow::IsCommandIdChecke
+ 
+ bool SpaceSwitcherRow::IsCommandIdEnabled(int command_id) const {
+   if (command_id == kDeleteCommand) {
+-    // The default space cannot be deleted.
+-    return menu_space_id_ != kDefaultSpaceId;
++    // The last space cannot be deleted.
++    return pager_->controller() &&
++           pager_->controller()->service()->spaces().size() > 1;
+   }
+   return true;
+ }
+@@ -564,9 +597,8 @@ void SpaceSwitcherRow::ConfirmDeleteSpac
+ }
+ 
+ bool SpaceSwitcherRow::CanReorder(const SpaceButton* button) const {
+-  // The default space stays first; a lone movable icon has nowhere to go.
+-  return pager_->controller() && !IsCompact() && buttons_.size() > 2 &&
+-         button->space_id() != kDefaultSpaceId &&
++  // A lone icon has nowhere to go.
++  return pager_->controller() && !IsCompact() && buttons_.size() > 1 &&
+          std::ranges::contains(buttons_, button);
+ }
+ 
+@@ -583,9 +615,9 @@ void SpaceSwitcherRow::UpdateReorder(int
+   if (!reorder_button_) {
+     return;
+   }
+-  // Stays within the icons, right of the default space's icon.
++  // Stays within the icons.
+   const int start = GetIconsStart();
+-  const int min_x = start + kButtonSize + kButtonSpacing;
++  const int min_x = start;
+   const int max_x = start + GetIconsWidth() - kButtonSize;
+   reorder_x_ = std::clamp(x - reorder_grab_, min_x, std::max(min_x, max_x));
+   InvalidateLayout();
+@@ -596,7 +628,7 @@ size_t SpaceSwitcherRow::GetReorderTarge
+   const int slot = static_cast<int>(std::lround(
+       static_cast<double>(reorder_x_ - GetIconsStart()) / slot_width));
+   return static_cast<size_t>(
+-      std::clamp(slot, 1, static_cast<int>(buttons_.size()) - 1));
++      std::clamp(slot, 0, static_cast<int>(buttons_.size()) - 1));
+ }
+ 
+ void SpaceSwitcherRow::EndReorder(bool commit) {
+--- a/chrome/browser/ui/neon/spaces/space_tab_menu_hooks.cc
++++ b/chrome/browser/ui/neon/spaces/space_tab_menu_hooks.cc
+@@ -18,6 +18,11 @@ ReopenInSpaceMenuFactory& Factory() {
+   return *factory;
+ }
+ 
++NewSpaceMenuDelegate& NewSpaceDelegate() {
++  static base::NoDestructor<NewSpaceMenuDelegate> delegate;
++  return *delegate;
++}
++
+ }  // namespace
+ 
+ void SetReopenInSpaceMenuFactory(ReopenInSpaceMenuFactory factory) {
+@@ -30,4 +35,28 @@ std::unique_ptr<ui::SimpleMenuModel> Cre
+   return Factory() ? Factory().Run(model, index) : nullptr;
+ }
+ 
++void SetNewSpaceMenuDelegate(NewSpaceMenuDelegate delegate) {
++  NewSpaceDelegate() = std::move(delegate);
++}
++
++void MaybeAddNewSpaceItem(ui::SimpleMenuModel* menu,
++                          BrowserWindowInterface* browser) {
++  if (!NewSpaceDelegate() || !NewSpaceDelegate().Run(browser, false)) {
++    return;
++  }
++  menu->AddSeparator(ui::NORMAL_SEPARATOR);
++  menu->AddItem(kNewSpaceCommand, u"New space");
++}
++
++bool MaybeExecuteNewSpaceCommand(BrowserWindowInterface* browser,
++                                 int command_id) {
++  if (command_id != kNewSpaceCommand) {
++    return false;
++  }
++  if (NewSpaceDelegate()) {
++    NewSpaceDelegate().Run(browser, true);
++  }
++  return true;
++}
++
+ }  // namespace neon::spaces
+--- a/chrome/browser/ui/neon/spaces/space_tab_menu_hooks.h
++++ b/chrome/browser/ui/neon/spaces/space_tab_menu_hooks.h
+@@ -9,6 +9,7 @@
+ 
+ #include "base/functional/callback.h"
+ 
++class BrowserWindowInterface;
+ class TabStripModel;
+ 
+ namespace ui {
+@@ -31,6 +32,26 @@ std::unique_ptr<ui::SimpleMenuModel> Cre
+     TabStripModel* model,
+     int index);
+ 
++// "New space" in the context menu of the new tab button, so that a space can
++// be created from the sidebar while the switcher row is hidden (one space).
++// Neon's spaces command ids start at 39500 (see space_tab_filter.h).
++inline constexpr int kNewSpaceCommand = 39520;
++
++// Answers whether |browser| can create a space (|execute| false), or creates
++// one, shows it and lets the user name it (|execute| true). Set by the
++// sidebar's switcher row.
++using NewSpaceMenuDelegate =
++    base::RepeatingCallback<bool(BrowserWindowInterface* browser,
++                                 bool execute)>;
++void SetNewSpaceMenuDelegate(NewSpaceMenuDelegate delegate);
++
++// Adds a separator and "New space" to |menu| when |browser| has spaces.
++void MaybeAddNewSpaceItem(ui::SimpleMenuModel* menu,
++                          BrowserWindowInterface* browser);
++// Runs |command_id| if it is kNewSpaceCommand. Returns whether it was.
++bool MaybeExecuteNewSpaceCommand(BrowserWindowInterface* browser,
++                                 int command_id);
++
+ }  // namespace neon::spaces
+ 
+ #endif  // CHROME_BROWSER_UI_NEON_SPACES_SPACE_TAB_MENU_HOOKS_H_
+--- a/chrome/browser/ui/views/neon/spaces/tab_strip_wrapper.cc
++++ b/chrome/browser/ui/views/neon/spaces/tab_strip_wrapper.cc
+@@ -6,9 +6,12 @@
+ 
+ #include <utility>
+ 
++#include "base/functional/bind.h"
++
+ #include "chrome/browser/neon/spaces/spaces_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/neon/spaces/space_tab_menu_hooks.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/neon/spaces/reopen_in_space_menu_model.h"
+ #include "chrome/browser/ui/views/neon/spaces/space_switcher_row.h"
+@@ -34,6 +37,8 @@ std::unique_ptr<views::View> WrapTabStri
+     return tab_strip_view;
+   }
+   ReopenInSpaceMenuModel::Install();
++  SetNewSpaceMenuDelegate(
++      base::BindRepeating(&SpaceSwitcherRow::HandleNewSpaceMenu));
+   auto pager = std::make_unique<SpacesPagerView>(region, browser_view,
+                                                  std::move(tab_strip_view));
+   pager->SetBottomView(std::make_unique<SpaceSwitcherRow>(pager.get()));
+--- a/chrome/browser/ui/views/tabs/shared/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/shared/BUILD.gn
+@@ -47,6 +47,7 @@ source_set("impl") {
+     "//chrome/browser/ui:layout_constants",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/color:color_headers",
++    "//chrome/browser/ui/neon/spaces:hooks",
+     "//chrome/browser/ui/tabs",
+     "//chrome/browser/ui/tabs:tab_group",
+     "//chrome/browser/ui/tabs:tab_strip",
+--- a/chrome/browser/ui/views/tabs/shared/new_tab_button_menu_model.cc
++++ b/chrome/browser/ui/views/tabs/shared/new_tab_button_menu_model.cc
+@@ -12,6 +12,7 @@
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/neon/spaces/space_tab_menu_hooks.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -52,12 +53,17 @@ NewTabButtonMenuModel::NewTabButtonMenuM
+ 
+   AddSeparator(ui::NORMAL_SEPARATOR);
+   AddNewSplitTabItem();
++  // Neon: "New space", also reachable while the space switcher is hidden.
++  neon::spaces::MaybeAddNewSpaceItem(this, browser_);
+ }
+ 
+ NewTabButtonMenuModel::~NewTabButtonMenuModel() = default;
+ 
+ void NewTabButtonMenuModel::ExecuteCommand(int command_id, int event_flags) {
+   CHECK(browser_);
++  if (neon::spaces::MaybeExecuteNewSpaceCommand(browser_, command_id)) {
++    return;
++  }
+ 
+   switch (command_id) {
+     case IDC_NEW_TAB:
