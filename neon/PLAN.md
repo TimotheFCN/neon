@@ -50,6 +50,7 @@ across spaces on purpose.
 | M0 | Linux dev build of stock Helium 0.22.1 from `neon-linux`, running under Xvfb | done | |
 | R1 | Containers port study: map Brave's implementation onto Helium's patch layout | done | |
 | R2 | Spaces design: data model, sidebar pager, persistence | done | |
+| R3 | Study: all spaces as containers, a global context for extensions, per-space extension access | doing | |
 | M1 | Containers core: a tab can live in a named persistent container | done | M0, R1 |
 | M1b | Containers hardening: fix the review findings on the port | done | M2 |
 | M2 | Spaces model: tabs grouped by space, one visible space, switch by command | done | M1, R2 |
@@ -155,14 +156,26 @@ checks). It added `containers/platform-auth.patch` and `spaces/groups.patch`. Wh
 - The platform SSO skip is ported from Brave. It only compiles on macOS and Windows and has
   never run. Check it on a managed Mac in M6.
 
-Behaviour M1b chose, to be confirmed by the owner:
+Behaviour M1b chose, and the owner's answer (2026-11-19):
 
-1. Extension pages (options, popups opened as tabs) always open in the default space.
+1. Extension pages (options, popups opened as tabs) always open in the default space. Under
+   review, see "Open design question" below.
 2. A tab group belongs to the space of the first tab that joined. A tab from another space that
-   is dragged in is taken out of the group.
-3. A split that ends up spanning two spaces is unsplit.
-4. Extension popup windows open on the space of the last active window.
-5. In a space with a single tab, the split picker shows a plain new tab page.
+   is dragged in is taken out of the group. Confirmed.
+3. A split that ends up spanning two spaces is unsplit. Confirmed.
+4. Extension popup windows open on the space of the last active window. Under review with 1.
+5. In a space with a single tab, the split picker shows a plain new tab page. Confirmed.
+
+#### Open design question: extensions and spaces
+
+Extensions are shared by all spaces, and an extension signed in to one account acts on pages of
+every space. The owner wants a model that makes this obvious and controllable. Their proposal:
+no visible space uses the default partition. Every space the user sees is a container, and the
+default partition becomes a "global" context that holds the browser's own pages and the
+extensions. Pages that belong to no space (extension pages, extension sign-in) would open in a
+floating window over the browser, as Arc does, and extensions could be turned off per space.
+This would replace decision 10. Study R3 (`neon/docs/global-space-design.md`) checks what it
+costs before anything is decided.
 
 ### M2: Spaces model (done)
 
