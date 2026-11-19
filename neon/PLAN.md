@@ -66,9 +66,9 @@ across spaces on purpose.
 | M3 | Sidebar pager: space switcher row, slide animation, scroll gesture | done | M2 |
 | M4 | Space management: create, rename, icon, colour, delete, reorder, settings page | done | M2 |
 | M5 | All spaces as containers: global context, no default space, extension pages in a separate window, tabs opened by extensions land in the current space | done | M4, R3 |
-| M6 | Clear browsing data, site data settings and DevTools per space | doing | M5 |
+| M6 | Clear browsing data, site data settings and DevTools per space | done | M5 |
 | M7 | Per-space pinned tabs | blocked | Upstream merging its persistent pinned tabs (#2931) |
-| M8 | Extension switch per space | todo | M5 |
+| M8 | Extension switch per space | doing | M5 |
 | M9 | Floating overlay for global pages (extension pages, extension sign-in) | todo | M5 |
 | M10 | Web push and notification clicks in containers | todo | M5 |
 | M11 | Site rules that route a URL to a space | todo | M5 |
@@ -303,10 +303,51 @@ Left open by M5:
   every file they touch in the built tree.
 - Window centring was only seen under Xvfb with no window manager.
 
-### M6 to M11
+### M6: Clear data and DevTools per space (done)
 
-M6 covers that document's "Clear browsing data", "Site
-data settings" and "DevTools" rows. M8 is its patches X1 and X2, M9 is X4. M7 waits for study
+Four patches: `containers/clear-browsing-data` (Brave's delegate hook, ported),
+`containers/devtools`, `spaces/data-scope`, `spaces/site-data-page`.
+`neon/tests/data_tools_m6.py` (153 checks) proves deletions on disk, each with a matching
+"still there" check in another space.
+
+What changed:
+
+- "Delete browsing data" has a scope: the current space (default) or all spaces, which also
+  clears the global context. With one space chosen only cookies, site data and cache are
+  offered, with a note that history, downloads, passwords and autofill are shared.
+- The site data settings pages show one space at a time through a Space menu, which also
+  offers "Outside spaces (extensions)" for the global context. Deleting acts on that space.
+- A space has "Clear data" in its menu and on the Spaces settings page.
+- DevTools acts on the inspected tab's partition. Three hooks in `content/browser/devtools/`
+  (`network_handler.cc`, `storage_handler.cc`, `frame_auto_attacher.cc`), about 30 lines, watch
+  them at each sync. Before, clearing cookies or cache from DevTools reached every space with a
+  service worker on the same origin, and cache clears hit the default partition.
+- "Empty cache and hard reload" clears the active tab's partition.
+- Clear on exit now waits for the per-container removals. Brave's code raced the shutdown and
+  could leave containers uncleared.
+
+Behaviour M6 chose, to be confirmed by the owner:
+
+1. Deleting a site on the All sites page still resets its permissions, which are shared, so the
+   reset applies in every space. The dialog says so.
+2. A cookie clear in one space regenerates Helium's fingerprinting noise tokens for the whole
+   profile, as upstream does on any cookie clear.
+3. "All spaces" counts a site once even when several spaces hold data for it.
+
+Left open by M6:
+
+- After a crash, the startup cleanup of "delete on close" sites only covers the default
+  partition.
+- Browser-level DevTools protocol methods (no target) still use the default partition.
+- A client cannot tell which space a target is in. A chrome-side way exists without touching
+  the protocol definitions: return the space from
+  `ChromeDevToolsManagerDelegate::GetTargetDescription`. Not built.
+- Not tested: the extension `browsingData` API, media licences, shared worker auto-attach.
+- Time ranges are proven for cookies only.
+
+### M7 to M11
+
+M8 is its patches X1 and X2, M9 is X4. M7 waits for study
 R4 (`neon/docs/pinned-tabs-design.md`).
 
 The owner decided on 2026-11-19 not to import upstream's pinned tabs pull request before it
