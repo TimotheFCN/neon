@@ -1,0 +1,562 @@
+Neon: extension pages open in a global window, outside any space (M5).
+
+With every space a container, the default storage partition is the global
+context of the browser's own work and the extensions. Extension pages
+(options pages, full-page UIs, chrome-extension:// URLs opened as tabs) need
+it, so with spaces they open in a popup browser window centred on the active
+browser window instead of in a tab of a space. A singleton navigation
+(runtime.openOptionsPage) brings back the window that already shows the page.
+A popup an extension opens with chrome.windows.create stays in the default
+partition and is centred the same way when the extension gave no position.
+
+The decision of what is global sits in chrome/browser/neon/global_context.h,
+so the later overlay can reuse it. Hooks: one call in chrome::Navigate(), one
+in WindowsCreateFunction. Without spaces (containers off) nothing changes.
+
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1170,7 +1170,9 @@ source_set("core") {
+     "//chrome/browser/metrics:expired_histograms_array",
+     "//chrome/browser/navigation_predictor",
+     "//chrome/browser/neon:containers_api",
++    "//chrome/browser/neon:global_context",
+     "//chrome/browser/neon/spaces",
++    "//chrome/browser/ui/neon/global",
+     "//chrome/browser/ui/neon/spaces",
+     "//chrome/browser/net",
+     "//chrome/browser/notifications",
+--- a/chrome/browser/extensions/api/tabs/windows_api.cc
++++ b/chrome/browser/extensions/api/tabs/windows_api.cc
+@@ -52,6 +52,7 @@
+ #include "chrome/browser/platform_util.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_init_state.h"
++#include "chrome/browser/ui/neon/global/global_window.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/browser/ui/window_sizer/window_sizer.h"
+ #include "chrome/browser/web_applications/web_app_filter.h"
+@@ -691,6 +692,15 @@ ExtensionFunction::ResponseAction Window
+     create_params.is_trusted_source = false;
+     initialized_type = true;
+   }
++#if !BUILDFLAG(IS_ANDROID)
++  // Neon: an extension's popup window opens outside any space, centred on
++  // the browser window, unless the extension placed it.
++  if (create_params.type == BrowserWindowInterface::TYPE_APP_POPUP) {
++    neon::global::CenterExtensionPopupBounds(
++        window_profile, create_data_->left || create_data_->top,
++        window_bounds);
++  }
++#endif
+   create_params.initial_bounds = window_bounds;
+   create_params.initial_show_state = ui::mojom::WindowShowState::kNormal;
+ 
+--- a/chrome/browser/neon/BUILD.gn
++++ b/chrome/browser/neon/BUILD.gn
+@@ -31,3 +31,19 @@ source_set("containers_api") {
+     "//url",
+   ]
+ }
++
++# What belongs to the global context (the default partition, outside any
++# space), and the seam chrome::Navigate() calls. See global_context.h.
++source_set("global_context") {
++  sources = [
++    "global_context.cc",
++    "global_context.h",
++  ]
++
++  deps = [
++    "//base",
++    "//extensions/buildflags",
++    "//extensions/common:common_constants",
++    "//url",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/neon/global_context.cc
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/neon/global_context.h"
++
++#include <utility>
++
++#include "base/no_destructor.h"
++#include "extensions/buildflags/buildflags.h"
++#include "url/gurl.h"
++
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++#include "extensions/common/constants.h"
++#endif
++
++namespace neon::global_context {
++
++namespace {
++
++NavigateRouter& GetRouter() {
++  static base::NoDestructor<NavigateRouter> router;
++  return *router;
++}
++
++}  // namespace
++
++bool IsGlobalContextURL(const GURL& url) {
++#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
++  return url.SchemeIs(extensions::kExtensionScheme);
++#else
++  return false;
++#endif
++}
++
++void SetNavigateRouter(NavigateRouter router) {
++  GetRouter() = std::move(router);
++}
++
++void MaybeRouteNavigation(NavigateParams* params) {
++  if (params && GetRouter()) {
++    GetRouter().Run(*params);
++  }
++}
++
++}  // namespace neon::global_context
+--- /dev/null
++++ b/chrome/browser/neon/global_context.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_NEON_GLOBAL_CONTEXT_H_
++#define CHROME_BROWSER_NEON_GLOBAL_CONTEXT_H_
++
++#include "base/functional/callback.h"
++
++class GURL;
++struct NavigateParams;
++
++// The global context. With spaces, every space the user sees is a container,
++// and the default storage partition holds only the browser's own background
++// work and the extensions. Pages that belong to that context open outside any
++// space: today in a separate popup window (chrome/browser/ui/neon/global),
++// later in an overlay. This file holds the decision of what belongs there, so
++// that both surfaces share it, and the seam chrome::Navigate() calls.
++namespace neon::global_context {
++
++// Whether |url| is a page of the global context: an extension's own page
++// (options page, full-page UI, any chrome-extension:// URL opened as a tab).
++// Such a page needs the default partition, where its extension keeps its
++// storage and its background runs.
++bool IsGlobalContextURL(const GURL& url);
++
++// Called by chrome::Navigate() before it picks a window. The UI layer
++// registers a router that may send |params| to a global window instead of a
++// tab of a space. One router per process.
++using NavigateRouter = base::RepeatingCallback<void(NavigateParams& params)>;
++void SetNavigateRouter(NavigateRouter router);
++void MaybeRouteNavigation(NavigateParams* params);
++
++}  // namespace neon::global_context
++
++#endif  // CHROME_BROWSER_NEON_GLOBAL_CONTEXT_H_
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/apps/link_capturing/link_capturing_tab_data.h"
+ #include "chrome/browser/browser_about_handler.h"
+ #include "chrome/browser/containers/containers_navigator_utils.h"
++#include "chrome/browser/neon/global_context.h"
+ #include "chrome/browser/picture_in_picture/picture_in_picture_window_manager.h"
+ #include "chrome/browser/platform_util.h"
+ #include "chrome/browser/prefs/incognito_mode_prefs.h"
+@@ -856,6 +857,9 @@ base::WeakPtr<content::NavigationHandle>
+   }
+ #endif
+ 
++  // Neon: extension pages open in a global window, outside any space.
++  neon::global_context::MaybeRouteNavigation(params);
++
+   if (!AdjustNavigateParamsForURL(params)) {
+     return nullptr;
+   }
+--- /dev/null
++++ b/chrome/browser/ui/neon/global/BUILD.gn
+@@ -0,0 +1,28 @@
++# Copyright 2026 The Neon Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++# The interim global window: extension pages and extension popup windows
++# open outside any space. See global_window.h.
++source_set("global") {
++  sources = [
++    "global_window.cc",
++    "global_window.h",
++  ]
++
++  public_deps = [ "//ui/gfx/geometry" ]
++
++  deps = [
++    "//base",
++    "//chrome/browser/neon:global_context",
++    "//chrome/browser/neon/spaces",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/navigator",
++    "//chrome/browser/ui/tabs:tab_enums",
++    "//chrome/browser/ui/tabs:tab_strip",
++    "//content/public/browser",
++    "//ui/base",
++    "//url",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/neon/global/global_window.cc
+@@ -0,0 +1,213 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/neon/global/global_window.h"
++
++#include <algorithm>
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/no_destructor.h"
++#include "chrome/browser/neon/global_context.h"
++#include "chrome/browser/neon/spaces/spaces_service.h"
++#include "chrome/browser/neon/spaces/spaces_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/base_window.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "url/gurl.h"
++
++namespace neon::global {
++
++namespace {
++
++// The size of a global window for a page, before it is fitted to the window
++// it is centred on.
++constexpr gfx::Size kPageSize(960, 720);
++
++BrowserWindowInterface* GetLastActiveNormalWindow(Profile* profile) {
++  BrowserWindowInterface* found = nullptr;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [&](BrowserWindowInterface* browser) {
++        if (browser->GetProfile() != profile ||
++            browser->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
++            !browser->GetWindow()) {
++          return true;
++        }
++        found = browser;
++        return false;
++      },
++      BrowserCollection::Order::kActivation);
++  return found;
++}
++
++// The global window of |profile| that shows |url|, ignoring the fragment.
++BrowserWindowInterface* FindGlobalWindowShowing(Profile* profile,
++                                                const GURL& url) {
++  BrowserWindowInterface* found = nullptr;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [&](BrowserWindowInterface* browser) {
++        if (browser->GetProfile() != profile ||
++            browser->GetType() != BrowserWindowInterface::TYPE_POPUP ||
++            !browser->GetTabStripModel() || !browser->GetWindow()) {
++          return true;
++        }
++        content::WebContents* contents =
++            browser->GetTabStripModel()->GetActiveWebContents();
++        if (contents && contents->GetVisibleURL().GetWithoutRef() ==
++                            url.GetWithoutRef()) {
++          found = browser;
++          return false;
++        }
++        return true;
++      },
++      BrowserCollection::Order::kActivation);
++  return found;
++}
++
++bool IsRoutedDisposition(WindowOpenDisposition disposition) {
++  switch (disposition) {
++    case WindowOpenDisposition::kCurrentTab:
++    case WindowOpenDisposition::kSingletonTab:
++    case WindowOpenDisposition::kSwitchToTab:
++    case WindowOpenDisposition::kNewForegroundTab:
++    case WindowOpenDisposition::kNewBackgroundTab:
++    case WindowOpenDisposition::kNewWindow:
++      return true;
++    default:
++      return false;
++  }
++}
++
++}  // namespace
++
++void InstallGlobalWindowRouting() {
++  static bool installed = false;
++  if (installed) {
++    return;
++  }
++  installed = true;
++  global_context::SetNavigateRouter(base::BindRepeating(&RouteNavigation));
++}
++
++bool IsGlobalWindowEnabled(Profile* profile) {
++  if (!profile || profile->IsOffTheRecord()) {
++    return false;
++  }
++  spaces::SpacesService* service =
++      spaces::SpacesServiceFactory::GetForProfile(profile);
++  return service && !service->spaces().empty();
++}
++
++void RouteNavigation(NavigateParams& params) {
++  if (!global_context::IsGlobalContextURL(params.url) ||
++      params.contents_to_insert || !IsRoutedDisposition(params.disposition)) {
++    return;
++  }
++  BrowserWindowInterface* browser = params.browser;
++  Profile* profile =
++      browser ? browser->GetProfile() : params.initiating_profile.get();
++  if (!IsGlobalWindowEnabled(profile)) {
++    return;
++  }
++  if (!browser) {
++    browser = GetLastActiveNormalWindow(profile);
++  }
++  // A window without tabs was made for this navigation (chrome.windows.create
++  // of a normal window): leave it its tab, which the window's spaces then move
++  // to a global window.
++  if (!browser || browser->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
++      !browser->GetTabStripModel() || browser->GetTabStripModel()->empty()) {
++    return;
++  }
++  // runtime.openOptionsPage and similar singleton navigations bring back the
++  // window that already shows the page.
++  if (params.disposition == WindowOpenDisposition::kSingletonTab ||
++      params.disposition == WindowOpenDisposition::kSwitchToTab) {
++    if (BrowserWindowInterface* existing =
++            FindGlobalWindowShowing(profile, params.url)) {
++      existing->GetWindow()->Activate();
++      params.disposition = WindowOpenDisposition::kIgnoreAction;
++      return;
++    }
++  }
++  const gfx::Rect bounds = GetCenteredBounds(profile, browser, kPageSize);
++  params.browser = browser;
++  params.disposition = WindowOpenDisposition::kNewPopup;
++  params.window_action = NavigateParams::WindowAction::kShowWindow;
++  params.tabstrip_add_types = AddTabTypes::ADD_ACTIVE;
++  params.tabstrip_index = -1;
++  if (!bounds.IsEmpty()) {
++    params.window_features.bounds = bounds;
++    params.window_features.has_x = params.window_features.has_y = true;
++    params.window_features.has_width = params.window_features.has_height =
++        true;
++  }
++}
++
++void MoveTabToGlobalWindow(BrowserWindowInterface* browser, int index) {
++  TabStripModel* model = browser ? browser->GetTabStripModel() : nullptr;
++  if (!model || !model->ContainsIndex(index)) {
++    return;
++  }
++  Profile* profile = browser->GetProfile();
++  BrowserWindowCreateParams create_params(BrowserWindowInterface::TYPE_POPUP,
++                                          *profile,
++                                          /*from_user_gesture=*/false);
++  create_params.initial_bounds = GetCenteredBounds(profile, browser, kPageSize);
++  BrowserWindowInterface* popup = CreateBrowserWindow(std::move(create_params));
++  if (!popup || !popup->GetTabStripModel()) {
++    return;
++  }
++  std::unique_ptr<content::WebContents> contents =
++      model->DetachWebContentsAtForInsertion(index);
++  popup->GetTabStripModel()->AddWebContents(
++      std::move(contents), 0, ui::PAGE_TRANSITION_AUTO_TOPLEVEL,
++      AddTabTypes::ADD_ACTIVE);
++  popup->GetWindow()->Show();
++}
++
++gfx::Rect GetCenteredBounds(Profile* profile,
++                            BrowserWindowInterface* anchor,
++                            const gfx::Size& size) {
++  if (!anchor || anchor->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
++    anchor = GetLastActiveNormalWindow(profile);
++  }
++  if (!anchor || !anchor->GetWindow()) {
++    return gfx::Rect();
++  }
++  const gfx::Rect window = anchor->GetWindow()->GetBounds();
++  if (window.IsEmpty()) {
++    return gfx::Rect();
++  }
++  gfx::Rect bounds(std::min(size.width(), window.width() * 9 / 10),
++                   std::min(size.height(), window.height() * 9 / 10));
++  bounds.set_origin(
++      window.CenterPoint() -
++      gfx::Vector2d(bounds.width() / 2, bounds.height() / 2));
++  return bounds;
++}
++
++void CenterExtensionPopupBounds(Profile* profile,
++                                bool position_given,
++                                gfx::Rect& bounds) {
++  if (position_given || bounds.IsEmpty() || !IsGlobalWindowEnabled(profile)) {
++    return;
++  }
++  const gfx::Rect centered =
++      GetCenteredBounds(profile, /*anchor=*/nullptr, bounds.size());
++  if (!centered.IsEmpty()) {
++    bounds = centered;
++  }
++}
++
++}  // namespace neon::global
+--- /dev/null
++++ b/chrome/browser/ui/neon/global/global_window.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Neon Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_NEON_GLOBAL_GLOBAL_WINDOW_H_
++#define CHROME_BROWSER_UI_NEON_GLOBAL_GLOBAL_WINDOW_H_
++
++#include "ui/gfx/geometry/rect.h"
++
++class BrowserWindowInterface;
++class Profile;
++struct NavigateParams;
++
++// The interim surface of the global context: a popup browser window (no tab
++// strip), centred on the browser window that was active. Pages that
++// neon::global_context::IsGlobalContextURL() accepts open there instead of in
++// a tab of a space, and stay in the default storage partition. A later
++// milestone replaces the window with an overlay; it reuses the decision in
++// chrome/browser/neon/global_context.h and RouteNavigation() below.
++//
++// Applies only to profiles with spaces. Without spaces (containers off), the
++// browser opens these pages in tabs, as stock Helium does.
++namespace neon::global {
++
++// Registers RouteNavigation() with chrome::Navigate(). Once per process.
++void InstallGlobalWindowRouting();
++
++// Whether |profile| has spaces, so that global pages leave the tab strip.
++bool IsGlobalWindowEnabled(Profile* profile);
++
++// Sends |params| to a global window when it would show a global page in a
++// tab, or in the current tab, of a normal window with spaces: a new popup
++// window centred on that window, or the global window that already shows the
++// page for a singleton navigation (runtime.openOptionsPage).
++void RouteNavigation(NavigateParams& params);
++
++// Moves the tab at |index| of |browser| into a new global window, keeping
++// the live page. For a global page that reached a tab of a space by another
++// path (a restored session, an older profile).
++void MoveTabToGlobalWindow(BrowserWindowInterface* browser, int index);
++
++// The bounds of a new global window of |size| centred on |anchor|, the last
++// active normal window of |profile| when null. Empty without such a window.
++gfx::Rect GetCenteredBounds(Profile* profile,
++                            BrowserWindowInterface* anchor,
++                            const gfx::Size& size);
++
++// For chrome.windows.create with type "popup": centres the window on the last
++// active normal window when the extension gave no position. Called from the
++// windows API with the bounds it computed.
++void CenterExtensionPopupBounds(Profile* profile,
++                                bool position_given,
++                                gfx::Rect& bounds);
++
++}  // namespace neon::global
++
++#endif  // CHROME_BROWSER_UI_NEON_GLOBAL_GLOBAL_WINDOW_H_
+--- a/chrome/browser/ui/neon/spaces/BUILD.gn
++++ b/chrome/browser/ui/neon/spaces/BUILD.gn
+@@ -56,6 +56,7 @@ source_set("spaces") {
+   deps = [
+     "//chrome/browser/neon:containers_api",
+     "//chrome/browser/tab_group_sync:factories",
++    "//chrome/browser/ui/neon/global",
+     "//chrome/browser/ui:browser_tabstrip",
+     "//chrome/browser/ui/helium:helium_layout_state_controller",
+     "//chrome/common",
+--- a/chrome/browser/ui/neon/spaces/spaces_window_controller.cc
++++ b/chrome/browser/ui/neon/spaces/spaces_window_controller.cc
+@@ -142,34 +142,14 @@ class HooksDelegateImpl : public HooksDe
+ };
+ 
+ std::string GetContainerForNewTabIn(BrowserWindowInterface* browser) {
++  // Popup and app windows have no space. A popup opened without an opener
++  // (an extension's chrome.windows.create, often a sign-in flow) belongs to
++  // the global context, the default partition, where the extension's own
++  // pages and background are. Popups opened by a page inherit its container
++  // and never get here.
+   SpacesWindowController* controller =
+       SpacesWindowController::FromBrowser(browser);
+-  if (controller) {
+-    return controller->GetContainerForNewTab();
+-  }
+-  // A popup window opened without an opener (an extension's
+-  // chrome.windows.create with type "popup", which is an app popup, often a
+-  // sign-in flow) has no space of its own. It opens on the space of the last
+-  // active window, as a new window does.
+-  if (browser->GetType() != BrowserWindowInterface::TYPE_POPUP &&
+-      browser->GetType() != BrowserWindowInterface::TYPE_APP_POPUP) {
+-    return std::string();
+-  }
+-  std::string container_id;
+-  GlobalBrowserCollection::GetInstance()->ForEach(
+-      [&](BrowserWindowInterface* other) {
+-        SpacesWindowController* other_controller =
+-            SpacesWindowController::FromBrowser(other);
+-        if (!other_controller ||
+-            other->GetProfile() != browser->GetProfile() ||
+-            !other->GetTabStripModel() || other->GetTabStripModel()->empty()) {
+-          return true;
+-        }
+-        container_id = other_controller->GetContainerForNewTab();
+-        return false;
+-      },
+-      BrowserCollection::Order::kActivation);
+-  return container_id;
++  return controller ? controller->GetContainerForNewTab() : std::string();
+ }
+ 
+ }  // namespace
+--- a/chrome/browser/ui/neon/spaces/spaces_window_manager.cc
++++ b/chrome/browser/ui/neon/spaces/spaces_window_manager.cc
+@@ -10,6 +10,7 @@
+ #include "chrome/browser/profiles/profile_selections.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/neon/global/global_window.h"
+ #include "chrome/browser/ui/neon/spaces/spaces_window_controller.h"
+ 
+ namespace neon::spaces {
+@@ -62,6 +63,8 @@ SpacesWindowManagerFactory::SpacesWindow
+               .Build()) {
+   DependsOn(SpacesServiceFactory::GetInstance());
+   SpacesWindowController::InstallHooks();
++  // Neon: extension pages open in a global window, outside any space.
++  global::InstallGlobalWindowRouting();
+ }
+ 
+ SpacesWindowManagerFactory::~SpacesWindowManagerFactory() = default;
