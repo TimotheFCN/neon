@@ -51,10 +51,10 @@ across spaces on purpose.
 | R1 | Containers port study: map Brave's implementation onto Helium's patch layout | done | |
 | R2 | Spaces design: data model, sidebar pager, persistence | done | |
 | M1 | Containers core: a tab can live in a named persistent container | done | M0, R1 |
-| M1b | Containers hardening: fix the review findings on the port | doing | M2 |
+| M1b | Containers hardening: fix the review findings on the port | done | M2 |
 | M2 | Spaces model: tabs grouped by space, one visible space, switch by command | done | M1, R2 |
 | M3 | Sidebar pager: space switcher row, slide animation, scroll gesture | done | M2 |
-| M4 | Space management: create, rename, icon, colour, delete, reorder, settings page | todo | M2 |
+| M4 | Space management: create, rename, icon, colour, delete, reorder, settings page | doing | M2 |
 | M5 | Per-space pinned tabs, and site rules that route a URL to a space | todo | M3 |
 | M6 | macOS: build from `neon-macos`, finger-tracked swipe, per-space glass tint | blocked | Mac access |
 | M7 | Distribution: own bundle id and data dir, updater off, hosting, sync script | todo | M6 for the Mac parts |
@@ -139,6 +139,31 @@ navigation. A restored blank tab now anchors its container on a site from its ow
 brand-new `about:blank` tab opens in the default space. Any restore fix for findings 4 to 6 must
 respect the same limit.
 
+Findings 4 to 6 and the rest of 8 landed in M1b, with `neon/tests/hardening_m1b.py` (205
+checks). It added `containers/platform-auth.patch` and `spaces/groups.patch`. What it changed:
+
+- The spaces command ids collided with Chromium's focus commands (39000 and 39001), so Ctrl+L,
+  Alt+D and F6 ran "previous space" and a typed URL loaded in another space. The ids now start at
+  39500. Earlier checks missed it because they navigated through DevTools, not the omnibox. New
+  checks must type into the real omnibox.
+- Saved tab groups reopen in their container. The group's container is kept in the pref
+  `neon.spaces.saved_group_containers`. Restoring a closed group still loses each tab's history.
+- New split tabs inherit the container, and the split picker lists only tabs of the split's
+  space.
+- View source keeps the tab's container. Extension pages stay in the default partition.
+- Removing a split with spaces on crashed (SIGSEGV). Fixed.
+- The platform SSO skip is ported from Brave. It only compiles on macOS and Windows and has
+  never run. Check it on a managed Mac in M6.
+
+Behaviour M1b chose, to be confirmed by the owner:
+
+1. Extension pages (options, popups opened as tabs) always open in the default space.
+2. A tab group belongs to the space of the first tab that joined. A tab from another space that
+   is dragged in is taken out of the group.
+3. A split that ends up spanning two spaces is unsplit.
+4. Extension popup windows open on the space of the last active window.
+5. In a space with a single tab, the split picker shows a plain new tab page.
+
 ### M2: Spaces model (done)
 
 Five patches under `patches/neon/spaces/` (service, window-controller, model-filter,
@@ -153,8 +178,8 @@ Left open by M2, to be picked up where noted:
 - Shift-click range selection and Ctrl+Shift+PgDn are not filtered by space (M3).
 - A change to the space list at runtime does not relay out the sidebar until the active tab
   changes (M4).
-- Keeping a space's tabs together is skipped in a section that contains a group or split, and
-  groups that mix containers are not ungrouped (M1b, with the saved groups fix).
+- Keeping a space's tabs together was skipped in a section that contains a group or split, and
+  groups that mixed containers were not ungrouped. Fixed in M1b (`spaces/groups.patch`).
 - macOS shortcuts are not wired, and Ctrl+Alt+Up/Down may clash with GNOME (M6).
 - Tabs in a container that no space uses count as the default space.
 - Not tested: dragging tabs between windows, tab search, tabs opened by extensions, bookmarks.
@@ -169,8 +194,8 @@ real X server and checks frames in the middle of each transition.
 
 Left open by M3:
 
-- Typing a URL into the new tab page of a non-default space loads it outside that space. Found
-  by the M3 agent, not fixed. This is the first item of M1b.
+- Typing a URL into the new tab page of a non-default space loaded it outside that space. Found
+  by the M3 agent and fixed in M1b.
 - Each window builds three full copies of every tab view, and a switch costs about 40 ms of
   layout with 90 tabs. Measure on real hardware before optimising.
 - The swipe was only run on X11 with a synthetic touchpad. Wayland and macOS paths compile but
